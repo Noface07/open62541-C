@@ -38,10 +38,10 @@ struct TagInfo{
 struct GroupInfo{
     vector<TagInfo> tags;
     int dataPointId;
-    string name;
-    string nodeId;
     string typeId;
     string parentId;
+    string name;
+    string nodeId;
 };
 
 struct ServerInfoO{

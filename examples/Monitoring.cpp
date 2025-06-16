@@ -29,19 +29,25 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
 
     if(variant->type == &UA_TYPES[UA_TYPES_INT32]) {
         std::cout << "New value (int32): " << *(UA_Int32 *)variant->data << std::endl;
+        cout << endl;
     } else if(variant->type == &UA_TYPES[UA_TYPES_DOUBLE]) {
         std::cout << "New value (double): " << *(UA_Double *)variant->data << std::endl;
+        cout << endl;
     } else if(variant->type == &UA_TYPES[UA_TYPES_FLOAT]) {
         std::cout << "New value (float): " << *(UA_Float *)variant->data << std::endl;
+        cout << endl;
     } else if(variant->type == &UA_TYPES[UA_TYPES_BOOLEAN]) {
         std::cout << "New value (bool): "
                   << (*(UA_Boolean *)variant->data ? "true" : "false") << std::endl;
+        cout << endl;
     } else if(variant->type == &UA_TYPES[UA_TYPES_STRING]) {
         UA_String str = *(UA_String *)variant->data;
         std::cout << "New value (string): " << std::string((char *)str.data, str.length)
                   << std::endl;
+        cout << endl;
     } else {
         std::cout << "Unsupported data type: " << variant->type->typeName << std::endl;
+        cout << endl;
     }
 }
 

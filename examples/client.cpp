@@ -21,14 +21,19 @@
 #include <queue>
 #include <mutex>
 #include <functional>
+
 #include "Monitoring.cpp"
 #include "MQTThandler.cpp"
 #include "fetchAPI.cpp"
 #include "structs.h"
 
+
+
 #include <unordered_map>
+#include <boost/asio.hpp>
 
-
+// Global MQTT handler instance
+MQTTHandler* g_mqttHandler = nullptr;
 
 using namespace std;
 
@@ -99,152 +104,41 @@ struct ServerInfo {
 
 
 
-vector<ServerInfoO>
-ParseServerHierarchy(string bearerToken) {
-
-    vector<ServerInfoO> servers;
-    if(!bearerToken.empty()) {
-        auto futureResponse = std::async(std::launch::async, getHierarchy, bearerToken);
-        json response = futureResponse.get();
-
-        if(response.contains("servers") && response["servers"].is_array()) {
-            for(const auto &item : response["servers"]) {
-                ServerInfoO serverInfo;
-
-                serverInfo.cfgName = item["cfgName"].get<string>();
-                serverInfo.endpointUrl = item["endpointUrl"].get<string>();
-                serverInfo.securityPolicy = item["securityPolicy"].get<string>();
-                serverInfo.msgSecurityMode = item["msgSecurityMode"].get<string>();
-                serverInfo.authType = item["authType"].get<string>();
-                serverInfo.dataPointId = item["dataPointId"].get<int>();
-                serverInfo.name = item["name"].get<string>();
-                serverInfo.nodeId = item["nodeId"].get<string>();
-                serverInfo.typeId = item["typeId"].get<string>();
-                serverInfo.parentId = item["parentId"].get<string>();
-
-                if(item.contains("groups") && item["groups"].is_array()) {
-                    vector<GroupInfo> groups;
-                    for(const auto &groupItem : item["groups"]) {
-                        GroupInfo groupInfo;
-
-                        groupInfo.dataPointId = groupItem["dataPointId"].get<int>();
-                        groupInfo.name = groupItem["name"].get<string>();
-                        groupInfo.nodeId = groupItem["nodeId"].get<string>();
-                        groupInfo.typeId = groupItem["typeId"].get<string>();
-                        groupInfo.parentId = groupItem["parentId"].get<string>();
-
-                        if(groupItem.contains("tags") && groupItem["tags"].is_array()) {
-                            vector<TagInfo> groupTags;
-                            for(const auto &tagItem : groupItem["tags"]) {
-                                TagInfo tagInfo;
-
-                                tagInfo.scaling = tagItem["scaling"].get<bool>();
-                                tagInfo.rawMin = tagItem["rawMin"].get<double>();
-                                tagInfo.rawMax = tagItem["rawMax"].get<double>();
-                                tagInfo.scaleMin = tagItem["scaleMin"].get<double>();
-                                tagInfo.scaleMax = tagItem["scaleMax"].get<double>();
-                                tagInfo.enableExpression =
-                                    tagItem["enableExpression"].get<bool>();
-                                tagInfo.expression = tagItem["expression"].get<string>();
-                                tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
-                                tagInfo.name = tagItem["name"].get<string>();
-                                tagInfo.nodeId = tagItem["nodeId"].get<string>();
-                                tagInfo.typeId = tagItem["typeId"].get<string>();
-                                tagInfo.parentId = tagItem["parentId"].get<string>();
-
-                                if(tagItem.contains("mappedInfospaceTags") &&
-                                   tagItem["mappedInfospaceTags"].is_array()) {
-                                    vector<MappedInfospaceTag> mappedTags;
-                                    for(const auto &mappedTag :
-                                        tagItem["mappedInfospaceTags"]) {
-                                        MappedInfospaceTag mappedInfo;
-                                        mappedInfo.id = mappedTag["id"].get<int>();
-                                        mappedInfo.tagId = mappedTag["tagId"].get<int>();
-                                        mappedInfo.name = mappedTag["name"].get<string>();
-                                        mappedInfo.namespaces =
-                                            mappedTag["namespace"].get<string>();
-                                        mappedInfo.isSimulationProfile =
-                                            mappedTag["isSimulationProfile"].get<bool>();
-                                        mappedInfo.isLogging =
-                                            mappedTag["isLogging"].get<bool>();
-                                        mappedInfo.isVirtual =
-                                            mappedTag["isVirtual"].get<bool>();
-                                        mappedTags.push_back(mappedInfo);
-                                    }
-                                    tagInfo.mappedInfospaceTags = mappedTags;
-                                }
-
-                                groupTags.push_back(tagInfo);
-                            }
-                            groupInfo.tags = groupTags;
-                        }
-
-                        groups.push_back(groupInfo);
-                    }
-                    serverInfo.groups = groups;
-                }
-
-                if(item.contains("tags") && item["tags"].is_array()) {
-                    vector<TagInfo> serverTags;
-                    for(const auto &tagItem : item["tags"]) {
-                        TagInfo tagInfo;
-
-                        tagInfo.scaling = tagItem["scaling"].get<bool>();
-                        tagInfo.rawMin = tagItem["rawMin"].get<double>();
-                        tagInfo.rawMax = tagItem["rawMax"].get<double>();
-                        tagInfo.scaleMin = tagItem["scaleMin"].get<double>();
-                        tagInfo.scaleMax = tagItem["scaleMax"].get<double>();
-                        tagInfo.enableExpression =
-                            tagItem["enableExpression"].get<bool>();
-                        tagInfo.expression = tagItem["expression"].get<string>();
-                        tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
-                        tagInfo.name = tagItem["name"].get<string>();
-                        tagInfo.nodeId = tagItem["nodeId"].get<string>();
-                        tagInfo.typeId = tagItem["typeId"].get<string>();
-                        tagInfo.parentId = tagItem["parentId"].get<string>();
-
-                        if(tagItem.contains("mappedInfospaceTags") &&
-                           tagItem["mappedInfospaceTags"].is_array()) {
-                            vector<MappedInfospaceTag> mappedTags;
-                            for(const auto &mappedTag : tagItem["mappedInfospaceTags"]) {
-                                MappedInfospaceTag mappedInfo;
-                                mappedInfo.id = mappedTag["id"].get<int>();
-                                mappedInfo.tagId = mappedTag["tagId"].get<int>();
-                                mappedInfo.name = mappedTag["name"].get<string>();
-                                mappedInfo.namespaces =
-                                    mappedTag["namespace"].get<string>();
-                                mappedInfo.isSimulationProfile =
-                                    mappedTag["isSimulationProfile"].get<bool>();
-                                mappedInfo.isLogging = mappedTag["isLogging"].get<bool>();
-                                mappedInfo.isVirtual = mappedTag["isVirtual"].get<bool>();
-                                mappedTags.push_back(mappedInfo);
-                            }
-                            tagInfo.mappedInfospaceTags = mappedTags;
-                        }
-
-                        serverTags.push_back(tagInfo);
-                    }
-                    serverInfo.tags = serverTags;
-                }
-
-                servers.push_back(serverInfo);
-            }
-        }
-    }
-    return servers;
-}
 
 
 
-
-
-
-   
 
 
 
 int main() {
+    // Initialize global MQTT handler
+    boost::asio::io_context ioc;
+    g_mqttHandler = new MQTTHandler(ioc);
+    
+    // Connect to MQTT broker
+    if (!g_mqttHandler->connect("216.48.184.131", "15579", "portal", "dt0Unw7QRh")) {
+        std::cerr << "Failed to connect to MQTT broker" << std::endl;
+        return EXIT_FAILURE;
+    }
 
+    // Set up callback for MQTT messages
+    g_mqttHandler->setCallback([](const std::string& topic, const std::string& payload) {
+        std::cout << "Received message on topic " << topic << ": " << payload << std::endl;
+        cout<<endl;
+        cout<<endl;
+
+        json json_payload = json::parse(payload);
+        std::cout << "Parsed payload: " << json_payload.dump() << std::endl;
+
+            // {"Data":[{"TagId":233,"Value":4715.46644,"TagType":"INFO_INC","TimeStamp":"2025-06-16T15:57:49.1859843+05:30","Source":2,"DatapointId":233,"InfoId":1001,"Quality":1,"UpdateType":1}]}
+
+        
+
+
+
+
+        
+    });
 
 #ifdef UA_ENABLE_SUBSCRIPTIONS
     signal(SIGINT, stopHandler);
@@ -253,7 +147,6 @@ int main() {
 
     std::vector<std::unique_ptr<ClientContext>> clientContexts;
     std::unordered_map<std::string, ClientContext *> clientPool;
-
 
     auto futureToken = std::async(std::launch::async, getBearerToken);
     string BearerToken = "";
@@ -264,31 +157,40 @@ int main() {
     }
 
 
-        // {
-        //     "cfgName": "Test Server 1 edit",
-        //     "endpointUrl": "EndpointUrl1",
-        //     "securityPolicy": "SCRP",
-        //     "msgSecurityMode": "MSMT1",
-        //     "authType": "Auth",
-        //     "groups": [],
-        //     "tags": [],
-        //     "dataPointId": 1,
-        //     "name": "Test Server 1 edit",
-        //     "nodeId": "ND01",
-        //     "typeId": "OPC_HI_SERVER",
-        //     "parentId": "ND01"
-        // }
-
-     
     vector<ServerInfoO> serverList = ParseServerHierarchy(BearerToken);
 
+
     cout << "endpoints: ";
-    for(const auto& server : serverList) {
-        cout << server.endpointUrl << " ";
+    for(const auto &server : serverList) {
+        cout << server.name << " ";
+        cout<<endl;
+        
+        // Print tags if they exist
+        for(const auto &tag : server.tags) {
+            if(tag.name) {
+                cout << *tag.name << " ";
+            }
+            cout<<endl;
+            
+            // Print mapped infospace tags if they exist
+            if(tag.mappedInfospaceTags) {
+                for(const auto &infoSpace : *tag.mappedInfospaceTags) {
+                    cout << infoSpace.namespaces << " ";
+                    g_mqttHandler->subscribe(infoSpace.namespaces);
+
+                    cout << infoSpace.namespaces << endl;
+
+                    // cout << infoSpace.namespaces << " subscribed; ";
+                    cout << endl;
+                    // Add a small delay between subscriptions
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+            }
+        }
     }
     cout << endl;
 
-
+    //g_mqttHandler->mqtt_subscribe_and_update("TDSPL/Test31-01/tag20-1");
 
 
     std::vector<ServerInfo> servers = { {"Anexee", "opc.tcp://localhost:53531"},
@@ -326,21 +228,7 @@ int main() {
 
     std::cout << "Client pool initialized. Press Ctrl+C to stop..." << std::endl;
 
-
-
-
-
     std::this_thread::sleep_for(std::chrono::seconds(1));
-
-
-
-    MQTTHandler *mqttHandler = new MQTTHandler("TDSPL/Test31-01/tag20-1");
-
-    mqttHandler->mqtt_subscribe_and_update("TDSPL/Test31-01/tag20-1");
-
-
-
-
 
     if(clientPool.count("Anexee")) {
         auto context = clientPool["Anexee"];
@@ -406,6 +294,8 @@ int main() {
     clientPool.clear();
     clientContexts.clear();
 
+    // Clean up MQTT handler at the end
+    delete g_mqttHandler;
     return EXIT_SUCCESS;
 
 
