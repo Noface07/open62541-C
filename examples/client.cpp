@@ -23,12 +23,14 @@
 #include <functional>
 #include "Monitoring.cpp"
 #include "MQTThandler.cpp"
+#include "fetchAPI.cpp"
+#include "structs.h"
 
 #include <unordered_map>
 
 
 
-
+using namespace std;
 
 
 std::atomic<bool> g_running(true);
@@ -38,7 +40,7 @@ void stopHandler(int signum) {
     g_running = false;
 }
 
-using namespace std;
+
 
 struct UA_Client_Deleter {
     void operator()(UA_Client *client) const {
@@ -95,6 +97,152 @@ struct ServerInfo {
     std::optional<std::string> password;
 };
 
+
+
+vector<ServerInfoO>
+ParseServerHierarchy(string bearerToken) {
+
+    vector<ServerInfoO> servers;
+    if(!bearerToken.empty()) {
+        auto futureResponse = std::async(std::launch::async, getHierarchy, bearerToken);
+        json response = futureResponse.get();
+
+        if(response.contains("servers") && response["servers"].is_array()) {
+            for(const auto &item : response["servers"]) {
+                ServerInfoO serverInfo;
+
+                serverInfo.cfgName = item["cfgName"].get<string>();
+                serverInfo.endpointUrl = item["endpointUrl"].get<string>();
+                serverInfo.securityPolicy = item["securityPolicy"].get<string>();
+                serverInfo.msgSecurityMode = item["msgSecurityMode"].get<string>();
+                serverInfo.authType = item["authType"].get<string>();
+                serverInfo.dataPointId = item["dataPointId"].get<int>();
+                serverInfo.name = item["name"].get<string>();
+                serverInfo.nodeId = item["nodeId"].get<string>();
+                serverInfo.typeId = item["typeId"].get<string>();
+                serverInfo.parentId = item["parentId"].get<string>();
+
+                if(item.contains("groups") && item["groups"].is_array()) {
+                    vector<GroupInfo> groups;
+                    for(const auto &groupItem : item["groups"]) {
+                        GroupInfo groupInfo;
+
+                        groupInfo.dataPointId = groupItem["dataPointId"].get<int>();
+                        groupInfo.name = groupItem["name"].get<string>();
+                        groupInfo.nodeId = groupItem["nodeId"].get<string>();
+                        groupInfo.typeId = groupItem["typeId"].get<string>();
+                        groupInfo.parentId = groupItem["parentId"].get<string>();
+
+                        if(groupItem.contains("tags") && groupItem["tags"].is_array()) {
+                            vector<TagInfo> groupTags;
+                            for(const auto &tagItem : groupItem["tags"]) {
+                                TagInfo tagInfo;
+
+                                tagInfo.scaling = tagItem["scaling"].get<bool>();
+                                tagInfo.rawMin = tagItem["rawMin"].get<double>();
+                                tagInfo.rawMax = tagItem["rawMax"].get<double>();
+                                tagInfo.scaleMin = tagItem["scaleMin"].get<double>();
+                                tagInfo.scaleMax = tagItem["scaleMax"].get<double>();
+                                tagInfo.enableExpression =
+                                    tagItem["enableExpression"].get<bool>();
+                                tagInfo.expression = tagItem["expression"].get<string>();
+                                tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
+                                tagInfo.name = tagItem["name"].get<string>();
+                                tagInfo.nodeId = tagItem["nodeId"].get<string>();
+                                tagInfo.typeId = tagItem["typeId"].get<string>();
+                                tagInfo.parentId = tagItem["parentId"].get<string>();
+
+                                if(tagItem.contains("mappedInfospaceTags") &&
+                                   tagItem["mappedInfospaceTags"].is_array()) {
+                                    vector<MappedInfospaceTag> mappedTags;
+                                    for(const auto &mappedTag :
+                                        tagItem["mappedInfospaceTags"]) {
+                                        MappedInfospaceTag mappedInfo;
+                                        mappedInfo.id = mappedTag["id"].get<int>();
+                                        mappedInfo.tagId = mappedTag["tagId"].get<int>();
+                                        mappedInfo.name = mappedTag["name"].get<string>();
+                                        mappedInfo.namespaces =
+                                            mappedTag["namespace"].get<string>();
+                                        mappedInfo.isSimulationProfile =
+                                            mappedTag["isSimulationProfile"].get<bool>();
+                                        mappedInfo.isLogging =
+                                            mappedTag["isLogging"].get<bool>();
+                                        mappedInfo.isVirtual =
+                                            mappedTag["isVirtual"].get<bool>();
+                                        mappedTags.push_back(mappedInfo);
+                                    }
+                                    tagInfo.mappedInfospaceTags = mappedTags;
+                                }
+
+                                groupTags.push_back(tagInfo);
+                            }
+                            groupInfo.tags = groupTags;
+                        }
+
+                        groups.push_back(groupInfo);
+                    }
+                    serverInfo.groups = groups;
+                }
+
+                if(item.contains("tags") && item["tags"].is_array()) {
+                    vector<TagInfo> serverTags;
+                    for(const auto &tagItem : item["tags"]) {
+                        TagInfo tagInfo;
+
+                        tagInfo.scaling = tagItem["scaling"].get<bool>();
+                        tagInfo.rawMin = tagItem["rawMin"].get<double>();
+                        tagInfo.rawMax = tagItem["rawMax"].get<double>();
+                        tagInfo.scaleMin = tagItem["scaleMin"].get<double>();
+                        tagInfo.scaleMax = tagItem["scaleMax"].get<double>();
+                        tagInfo.enableExpression =
+                            tagItem["enableExpression"].get<bool>();
+                        tagInfo.expression = tagItem["expression"].get<string>();
+                        tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
+                        tagInfo.name = tagItem["name"].get<string>();
+                        tagInfo.nodeId = tagItem["nodeId"].get<string>();
+                        tagInfo.typeId = tagItem["typeId"].get<string>();
+                        tagInfo.parentId = tagItem["parentId"].get<string>();
+
+                        if(tagItem.contains("mappedInfospaceTags") &&
+                           tagItem["mappedInfospaceTags"].is_array()) {
+                            vector<MappedInfospaceTag> mappedTags;
+                            for(const auto &mappedTag : tagItem["mappedInfospaceTags"]) {
+                                MappedInfospaceTag mappedInfo;
+                                mappedInfo.id = mappedTag["id"].get<int>();
+                                mappedInfo.tagId = mappedTag["tagId"].get<int>();
+                                mappedInfo.name = mappedTag["name"].get<string>();
+                                mappedInfo.namespaces =
+                                    mappedTag["namespace"].get<string>();
+                                mappedInfo.isSimulationProfile =
+                                    mappedTag["isSimulationProfile"].get<bool>();
+                                mappedInfo.isLogging = mappedTag["isLogging"].get<bool>();
+                                mappedInfo.isVirtual = mappedTag["isVirtual"].get<bool>();
+                                mappedTags.push_back(mappedInfo);
+                            }
+                            tagInfo.mappedInfospaceTags = mappedTags;
+                        }
+
+                        serverTags.push_back(tagInfo);
+                    }
+                    serverInfo.tags = serverTags;
+                }
+
+                servers.push_back(serverInfo);
+            }
+        }
+    }
+    return servers;
+}
+
+
+
+
+
+
+   
+
+
+
 int main() {
 
 
@@ -105,6 +253,43 @@ int main() {
 
     std::vector<std::unique_ptr<ClientContext>> clientContexts;
     std::unordered_map<std::string, ClientContext *> clientPool;
+
+
+    auto futureToken = std::async(std::launch::async, getBearerToken);
+    string BearerToken = "";
+    json token = futureToken.get();
+    // Extract access_token
+    if (token.contains("access_token")) {
+        BearerToken = token["access_token"].get<std::string>();
+    }
+
+
+        // {
+        //     "cfgName": "Test Server 1 edit",
+        //     "endpointUrl": "EndpointUrl1",
+        //     "securityPolicy": "SCRP",
+        //     "msgSecurityMode": "MSMT1",
+        //     "authType": "Auth",
+        //     "groups": [],
+        //     "tags": [],
+        //     "dataPointId": 1,
+        //     "name": "Test Server 1 edit",
+        //     "nodeId": "ND01",
+        //     "typeId": "OPC_HI_SERVER",
+        //     "parentId": "ND01"
+        // }
+
+     
+    vector<ServerInfoO> serverList = ParseServerHierarchy(BearerToken);
+
+    cout << "endpoints: ";
+    for(const auto& server : serverList) {
+        cout << server.endpointUrl << " ";
+    }
+    cout << endl;
+
+
+
 
     std::vector<ServerInfo> servers = { {"Anexee", "opc.tcp://localhost:53531"},
                                         {"Prosys", "opc.tcp://localhost:53530"} };

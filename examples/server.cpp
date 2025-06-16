@@ -632,8 +632,8 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, stopHandler);
     signal(SIGTERM, stopHandler);
 
-    UA_ByteString certificate = loadFile("certs/own/certs/server_cert.der");
-    UA_ByteString privateKey  = loadFile("certs/own/certs/server_key.der");
+    UA_ByteString certificate = loadFile("D:/OPC UA Server/OPCUA- open 62451/open62541-C/build/bin/examples/certs/own/certs/server_cert.der");
+    UA_ByteString privateKey  = loadFile("D:/OPC UA Server/OPCUA- open 62451/open62541-C/build/bin/examples/certs/own/certs/server_key.der");
     
     if(certificate.length == 0 || privateKey.length == 0) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -1359,67 +1359,101 @@ UA_Server_writeObjectProperty_scalar(
         // Register server with LDS now that it's running
 
             // register server
-    //     UA_ClientConfig cc;
-    //     memset(&cc, 0, sizeof(UA_ClientConfig));
-    //     UA_ClientConfig_setDefault(&cc);
-    //     // UA_ClientConfig_setDefaultEncryption(&cc,certificate,privateKey,NULL,0,NULL,0);
-    //     UA_ClientConfig_setAuthenticationCert(&cc, certificate, privateKey);
+        // UA_ClientConfig cc;
+        // memset(&cc, 0, sizeof(UA_ClientConfig));
+        // UA_ClientConfig_setDefault(&cc);
 
-    //     cc.endpoint.securityMode = UA_MESSAGESECURITYMODE_NONE;
-    //     cc.endpoint.userIdentityTokensSize = 1;
-    //     cc.endpoint.userIdentityTokens = (UA_UserTokenPolicy *) UA_Array_new(1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
-    //     UA_UserTokenPolicy_init(&cc.endpoint.userIdentityTokens[0]);
-    //     cc.endpoint.userIdentityTokens[0].tokenType = UA_USERTOKENTYPE_ANONYMOUS;
-    //     cc.endpoint.userIdentityTokens[0].policyId = UA_String_fromChars("open62541-anonymous-policy");
-    //     UA_ByteString_clear(&cc.securityPolicyUri);
-    //     cc.endpoint.userIdentityTokens[0].securityPolicyUri = UA_String_fromChars("http://opcfoundation.org/UA/SecurityPolicy#None");
-    //     cc.endpoint.transportProfileUri =
-    // UA_String_fromChars("http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary");
+        // const char *certPath = "D:/OPC UA Server/OPCUA- open "
+        //                       "62451/open62541-C/build/bin/examples/client/client.der";
+        // const char *certKey = "D:/OPC UA Server/OPCUA- open "
+        //                        "62451/open62541-C/build/bin/examples/client/client_key.der";
+        // const char *servercertPath = "D:/OPC UA Server/OPCUA- open "
+        //                        "62451/open62541-C/build/bin/examples/Certs/own/certs/server_cert.der";
 
-    //     for(size_t j = 0; j < cc.endpoint.userIdentityTokensSize; j++) {
-    //         UA_UserTokenPolicy *pol = &cc.endpoint.userIdentityTokens[j];
-    //         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_CLIENT, "Registration Client TokenType: %d, PolicyId: %.*s, SecurityPolicyUri: %.*s",
-    //             pol->tokenType,
-    //             (int)pol->policyId.length, pol->policyId.data,
-    //             (int)pol->securityPolicyUri.length, pol->securityPolicyUri.data);
-    //     }
+        // UA_ByteString certificatee = loadFile(certPath);
+        // UA_ByteString privateKeye = loadFile(certKey);
+        // UA_ByteString serverCerte = loadFile(servercertPath);
+
+        //     if (certificate.length == 0) {
+        //         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to load client certificate"); 
+        //         return EXIT_FAILURE;
+        //     }
+        //     if (privateKey.length == 0) {
+        //         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to load client private key"); 
+        //         return EXIT_FAILURE;
+        //     }
+        //     if (serverCerte.length == 0) {
+        //         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to load server certificate into trust list"); 
+        //         return EXIT_FAILURE;
+        //     }
+
+        // UA_STACKARRAY(UA_ByteString, trustLists, 1);
+        // trustLists[0] = serverCerte;
+    
+        // // Step 3: Apply encryption
+        // UA_ClientConfig_setDefaultEncryption(&cc, certificatee, privateKeye, NULL, 0,
+        // NULL, 0);
+
+        // UA_CertificateGroup_AcceptAll(&cc.certificateVerification);
+
+        // //cc.securityMode = UA_MESSAGESECURITYMODE_NONE;
+        // //cc.securityPolicyUri =
+        // //UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
+
+        // //UA_String_clear(&cc.applicationUri);
+        // cc.clientDescription.applicationUri =
+        // UA_STRING_ALLOC("urn:Anexee.server.application");
+        // //cc.clientDescription.applicationName = UA_LOCALIZEDTEXT_ALLOC("en-US",
+        // //"Anexee"); 
+        // //cc.clientDescription.productUri =
+        // //UA_STRING_ALLOC("urn:Anexee.server");
+
+        // //cc.userTokenPolicy.securityPolicyUri =
+        // //    UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
+        // //
+
+        // //cc.clientDescription.applicationUri =
+        // //    UA_STRING_ALLOC("urn:Anexee.server.application");
+        // cc.clientDescription.productUri = UA_STRING_ALLOC("urn:Anexee.server");
+        // cc.clientDescription.applicationName = UA_LOCALIZEDTEXT_ALLOC("en-US", "Anexee");
+        // cc.clientDescription.applicationType = UA_APPLICATIONTYPE_SERVER;
+
+        // cc.endpointUrl = UA_STRING_ALLOC("opc.tcp://localhost:4840");
+
+        // cc.userTokenPolicy.tokenType = UA_USERTOKENTYPE_ANONYMOUS;
+        // cc.userTokenPolicy.policyId = UA_STRING_ALLOC("anonymous-policy");
+
+        // cc.securityPolicyUri =
+        //     UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#None");
+        // cc.securityMode = UA_MESSAGESECURITYMODE_NONE;
+
+        // // Set if LDS requires user credentials (rare):
+        // //cc.userIdentityToken.encoding = UA_EXTENSIONOBJECT_DECODED;
+        // //cc.userIdentityToken.content.decoded.type =
+        // //    &UA_TYPES[UA_TYPES_USERNAMEIDENTITYTOKEN];
+        // //cc.userIdentityToken.content.decoded.data = UA_UserNameIdentityToken_new();
+        // //UA_UserNameIdentityToken *token =
+        // //    (UA_UserNameIdentityToken *)cc.userIdentityToken.content.decoded.data;
+       
+
+        // cc.applicationUri = UA_STRING_ALLOC("urn:Anexee.server.application");
 
 
 
-
-
-
-
-
-
-
-
-
-
-        const char *discoveryUrlStr = "opc.tcp://Asce:48060";
-        UA_String discoveryUrl = UA_String_fromChars(discoveryUrlStr);
+        // const char *discoveryUrlStr = "opc.tcp://Asce:4840";
+        // UA_String discoveryUrl = UA_String_fromChars(discoveryUrlStr);
 
        
 
 
-
-
-
-
-
-
-
-
-
-
-        //UA_StatusCode result = UA_Server_registerDiscovery(server, &cc, discoveryUrl, UA_STRING_NULL);
-        //if(result != UA_STATUSCODE_GOOD) {
+        // UA_StatusCode result = UA_Server_registerDiscovery(server, &cc, discoveryUrl, UA_STRING_NULL);
+        // if(result != UA_STATUSCODE_GOOD) {
         //    UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_SERVER,
         //                 "Could not create periodic job for server register. StatusCode %s",
         //                 UA_StatusCode_name(result));
         //    UA_Server_delete(server);
         //    return EXIT_FAILURE;
-        //}
+        // }
 
     while(running)
         UA_Server_run_iterate(server, true);

@@ -19,6 +19,10 @@
 
 
 #include <nlohmann/json.hpp>
+
+#include "structs.h"
+
+
 using json = nlohmann::json;
 
 
@@ -89,12 +93,12 @@ json getBearerToken() {
 
 
 
-json getTopicList(string bearerToken) {
+json getHierarchy(string bearerToken) {
 
 try{
     std::string host = "164.52.221.177";
     std::string port = "5128";
-    std::string target = "/api/GetTopicList";
+    std::string target = "/api/GetOpcUaHierarchy";
     int version = 11;
 
     // JSON body
@@ -115,7 +119,7 @@ try{
         },
 
         "data": {
-            "isLogging" : true
+            "nodeId": "ND01"
         }
     }
     )";
@@ -165,3 +169,6 @@ try{
     }
     
 }
+
+
+
