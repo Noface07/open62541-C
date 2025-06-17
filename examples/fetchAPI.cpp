@@ -120,7 +120,7 @@ try{
         },
 
         "data": {
-            "nodeId": "ND01"
+            "nodeId": "ND02"
         }
     }
     )";
@@ -303,11 +303,11 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                                 mappedInfo.isLogging = mappedTag["isLogging"].get<bool>();
                                 mappedInfo.isVirtual = mappedTag["isVirtual"].get<bool>();
                                 
-                                
-                                if(tagItem.contains("namespaceNodeID") && tagItem["namespaceNodeID"].is_string() && tagInfo.namespaceNodeID.has_value()) {
-                                    pair<string, string> NodePair = {tagInfo.namespaceNodeID.value(), serverInfo.endpointUrl};
+                                //name to namespace 
+                                // if(tagItem.contains("namespaceNodeID") && tagItem["namespaceNodeID"].is_string() && tagInfo.namespaceNodeID.has_value()) {
+                                    pair<string, string> NodePair = {tagInfo.name.value(), serverInfo.endpointUrl};
                                     Mapping[mappedInfo.tagId] = NodePair;
-                                }
+                                // }
 
                                 mappedTags.push_back(mappedInfo);
                             }
@@ -331,4 +331,20 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
     cout << endl;
 
     return servers;
+}
+
+
+std::pair<int, std::string> extractNsAndValue(const std::string& input) {
+    std::size_t nsPos = input.find("ns=");
+    std::size_t semiPos = input.find(';');
+    std::size_t equalPos = input.find('=', semiPos);  // '=' after the semicolon
+
+    if (nsPos == std::string::npos || semiPos == std::string::npos || equalPos == std::string::npos) {
+        return {0, ""};
+    }
+
+    int ns = std::stoi(input.substr(nsPos + 3, semiPos - (nsPos + 3))); // Extract between "ns=" and ';'
+    std::string value = input.substr(equalPos + 1); // Extract after '='
+
+    return {ns, value};
 }

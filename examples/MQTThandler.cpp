@@ -230,3 +230,32 @@ public:
 
 
 };
+
+
+enum DataSourceType
+{
+     INFO_STATE, //State
+     INFO_INST, //Instentaionus
+     INFO_INC, //Counter
+     INFO_DCR,
+     DT_TYP_TXT, //String
+};
+enum DataSource
+{
+     OpcDADataSource = 1, //OPC DA
+     SIMULATOR = 2,
+     EXPRESSION = 3,
+     OpcUADataSource = 4
+};
+enum DataQuality
+{
+     GOOD = 1,
+     BAD = 2,
+     UNKNOWN = 3,    
+};
+enum UpdateType
+{
+     TELEMETERY = 1,
+     COMMAND = 2,
+     BULKDATA= 3,
+};

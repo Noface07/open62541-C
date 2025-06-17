@@ -32,11 +32,10 @@
 #include <unordered_map>
 #include <boost/asio.hpp>
 
-// Global MQTT handler instance
-MQTTHandler* g_mqttHandler = nullptr;
-
 using namespace std;
 
+// Global MQTT handler instance
+MQTTHandler* g_mqttHandler = nullptr;
 
 std::atomic<bool> g_running(true);
 
@@ -53,6 +52,7 @@ struct UA_Client_Deleter {
             UA_Client_delete(client);
     }
 };
+
 
 struct ClientContext {
     std::string name;
@@ -95,14 +95,21 @@ struct ClientContext {
     }
 };
 
-struct ServerInfo {
-    std::string name;
-    std::string endpoint;
-    std::optional<std::string> username;
-    std::optional<std::string> password;
-};
-
-
+static UA_ByteString loadFile(const char *path) {
+    UA_ByteString fileContents = UA_BYTESTRING_NULL;
+    FILE *fp = fopen(path, "rb");
+    if(!fp)
+        return fileContents;
+    fseek(fp, 0, SEEK_END);
+    fileContents.length = (size_t)ftell(fp);
+    fileContents.data = (UA_Byte *)UA_malloc(fileContents.length * sizeof(UA_Byte));
+    fseek(fp, 0, SEEK_SET);
+    if(fread(fileContents.data, sizeof(UA_Byte), fileContents.length, fp) != fileContents.length) {
+        UA_ByteString_clear(&fileContents);
+    }
+    fclose(fp);
+    return fileContents;
+}
 
 
 
@@ -176,19 +183,42 @@ int main() {
     //g_mqttHandler->mqtt_subscribe_and_update("TDSPL/Test31-01/tag20-1");
 
 
-    std::vector<ServerInfo> servers = { {"Anexee", "opc.tcp://localhost:53531"},
-                                        {"Prosys", "opc.tcp://localhost:53530"} };
+    // std::vector<ServerInfo> servers = { {"Anexee", "opc.tcp://localhost:53531"},
+    //                                     {"Prosys", "opc.tcp://localhost:53530"} };
 
-    for(const auto &server : servers) {
+    for(const auto &server : serverList) {
         auto context = std::make_unique<ClientContext>();
         context->name = server.name;
-        context->endpoint = server.endpoint;
+        context->endpoint = server.endpointUrl;
         context->client = std::unique_ptr<UA_Client, UA_Client_Deleter>(UA_Client_new());
         UA_ClientConfig_setDefault(UA_Client_getConfig(context->client.get()));
 
-        UA_StatusCode retval = UA_Client_connect(context->client.get(), server.endpoint.c_str());
+        
+
+        //ADD LOGIC FOR CERTIFICATES
+            /* TODO */
+
+
+        //FOR SECURITY POLICY and MESSAGE SECURITY MODE
+        // UA_ClientConfig *config = UA_Client_getConfig(context->client.get());
+        // if (server.msgSecurityMode == "None") {
+        //     config->securityMode = UA_MESSAGESECURITYMODE_NONE;
+        // } else if (server.msgSecurityMode == "Sign") {
+        //     config->securityMode = UA_MESSAGESECURITYMODE_SIGN;
+        // } else if (server.msgSecurityMode == "SignAndEncrypt") {
+        //     config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
+        // } else {
+        //     config->securityMode = UA_MESSAGESECURITYMODE_INVALID;
+        // }
+
+        // std::string base = "http://opcfoundation.org/UA/SecurityPolicy#";
+        // std::string full = base + server.securityPolicy;
+        // config->securityPolicyUri = UA_STRING_STATIC(full.c_str());
+
+
+        UA_StatusCode retval = UA_Client_connect(context->client.get(), server.endpointUrl.c_str());
         if(retval != UA_STATUSCODE_GOOD) {
-            std::cerr << "Could not connect to server: " << server.endpoint << std::endl;
+            std::cerr << "Could not connect to server: " << server.endpointUrl << std::endl;
             continue;
         }
 
@@ -200,7 +230,7 @@ int main() {
             context->client.get(), request, nullptr, nullptr, nullptr);
         if(context->subscription.responseHeader.serviceResult == UA_STATUSCODE_GOOD) {
             std::cout << "Subscription created successfully for server: "
-                      << server.endpoint << std::endl;
+                      << server.endpointUrl << std::endl;
         }
 #endif
 
@@ -217,71 +247,101 @@ int main() {
 
 
         // Set up callback for MQTT messages
-    g_mqttHandler->setCallback(
-        [clientPool](const std::string &topic, const std::string &payload) {
-            std::cout << "Received message on topic " << topic << ": " << payload
-                      << std::endl;
-            cout << endl;
-            cout << endl;
-            json json_payload = json::parse(payload);
-            // {"Data":[{"TagId":233,"Value":4715.46644,"TagType":"INFO_INC","TimeStamp":"2025-06-16T15:57:49.1859843+05:30","Source":2,"DatapointId":233,"InfoId":1001,"Quality":1,"UpdateType":1}]}
-            if(json_payload.contains("Data") && json_payload["Data"].is_array()) {
-                auto data = json_payload["Data"][0];
+g_mqttHandler->setCallback(
+    [&clientPool](const std::string &topic, const std::string &payload) {
+        std::cout << "Received message on topic " << topic << ": " << payload << "\n\n";
 
-                //Modify for MQTT receiving and updating data or reading data from OPC UA server
+        json json_payload = json::parse(payload);
 
-                // if(data.contains("TagId") && data["TagId"].is_number_integer()) {
-                //     int tagId = data["TagId"].get<int>();
-                //     cout << "TagId: " << tagId << endl;
+        if (!json_payload.contains("Data") || !json_payload["Data"].is_array())
+            return;
 
-                //     if(clientPool.count(Mapping[tagId].second)) {
-                //         string endpoint = Mapping[tagId].second;
-                //         auto context = clientPool[endpoint];
-                //         std::cout << "Ready to use client: Anexee (connected to "
-                //                   << context->endpoint << ")" << std::endl;
+        auto data = json_payload["Data"][0];
+        if (!data.contains("TagId") || !data["TagId"].is_number_integer())
+            return;
 
-                //         if(UA_STATUSCODE_GOOD ==
-                //                context->subscription.responseHeader.serviceResult &&
-                //            context->subscription.subscriptionId != 0) {
+        int tagId = data["TagId"].get<int>();
+        std::cout << "TagId: " << tagId << std::endl;
 
-                //             std::lock_guard<std::mutex> lock(context->taskMutex);
-                //             context->taskQueue.push([context,tagId]() {
-                //                 MonitorItem(context->client.get(), context->subscription,
-                //                             Mapping[tagId].first.c_str(), tagId);
-                //             });
-                //         } else {
-                //             std::cerr << "Failed to create subscription" << std::endl;
-                //         }
-                //     }
-                // }
+        if (!data.contains("UpdateType") || !data["UpdateType"].is_string())
+            return;
 
-                
-            }
-        
-        
-        });
+        int updateType = data["UpdateType"].get<int>();
+        std::cout << "UpdateType: " << updateType << std::endl;
 
+        std::string endpoint = Mapping[tagId].second;
+        if (!clientPool.count(endpoint))
+            return;
 
+        auto context = clientPool.at(endpoint);
+        std::cout << "Ready to use client:  (connected to " << context->endpoint << ")" << std::endl;
 
-
-
-
-    if(clientPool.count("opc.tcp://localhost:53531")) {
-        auto context = clientPool["opc.tcp://localhost:53531"];
-        std::cout << "Ready to use client: Anexee (connected to "
-                  << context->endpoint << ")" << std::endl;
-
-        if (UA_STATUSCODE_GOOD == context->subscription.responseHeader.serviceResult &&
-            context->subscription.subscriptionId != 0) {
-
-            std::lock_guard<std::mutex> lock(context->taskMutex);
-            context->taskQueue.push([context]() {
-                MonitorItem(context->client.get(), context->subscription, "ns=1;i=194", 123);
-            });
-        } else {
+        if (context->subscription.responseHeader.serviceResult != UA_STATUSCODE_GOOD ||
+            context->subscription.subscriptionId == 0) {
             std::cerr << "Failed to create subscription" << std::endl;
+            return;
         }
+
+        if (updateType == UpdateType::TELEMETERY) {
+            // std::lock_guard<std::mutex> lock(context->taskMutex);
+            // context->taskQueue.push([context, tagId]() {
+            //     MonitorItem(context->client.get(), context->subscription,
+            //                 Mapping[tagId].first.c_str(), tagId);
+            // });
+            cout<<"TELEMETERY"<<endl;
+        } else if (updateType == UpdateType::COMMAND) {
+            std::lock_guard<std::mutex> lock(context->taskMutex);
+            context->taskQueue.push([context, tagId, data, topic, json_payload]() mutable {
+                UA_Variant value;
+                UA_Variant_init(&value);
+                double val = data["Value"].get<double>();
+                UA_Variant_setScalar(&value, &val, &UA_TYPES[UA_TYPES_DOUBLE]);
+
+                auto nsAndValue = extractNsAndValue(Mapping[tagId].first);
+                UA_StatusCode retval = UA_Client_writeValueAttribute(
+                    context->client.get(),
+                    UA_NODEID_STRING(nsAndValue.first, const_cast<char*>(nsAndValue.second.c_str())),
+                    &value);
+
+                if (retval != UA_STATUSCODE_GOOD) {
+                    std::cerr << "Failed to write value: " << UA_StatusCode_name(retval) << std::endl;
+                } else {
+                    std::cout << "Value written successfully" << std::endl;
+                    g_mqttHandler->publish(topic, json_payload.dump());
+                }
+
+                UA_Variant_clear(&value);
+            });
+        }
+        else if (updateType == UpdateType::BULKDATA) {
+            cout<<"BULKDATA"<<endl;
+        }
+        
     }
+);
+
+
+
+
+
+
+
+    // if(clientPool.count("opc.tcp://localhost:53531")) {
+    //     auto context = clientPool["opc.tcp://localhost:53531"];
+    //     std::cout << "Ready to use client: Anexee (connected to "
+    //               << context->endpoint << ")" << std::endl;
+
+    //     if (UA_STATUSCODE_GOOD == context->subscription.responseHeader.serviceResult &&
+    //         context->subscription.subscriptionId != 0) {
+
+    //         std::lock_guard<std::mutex> lock(context->taskMutex);
+    //         context->taskQueue.push([context]() {
+    //             MonitorItem(context->client.get(), context->subscription, "ns=1;i=194", 123);
+    //         });
+    //     } else {
+    //         std::cerr << "Failed to create subscription" << std::endl;
+    //     }
+    // }
 
 
 
