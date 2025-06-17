@@ -140,7 +140,7 @@ parseNodeId(const char *nodeIdStr) {
 
 static void
 MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
-            const char *nodeIdStr, const char *serverName) {
+            const char *nodeIdStr, int tagID) {
 
     UA_MonitoredItemCreateRequest monRequest;
     UA_MonitoredItemCreateResult monResponse;
@@ -163,7 +163,7 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
         UA_String nodeIdStr = UA_STRING_NULL;
         UA_NodeId_print(&monRequest.itemToMonitor.nodeId, &nodeIdStr);
         cout << "Monitoring Node " << string((char *)nodeIdStr.data, nodeIdStr.length)
-             << ", id " << monResponse.monitoredItemId << serverName << endl;
+             << ", id " << monResponse.monitoredItemId << tagID << endl;
         UA_String_clear(&nodeIdStr);
     }
 }

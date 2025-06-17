@@ -121,24 +121,7 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    // Set up callback for MQTT messages
-    g_mqttHandler->setCallback([](const std::string& topic, const std::string& payload) {
-        std::cout << "Received message on topic " << topic << ": " << payload << std::endl;
-        cout<<endl;
-        cout<<endl;
 
-        json json_payload = json::parse(payload);
-        std::cout << "Parsed payload: " << json_payload.dump() << std::endl;
-
-            // {"Data":[{"TagId":233,"Value":4715.46644,"TagType":"INFO_INC","TimeStamp":"2025-06-16T15:57:49.1859843+05:30","Source":2,"DatapointId":233,"InfoId":1001,"Quality":1,"UpdateType":1}]}
-
-        
-
-
-
-
-        
-    });
 
 #ifdef UA_ENABLE_SUBSCRIPTIONS
     signal(SIGINT, stopHandler);
@@ -222,7 +205,7 @@ int main() {
 #endif
 
         context->startLoop();
-        clientPool[context->name] = context.get();
+        clientPool[context->endpoint] = context.get();
         clientContexts.push_back(std::move(context));
     }
 
@@ -230,8 +213,61 @@ int main() {
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    if(clientPool.count("Anexee")) {
-        auto context = clientPool["Anexee"];
+
+
+
+        // Set up callback for MQTT messages
+    g_mqttHandler->setCallback(
+        [clientPool](const std::string &topic, const std::string &payload) {
+            std::cout << "Received message on topic " << topic << ": " << payload
+                      << std::endl;
+            cout << endl;
+            cout << endl;
+            json json_payload = json::parse(payload);
+            // {"Data":[{"TagId":233,"Value":4715.46644,"TagType":"INFO_INC","TimeStamp":"2025-06-16T15:57:49.1859843+05:30","Source":2,"DatapointId":233,"InfoId":1001,"Quality":1,"UpdateType":1}]}
+            if(json_payload.contains("Data") && json_payload["Data"].is_array()) {
+                auto data = json_payload["Data"][0];
+
+                //Modify for MQTT receiving and updating data or reading data from OPC UA server
+
+                // if(data.contains("TagId") && data["TagId"].is_number_integer()) {
+                //     int tagId = data["TagId"].get<int>();
+                //     cout << "TagId: " << tagId << endl;
+
+                //     if(clientPool.count(Mapping[tagId].second)) {
+                //         string endpoint = Mapping[tagId].second;
+                //         auto context = clientPool[endpoint];
+                //         std::cout << "Ready to use client: Anexee (connected to "
+                //                   << context->endpoint << ")" << std::endl;
+
+                //         if(UA_STATUSCODE_GOOD ==
+                //                context->subscription.responseHeader.serviceResult &&
+                //            context->subscription.subscriptionId != 0) {
+
+                //             std::lock_guard<std::mutex> lock(context->taskMutex);
+                //             context->taskQueue.push([context,tagId]() {
+                //                 MonitorItem(context->client.get(), context->subscription,
+                //                             Mapping[tagId].first.c_str(), tagId);
+                //             });
+                //         } else {
+                //             std::cerr << "Failed to create subscription" << std::endl;
+                //         }
+                //     }
+                // }
+
+                
+            }
+        
+        
+        });
+
+
+
+
+
+
+    if(clientPool.count("opc.tcp://localhost:53531")) {
+        auto context = clientPool["opc.tcp://localhost:53531"];
         std::cout << "Ready to use client: Anexee (connected to "
                   << context->endpoint << ")" << std::endl;
 
@@ -240,7 +276,7 @@ int main() {
 
             std::lock_guard<std::mutex> lock(context->taskMutex);
             context->taskQueue.push([context]() {
-                MonitorItem(context->client.get(), context->subscription, "ns=1;i=194", "Anexee");
+                MonitorItem(context->client.get(), context->subscription, "ns=1;i=194", 123);
             });
         } else {
             std::cerr << "Failed to create subscription" << std::endl;

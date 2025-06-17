@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <iostream>
+#include <unordered_map>
 
 
 #include <nlohmann/json.hpp>
@@ -33,7 +34,7 @@ namespace beast = boost::beast;
 using tcp = boost::asio::ip::tcp;  
 
 as::io_context ioc;
-
+unordered_map<int, pair<string, string>> Mapping;
 
 json getBearerToken() {
     try {
@@ -192,67 +193,67 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                 serverInfo.typeId = item["typeId"].get<string>();
                 serverInfo.parentId = item["parentId"].get<string>();
 
-                if(item.contains("groups") && item["groups"].is_array()) {
-                    vector<GroupInfo> groups;
-                    for(const auto &groupItem : item["groups"]) {
-                        GroupInfo groupInfo;
+                // if(item.contains("groups") && item["groups"].is_array()) {
+                //     vector<GroupInfo> groups;
+                //     for(const auto &groupItem : item["groups"]) {
+                //         GroupInfo groupInfo;
 
-                        groupInfo.dataPointId = groupItem["dataPointId"].get<int>();
-                        groupInfo.name = groupItem["name"].get<string>();
-                        groupInfo.nodeId = groupItem["nodeId"].get<string>();
-                        groupInfo.typeId = groupItem["typeId"].get<string>();
-                        groupInfo.parentId = groupItem["parentId"].get<string>();
+                //         groupInfo.dataPointId = groupItem["dataPointId"].get<int>();
+                //         groupInfo.name = groupItem["name"].get<string>();
+                //         groupInfo.nodeId = groupItem["nodeId"].get<string>();
+                //         groupInfo.typeId = groupItem["typeId"].get<string>();
+                //         groupInfo.parentId = groupItem["parentId"].get<string>();
 
-                        if(groupItem.contains("tags") && groupItem["tags"].is_array()) {
-                            vector<TagInfo> groupTags;
-                            for(const auto &tagItem : groupItem["tags"]) {
-                                TagInfo tagInfo;
+                //         if(groupItem.contains("tags") && groupItem["tags"].is_array()) {
+                //             vector<TagInfo> groupTags;
+                //             for(const auto &tagItem : groupItem["tags"]) {
+                //                 TagInfo tagInfo;
 
-                                tagInfo.scaling = tagItem["scaling"].get<bool>();
-                                tagInfo.rawMin = tagItem["rawMin"].get<double>();
-                                tagInfo.rawMax = tagItem["rawMax"].get<double>();
-                                tagInfo.scaleMin = tagItem["scaleMin"].get<double>();
-                                tagInfo.scaleMax = tagItem["scaleMax"].get<double>();
-                                tagInfo.enableExpression =
-                                    tagItem["enableExpression"].get<bool>();
-                                tagInfo.expression = tagItem["expression"].get<string>();
-                                tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
-                                tagInfo.name = tagItem["name"].get<string>();
-                                tagInfo.nodeId = tagItem["nodeId"].get<string>();
-                                tagInfo.typeId = tagItem["typeId"].get<string>();
-                                tagInfo.parentId = tagItem["parentId"].get<string>();
+                //                 tagInfo.scaling = tagItem["scaling"].get<bool>();
+                //                 tagInfo.rawMin = tagItem["rawMin"].get<double>();
+                //                 tagInfo.rawMax = tagItem["rawMax"].get<double>();
+                //                 tagInfo.scaleMin = tagItem["scaleMin"].get<double>();
+                //                 tagInfo.scaleMax = tagItem["scaleMax"].get<double>();
+                //                 tagInfo.enableExpression =
+                //                     tagItem["enableExpression"].get<bool>();
+                //                 tagInfo.expression = tagItem["expression"].get<string>();
+                //                 tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
+                //                 tagInfo.name = tagItem["name"].get<string>();
+                //                 tagInfo.nodeId = tagItem["nodeId"].get<string>();
+                //                 tagInfo.typeId = tagItem["typeId"].get<string>();
+                //                 tagInfo.parentId = tagItem["parentId"].get<string>();
 
-                                if(tagItem.contains("mappedInfospaceTags") &&
-                                   tagItem["mappedInfospaceTags"].is_array()) {
-                                    vector<MappedInfospaceTag> mappedTags;
-                                    for(const auto &mappedTag :
-                                        tagItem["mappedInfospaceTags"]) {
-                                        MappedInfospaceTag mappedInfo;
-                                        mappedInfo.id = mappedTag["id"].get<int>();
-                                        mappedInfo.tagId = mappedTag["tagId"].get<int>();
-                                        mappedInfo.name = mappedTag["name"].get<string>();
-                                        mappedInfo.namespaces =
-                                            mappedTag["namespace"].get<string>();
-                                        mappedInfo.isSimulationProfile =
-                                            mappedTag["isSimulationProfile"].get<bool>();
-                                        mappedInfo.isLogging =
-                                            mappedTag["isLogging"].get<bool>();
-                                        mappedInfo.isVirtual =
-                                            mappedTag["isVirtual"].get<bool>();
-                                        mappedTags.push_back(mappedInfo);
-                                    }
-                                    tagInfo.mappedInfospaceTags = mappedTags;
-                                }
+                //                 if(tagItem.contains("mappedInfospaceTags") &&
+                //                    tagItem["mappedInfospaceTags"].is_array()) {
+                //                     vector<MappedInfospaceTag> mappedTags;
+                //                     for(const auto &mappedTag :
+                //                         tagItem["mappedInfospaceTags"]) {
+                //                         MappedInfospaceTag mappedInfo;
+                //                         mappedInfo.id = mappedTag["id"].get<int>();
+                //                         mappedInfo.tagId = mappedTag["tagId"].get<int>();
+                //                         mappedInfo.name = mappedTag["name"].get<string>();
+                //                         mappedInfo.namespaces =
+                //                             mappedTag["namespace"].get<string>();
+                //                         mappedInfo.isSimulationProfile =
+                //                             mappedTag["isSimulationProfile"].get<bool>();
+                //                         mappedInfo.isLogging =
+                //                             mappedTag["isLogging"].get<bool>();
+                //                         mappedInfo.isVirtual =
+                //                             mappedTag["isVirtual"].get<bool>();
+                //                         mappedTags.push_back(mappedInfo);
+                //                     }
+                //                     tagInfo.mappedInfospaceTags = mappedTags;
+                //                 }
 
-                                groupTags.push_back(tagInfo);
-                            }
-                            groupInfo.tags = groupTags;
-                        }
+                //                 groupTags.push_back(tagInfo);
+                //             }
+                //             groupInfo.tags = groupTags;
+                //         }
 
-                        groups.push_back(groupInfo);
-                    }
-                    serverInfo.groups = groups;
-                }
+                //         groups.push_back(groupInfo);
+                //     }
+                //     serverInfo.groups = groups;
+                // }
 
                 if(item.contains("tags") && item["tags"].is_array()) {
                     vector<TagInfo> serverTags;
@@ -265,13 +266,27 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                         tagInfo.scaleMin = tagItem["scaleMin"].get<double>();
                         tagInfo.scaleMax = tagItem["scaleMax"].get<double>();
                         tagInfo.enableExpression =
-                            tagItem["enableExpression"].get<bool>();
+                        tagItem["enableExpression"].get<bool>();
                         tagInfo.expression = tagItem["expression"].get<string>();
-                        tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
+
+                        if(tagItem.contains("namespaceNodeID") && tagItem["namespaceNodeID"].is_string()) {
+                            tagInfo.namespaceNodeID = tagItem["namespaceNodeID"].get<string>();
+                        }
+                        if(tagItem.contains("dataPointId") && tagItem["dataPointId"].is_number_integer()) {
+                            tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
+                        }
+                        if(tagItem.contains("name") && tagItem["name"].is_string()) {
                         tagInfo.name = tagItem["name"].get<string>();
-                        tagInfo.nodeId = tagItem["nodeId"].get<string>();
-                        tagInfo.typeId = tagItem["typeId"].get<string>();
-                        tagInfo.parentId = tagItem["parentId"].get<string>();
+                        }
+                        if(tagItem.contains("nodeId") && tagItem["nodeId"].is_string()) {
+                            tagInfo.nodeId = tagItem["nodeId"].get<string>();
+                        }
+                        if(tagItem.contains("typeId") && tagItem["typeId"].is_string()) {
+                            tagInfo.typeId = tagItem["typeId"].get<string>();
+                        }
+                        if(tagItem.contains("parentId") && tagItem["parentId"].is_string()) {
+                            tagInfo.parentId = tagItem["parentId"].get<string>();
+                        }
 
                         if(tagItem.contains("mappedInfospaceTags") &&
                            tagItem["mappedInfospaceTags"].is_array()) {
@@ -279,7 +294,7 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                             for(const auto &mappedTag : tagItem["mappedInfospaceTags"]) {
                                 MappedInfospaceTag mappedInfo;
                                 mappedInfo.id = mappedTag["id"].get<int>();
-                                mappedInfo.tagId = mappedTag["tagId"].get<int>();
+                                mappedInfo.tagId = mappedTag["tagId"].get<int>();                                
                                 mappedInfo.name = mappedTag["name"].get<string>();
                                 mappedInfo.namespaces =
                                     mappedTag["namespace"].get<string>();
@@ -287,6 +302,13 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                                     mappedTag["isSimulationProfile"].get<bool>();
                                 mappedInfo.isLogging = mappedTag["isLogging"].get<bool>();
                                 mappedInfo.isVirtual = mappedTag["isVirtual"].get<bool>();
+                                
+                                
+                                if(tagItem.contains("namespaceNodeID") && tagItem["namespaceNodeID"].is_string() && tagInfo.namespaceNodeID.has_value()) {
+                                    pair<string, string> NodePair = {tagInfo.namespaceNodeID.value(), serverInfo.endpointUrl};
+                                    Mapping[mappedInfo.tagId] = NodePair;
+                                }
+
                                 mappedTags.push_back(mappedInfo);
                             }
                             tagInfo.mappedInfospaceTags = mappedTags;
@@ -301,7 +323,12 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
             }
         }
     }
+
+    cout << "Mapping: " << endl;
+    for(const auto &mapping : Mapping) {
+        cout << mapping.first << " " << mapping.second.first << " " << mapping.second.second << endl;
+    }
+    cout << endl;
+
     return servers;
 }
-
-

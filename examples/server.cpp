@@ -632,8 +632,8 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, stopHandler);
     signal(SIGTERM, stopHandler);
 
-    UA_ByteString certificate = loadFile("D:/OPC UA Server/OPCUA- open 62451/open62541-C/build/bin/examples/certs/own/certs/server_cert.der");
-    UA_ByteString privateKey  = loadFile("D:/OPC UA Server/OPCUA- open 62451/open62541-C/build/bin/examples/certs/own/certs/server_key.der");
+    UA_ByteString certificate = loadFile("certs/own/certs/server_cert.der");
+    UA_ByteString privateKey  = loadFile("certs/own/certs/server_key.der");
     
     if(certificate.length == 0 || privateKey.length == 0) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
