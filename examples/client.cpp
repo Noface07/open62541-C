@@ -191,16 +191,41 @@ int main() {
         context->name = server.name;
         context->endpoint = server.endpointUrl;
         context->client = std::unique_ptr<UA_Client, UA_Client_Deleter>(UA_Client_new());
-        UA_ClientConfig_setDefault(UA_Client_getConfig(context->client.get()));
 
         
-
         //ADD LOGIC FOR CERTIFICATES
             /* TODO */
+        UA_ByteString client_cert = loadFile("client/own/certs/client_cert.der");
+        UA_ByteString client_key = loadFile("client/own/certs/client_key.der");
+        UA_ByteString server_cert = loadFile("server/own/certs/server_cert.der");
+        UA_ByteString ca_cert = loadFile("ca/certs/ca.crt");
+        UA_ByteString revocation_cert = loadFile("server/trusted/crl/crl.crl");
 
+        // Create trust list array
+        UA_STACKARRAY(UA_ByteString, trustList, 1);
+        trustList[0] = ca_cert;
+
+        UA_STACKARRAY(UA_ByteString, revocationList, 1);   
+        revocationList[0] = revocation_cert;
 
         //FOR SECURITY POLICY and MESSAGE SECURITY MODE
-        // UA_ClientConfig *config = UA_Client_getConfig(context->client.get());
+        
+        if(server.endpointUrl == "opc.tcp://Asce:53531") {
+        
+        UA_ClientConfig *config = UA_Client_getConfig(context->client.get());
+        UA_ClientConfig_setDefaultEncryption(config,
+            client_cert,
+            client_key,
+            trustList,  // trustList array
+            1,  // trustListSize (number of certificates in trust list)
+            revocationList,  // RevocationList
+            1);  // RevocationListSize
+            
+            config->applicationUri = UA_STRING_STATIC("urn:Anexee.server.application");
+            config->clientDescription.applicationUri = UA_STRING_STATIC("urn:Anexee.server.application");
+            config->clientDescription.applicationName = UA_LOCALIZEDTEXT_ALLOC("en-US", "Anexee");
+            config->clientDescription.productUri = UA_STRING_STATIC("urn:Anexee");
+
         // if (server.msgSecurityMode == "None") {
         //     config->securityMode = UA_MESSAGESECURITYMODE_NONE;
         // } else if (server.msgSecurityMode == "Sign") {
@@ -210,18 +235,26 @@ int main() {
         // } else {
         //     config->securityMode = UA_MESSAGESECURITYMODE_INVALID;
         // }
-
         // std::string base = "http://opcfoundation.org/UA/SecurityPolicy#";
         // std::string full = base + server.securityPolicy;
         // config->securityPolicyUri = UA_STRING_STATIC(full.c_str());
 
-
-        UA_StatusCode retval = UA_Client_connect(context->client.get(), server.endpointUrl.c_str());
+        config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
+        config->securityPolicyUri = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
+                UA_StatusCode retval = UA_Client_connect(context->client.get(), server.endpointUrl.c_str());
         if(retval != UA_STATUSCODE_GOOD) {
             std::cerr << "Could not connect to server: " << server.endpointUrl << std::endl;
             continue;
         }
-
+        }
+        else{
+                UA_ClientConfig_setDefault(UA_Client_getConfig(context->client.get()));
+                UA_StatusCode retval = UA_Client_connect(context->client.get(), server.endpointUrl.c_str());
+                if(retval != UA_STATUSCODE_GOOD) {
+                    std::cerr << "Could not connect to server: " << server.endpointUrl << std::endl;
+                    continue;
+                }
+        }
 #ifdef UA_ENABLE_SUBSCRIPTIONS
         UA_CreateSubscriptionRequest request = UA_CreateSubscriptionRequest_default();
         request.requestedMaxKeepAliveCount = 60;

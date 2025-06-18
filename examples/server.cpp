@@ -632,8 +632,8 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, stopHandler);
     signal(SIGTERM, stopHandler);
 
-    UA_ByteString certificate = loadFile("certs/own/certs/server_cert.der");
-    UA_ByteString privateKey  = loadFile("certs/own/certs/server_key.der");
+    UA_ByteString certificate = loadFile("server/own/certs/server_cert.der");  
+    UA_ByteString privateKey  = loadFile("server/own/certs/server_key.der");
     
     if(certificate.length == 0 || privateKey.length == 0) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -642,11 +642,11 @@ int main(int argc, char* argv[]) {
     }
 
     UA_ByteString *trustList = NULL;
-    size_t trustListSize = loadCertsFromDirectory("certs/trusted/certs", &trustList);
+    size_t trustListSize = loadCertsFromDirectory("server/trusted/certs", &trustList);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Loaded %zu trusted certificate(s).", trustListSize);
     
     UA_ByteString *issuerList = NULL;
-    size_t issuerListSize = loadCertsFromDirectory("certs/issuers/certs", &issuerList);
+    size_t issuerListSize = loadCertsFromDirectory("server/issuers/certs", &issuerList);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Loaded %zu issuer certificate(s).", issuerListSize);
 
     size_t revocationListSize = 0;
@@ -1363,16 +1363,11 @@ UA_Server_writeObjectProperty_scalar(
         // memset(&cc, 0, sizeof(UA_ClientConfig));
         // UA_ClientConfig_setDefault(&cc);
 
-        // const char *certPath = "D:/OPC UA Server/OPCUA- open "
-        //                       "62451/open62541-C/build/bin/examples/client/client.der";
-        // const char *certKey = "D:/OPC UA Server/OPCUA- open "
-        //                        "62451/open62541-C/build/bin/examples/client/client_key.der";
-        // const char *servercertPath = "D:/OPC UA Server/OPCUA- open "
-        //                        "62451/open62541-C/build/bin/examples/Certs/own/certs/server_cert.der";
-
-        // UA_ByteString certificatee = loadFile(certPath);
-        // UA_ByteString privateKeye = loadFile(certKey);
-        // UA_ByteString serverCerte = loadFile(servercertPath);
+        // UA_ByteString client_cert = loadFile("client/own/certs/client_cert.der");
+        // UA_ByteString client_key = loadFile("client/own/certs/client_key.der");
+        // UA_ByteString server_cert = loadFile("server/own/certs/server_cert.der");
+        // UA_ByteString ca_cert = loadFile("ca/certs/ca.crt");
+        // UA_ByteString revocation_cert = loadFile("server/trusted/crl/crl.crl");
 
         //     if (certificate.length == 0) {
         //         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to load client certificate"); 

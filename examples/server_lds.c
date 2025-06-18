@@ -149,8 +149,8 @@ main(void) {
 
 
 
-    UA_ByteString certificate = loadFile("certs/own/certs/server_cert.der");
-    UA_ByteString privateKey  = loadFile("certs/own/certs/server_key.der");
+    UA_ByteString certificate = loadFile("server/own/certs/server_cert.der");
+    UA_ByteString privateKey  = loadFile("server/own/certs/server_key.der");
     
     if(certificate.length == 0 || privateKey.length == 0) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -159,11 +159,11 @@ main(void) {
     }
 
     UA_ByteString *trustList = NULL;
-    size_t trustListSize = loadCertsFromDirectory("certs/trusted/certs", &trustList);
+    size_t trustListSize = loadCertsFromDirectory("server/trusted/certs", &trustList);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Loaded %zu trusted certificate(s).", trustListSize);
     
     UA_ByteString *issuerList = NULL;
-    size_t issuerListSize = loadCertsFromDirectory("certs/issuers/certs", &issuerList);
+    size_t issuerListSize = loadCertsFromDirectory("server/issued/certs", &issuerList);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Loaded %zu issuer certificate(s).", issuerListSize);
 
     size_t revocationListSize = 0;
