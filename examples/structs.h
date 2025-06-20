@@ -35,14 +35,14 @@ struct TagInfo{
     optional<string> parentId;
 };
 
-// struct GroupInfo{
-//     vector<TagInfo> tags;
-//     int dataPointId;
-//     string typeId;
-//     string parentId;
-//     string name;
-//     string nodeId;
-// };
+struct GroupInfo{
+    vector<TagInfo> tags;
+    int dataPointId;
+    string typeId;
+    string parentId;
+    string name;
+    string nodeId;
+};
 
 struct ServerInfoO{
     string cfgName;
@@ -50,8 +50,8 @@ struct ServerInfoO{
     string securityPolicy;
     string msgSecurityMode;
     string authType;
-    // vector<GroupInfo> groups;
-    vector<TagInfo> tags;
+    vector<GroupInfo> groups;
+    // vector<TagInfo> tags;
     int dataPointId;
     string name;
     string nodeId;
