@@ -24,7 +24,7 @@
 #include "structs.h"
 
 
-using json = nlohmann::json;
+using json = nlohmann::ordered_json;
 
 
 using namespace std;
@@ -35,6 +35,7 @@ using tcp = boost::asio::ip::tcp;
 
 as::io_context ioc;
 unordered_map<int, pair<string, string>> Mapping;
+unordered_map<int, string> TopicMapping;
 
 json getBearerToken() {
     try {
@@ -307,8 +308,8 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                                 // if(tagItem.contains("namespaceNodeID") && tagItem["namespaceNodeID"].is_string() && tagInfo.namespaceNodeID.has_value()) {
                                     pair<string, string> NodePair = {tagInfo.name.value(), serverInfo.endpointUrl};
                                     Mapping[mappedInfo.tagId] = NodePair;
-                                // }
 
+                                // }
                                 mappedTags.push_back(mappedInfo);
                             }
                             tagInfo.mappedInfospaceTags = mappedTags;
@@ -318,6 +319,10 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                     }
                     serverInfo.tags = serverTags;
                 }
+
+
+
+
 
                 servers.push_back(serverInfo);
             }

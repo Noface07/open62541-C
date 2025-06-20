@@ -23,7 +23,7 @@
 #include <functional>
 
 #include "Monitoring.cpp"
-#include "MQTThandler.cpp"
+#include "MQTThandler.h"
 #include "fetchAPI.cpp"
 #include "structs.h"
 
@@ -52,6 +52,7 @@ struct UA_Client_Deleter {
             UA_Client_delete(client);
     }
 };
+
 
 
 struct ClientContext {
@@ -127,6 +128,9 @@ int main() {
         std::cerr << "Failed to connect to MQTT broker" << std::endl;
         return EXIT_FAILURE;
     }
+    else{
+        std::cout << "Connected to MQTT broker" << std::endl;
+    }
 
 
 
@@ -162,11 +166,19 @@ int main() {
             }
             cout<<endl;
             
-            // Print mapped infospace tags if they exist
+            // Subscribe if it is R/W
+            // if tag.att= r/w{
             if(tag.mappedInfospaceTags) {
                 for(const auto &infoSpace : *tag.mappedInfospaceTags) {
                     cout << infoSpace.namespaces << " ";
-                    g_mqttHandler->subscribe(infoSpace.namespaces);
+                    
+                    if(g_mqttHandler->isConnected()){
+                        g_mqttHandler->subscribe(infoSpace.namespaces);
+                        std::cout << "Subscribing to topic: " << infoSpace.namespaces << std::endl;
+                    }
+                    else{
+                        std::cout << "MQTT handler is not connected" << std::endl;
+                    }
 
                     cout << infoSpace.namespaces << endl;
 
@@ -176,6 +188,7 @@ int main() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
             }
+            // }
         }
     }
     cout << endl;
@@ -210,7 +223,7 @@ int main() {
 
         //FOR SECURITY POLICY and MESSAGE SECURITY MODE
         
-        if(server.endpointUrl == "opc.tcp://Asce:53531") {
+        if(server.msgSecurityMode != "NONE") {
         
         UA_ClientConfig *config = UA_Client_getConfig(context->client.get());
         UA_ClientConfig_setDefaultEncryption(config,
@@ -226,25 +239,38 @@ int main() {
             config->clientDescription.applicationName = UA_LOCALIZEDTEXT_ALLOC("en-US", "Anexee");
             config->clientDescription.productUri = UA_STRING_STATIC("urn:Anexee");
 
-        // if (server.msgSecurityMode == "None") {
-        //     config->securityMode = UA_MESSAGESECURITYMODE_NONE;
-        // } else if (server.msgSecurityMode == "Sign") {
-        //     config->securityMode = UA_MESSAGESECURITYMODE_SIGN;
-        // } else if (server.msgSecurityMode == "SignAndEncrypt") {
-        //     config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
-        // } else {
-        //     config->securityMode = UA_MESSAGESECURITYMODE_INVALID;
-        // }
-        // std::string base = "http://opcfoundation.org/UA/SecurityPolicy#";
-        // std::string full = base + server.securityPolicy;
-        // config->securityPolicyUri = UA_STRING_STATIC(full.c_str());
+            if (server.msgSecurityMode == "NONE") {
+                config->securityMode = UA_MESSAGESECURITYMODE_NONE;
+            } else if (server.msgSecurityMode == "OPC_UA_SM_SG") {
+                config->securityMode = UA_MESSAGESECURITYMODE_SIGN;
+            } else if (server.msgSecurityMode == "OPC_UA_SM_SG_ENC") {
+                config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
+            } else {
+                config->securityMode = UA_MESSAGESECURITYMODE_INVALID;
+            }
+            // std::string base = "http://opcfoundation.org/UA/SecurityPolicy#";
+            // std::string full = base + server.securityPolicy;
+            // config->securityPolicyUri = UA_STRING_STATIC(full.c_str());
 
-        config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
-        config->securityPolicyUri = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
-                UA_StatusCode retval = UA_Client_connect(context->client.get(), server.endpointUrl.c_str());
-        if(retval != UA_STATUSCODE_GOOD) {
-            std::cerr << "Could not connect to server: " << server.endpointUrl << std::endl;
-            continue;
+            // config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
+            config->securityPolicyUri = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
+            
+            UA_StatusCode retval;
+            
+            if(server.authType == "anonymous") {
+                retval = UA_Client_connect(context->client.get(), server.endpointUrl.c_str());
+            }
+            else if (server.authType == "user") {
+                retval = UA_Client_connectUsername(context->client.get(), server.endpointUrl.c_str(), "user1", "password1");
+            } 
+            else {
+                std::cerr << "Invalid authentication type: " << server.authType << std::endl;
+                continue;
+            }
+
+            if(retval != UA_STATUSCODE_GOOD) {
+                std::cerr << "Could not connect to server: " << server.endpointUrl << std::endl;
+                continue;
         }
         }
         else{
@@ -258,6 +284,12 @@ int main() {
 #ifdef UA_ENABLE_SUBSCRIPTIONS
         UA_CreateSubscriptionRequest request = UA_CreateSubscriptionRequest_default();
         request.requestedMaxKeepAliveCount = 60;
+        request.requestedPublishingInterval = 1000;
+        request.publishingEnabled = true;
+        request.requestedLifetimeCount = 100;
+        request.priority = 0;
+        request.maxNotificationsPerPublish = 100;
+        request.maxNotificationsPerPublish = 100;
 
         context->subscription = UA_Client_Subscriptions_create(
             context->client.get(), request, nullptr, nullptr, nullptr);
@@ -270,9 +302,30 @@ int main() {
         context->startLoop();
         clientPool[context->endpoint] = context.get();
         clientContexts.push_back(std::move(context));
+
+        for(const auto &tag : server.tags) {
+            for(const auto &infoSpace : *tag.mappedInfospaceTags) {
+
+                
+
+            auto context = clientPool.at(Mapping[infoSpace.tagId].second);
+            std::lock_guard<std::mutex> lock(context->taskMutex);
+            context->taskQueue.push([context, infoSpace]() {
+                MyMonitorContext *myContext = new MyMonitorContext{infoSpace, g_mqttHandler};
+                MonitorItem(context->client.get(), context->subscription,
+                            Mapping[infoSpace.tagId].first.c_str(), infoSpace.tagId,myContext);
+                });
+
+            }
+        }
+
+
+
     }
 
     std::cout << "Client pool initialized. Press Ctrl+C to stop..." << std::endl;
+
+    
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
@@ -352,61 +405,6 @@ g_mqttHandler->setCallback(
         
     }
 );
-
-
-
-
-
-
-
-    // if(clientPool.count("opc.tcp://localhost:53531")) {
-    //     auto context = clientPool["opc.tcp://localhost:53531"];
-    //     std::cout << "Ready to use client: Anexee (connected to "
-    //               << context->endpoint << ")" << std::endl;
-
-    //     if (UA_STATUSCODE_GOOD == context->subscription.responseHeader.serviceResult &&
-    //         context->subscription.subscriptionId != 0) {
-
-    //         std::lock_guard<std::mutex> lock(context->taskMutex);
-    //         context->taskQueue.push([context]() {
-    //             MonitorItem(context->client.get(), context->subscription, "ns=1;i=194", 123);
-    //         });
-    //     } else {
-    //         std::cerr << "Failed to create subscription" << std::endl;
-    //     }
-    // }
-
-
-
-
-
-
-
-
-
-
-    //     if(clientPool.count("Prosys")) {
-    //     auto context = clientPool["Prosys"];
-    //     std::cout << "Ready to use client: Anexee (connected to "
-    //               << context->endpoint << ")" << std::endl;
-
-    //     if (UA_STATUSCODE_GOOD == context->subscription.responseHeader.serviceResult &&
-    //         context->subscription.subscriptionId != 0) {
-
-    //         std::lock_guard<std::mutex> lock(context->taskMutex);
-    //         context->taskQueue.push([context]() {
-    //             MonitorItem(context->client.get(), context->subscription, "ns=3;i=1002", "Prosys");
-    //         });
-    //     } else {
-    //         std::cerr << "Failed to create subscription" << std::endl;
-    //     }
-    // }
-
-
-
-
-
-
 
 
     while(g_running) {

@@ -6,8 +6,7 @@
 
 using namespace std;
 
-
-
+class MQTTHandler; // Forward declaration
 
 struct MappedInfospaceTag{
     int id;
@@ -58,6 +57,14 @@ struct ServerInfoO{
     string nodeId;
     string typeId;
     string parentId;
+};
+
+struct MyMonitorContext {
+    MappedInfospaceTag infoSpace;
+    MQTTHandler* mqttHandler;
+    // unordered_map<int, string> TopicMapping;
+    // json payload;
+    // Add more fields as needed
 };
 
 
