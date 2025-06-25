@@ -256,25 +256,27 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
         cout << "Invalid node ID format: " << nodeIdStr << endl;
         return;
     }
-
+    
     monRequest = createMonitoredItemRequest(nodeId);
 
     monRequest.requestedParameters.clientHandle = 42;
     
     // Configure monitoring parameters for better timestamp handling
-    monRequest.requestedParameters.samplingInterval = 1000.0; // 1 second sampling interval
-    monRequest.requestedParameters.queueSize = 1; // Queue size for notifications
+    monRequest.requestedParameters.samplingInterval = myContext->infoSpace.samplingInterval; // 1 second sampling interval
+    monRequest.requestedParameters.queueSize = myContext->infoSpace.queuesize; // Queue size for notifications
     monRequest.requestedParameters.discardOldest = true; // Discard oldest when queue is full
     
     // Configure the monitoring filter
-    // UA_DataChangeFilter filter;
-    // filter.deadbandType = UA_DEADBANDTYPE_NONE; // No deadband filtering
-    // filter.deadbandValue = 0.0;
-    // monRequest.requestedParameters.filter = (UA_ExtensionObject) {
-    //     .encoding = UA_EXTENSIONOBJECT_DECODED,
-    //     .content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER],
-    //     .content.decoded.data = &filter
-    // };
+    UA_DataChangeFilter filter;
+    filter.deadbandType = UA_DEADBANDTYPE_PERCENT; // No deadband filtering
+    filter.deadbandValue =  myContext->infoSpace.deadband;
+    filter.trigger = UA_DATACHANGETRIGGER_STATUSVALUE;
+    UA_ExtensionObject filterExtObj;
+    memset(&filterExtObj, 0, sizeof(filterExtObj));
+    filterExtObj.encoding = UA_EXTENSIONOBJECT_DECODED;
+    filterExtObj.content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER];
+    filterExtObj.content.decoded.data = &filter;
+    monRequest.requestedParameters.filter = filterExtObj;
 
     monResponse = UA_Client_MonitoredItems_createDataChange(
         client, response.subscriptionId, UA_TIMESTAMPSTORETURN_BOTH, monRequest, myContext,

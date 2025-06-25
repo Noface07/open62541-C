@@ -149,21 +149,21 @@ main(void) {
 
 
 
-    UA_ByteString certificate = loadFile("server/own/certs/server_cert.der");
-    UA_ByteString privateKey  = loadFile("server/own/certs/server_key.der");
+    UA_ByteString certificate = loadFile("lds/own/certs/lds_cert.der");
+    UA_ByteString privateKey  = loadFile("lds/own/certs/lds_key.der");
     
-    if(certificate.length == 0 || privateKey.length == 0) {
-        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                     "Could not load server certificate or key from certs/own/");
-        return EXIT_FAILURE;
-    }
+    // if(certificate.length == 0 || privateKey.length == 0) {
+    //     UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+    //                  "Could not load server certificate or key from certs/own/");
+    //     return EXIT_FAILURE;
+    // }
 
     UA_ByteString *trustList = NULL;
-    size_t trustListSize = loadCertsFromDirectory("server/trusted/certs", &trustList);
+    size_t trustListSize = loadCertsFromDirectory("lds/trusted/certs", &trustList);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Loaded %zu trusted certificate(s).", trustListSize);
     
     UA_ByteString *issuerList = NULL;
-    size_t issuerListSize = loadCertsFromDirectory("server/issued/certs", &issuerList);
+    size_t issuerListSize = loadCertsFromDirectory("lds/issued/certs", &issuerList);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Loaded %zu issuer certificate(s).", issuerListSize);
 
     size_t revocationListSize = 0;
@@ -188,12 +188,12 @@ main(void) {
     // See also: https://forum.unified-automation.com/topic1987.html
     config->applicationDescription.applicationType = UA_APPLICATIONTYPE_DISCOVERYSERVER;
     UA_String_clear(&config->applicationDescription.applicationUri);
-    config->applicationDescription.applicationUri = UA_String_fromChars("urn:Anexee.server.application");
+    config->applicationDescription.applicationUri = UA_STRING_ALLOC("urn:Anexee.server.application");
 
-    config->secureChannelPKI.clear(&config->secureChannelPKI);
-    config->sessionPKI.clear(&config->sessionPKI);
-    UA_CertificateGroup_AcceptAll(&config->secureChannelPKI);
-    UA_CertificateGroup_AcceptAll(&config->sessionPKI);
+    // config->secureChannelPKI.clear(&config->secureChannelPKI);
+    // config->sessionPKI.clear(&config->sessionPKI);
+    // UA_CertificateGroup_AcceptAll(&config->secureChannelPKI);
+    // UA_CertificateGroup_AcceptAll(&config->sessionPKI);
 
     // Add a secure endpoint (example for Basic256Sha256)
     config->endpointsSize = 1;
@@ -202,7 +202,7 @@ main(void) {
 
     // Endpoint 0: None/Anonymous
     UA_EndpointDescription_init(&config->endpoints[0]);
-    config->endpoints[0].endpointUrl = UA_STRING_ALLOC("opc.tcp://0.0.0.0:4840");
+    config->endpoints[0].endpointUrl = UA_STRING_ALLOC("opc.tcp://Asce:4840");
     config->endpoints[0].securityMode = UA_MESSAGESECURITYMODE_NONE;
     config->endpoints[0].securityPolicyUri =
         UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#None");
@@ -220,56 +220,31 @@ main(void) {
     config->endpoints[0].userIdentityTokens[0].securityPolicyUri =
         UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#None");
 
-    // Endpoint 1: SignAndEncrypt/Certificate
-    // UA_EndpointDescription_init(&config->endpoints[0]);
-    // config->endpoints[0].endpointUrl = UA_STRING_ALLOC("opc.tcp://Asce:4840");
-    // config->endpoints[0].securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
-    // config->endpoints[0].securityPolicyUri =
-    // UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
-    // config->endpoints[0].userIdentityTokensSize = 1;
-    // config->endpoints[0].userIdentityTokens = (UA_UserTokenPolicy *) UA_Array_new(1,
-    // &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
-    // UA_UserTokenPolicy_init(&config->endpoints[1].userIdentityTokens[0]);
-    // config->endpoints[0].userIdentityTokens[0].tokenType =
-    // UA_USERTOKENTYPE_CERTIFICATE; config->endpoints[0].userIdentityTokens[0].policyId =
-    // UA_STRING_ALLOC("X509");
-    // config->endpoints[0].userIdentityTokens[0].securityPolicyUri =
-    // UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
+    // Endpoint 1: Basic256Sha256 / SignAndEncrypt
+    config->endpointsSize += 1;
+    config->endpoints = (UA_EndpointDescription *)UA_realloc(
+        config->endpoints, config->endpointsSize * sizeof(UA_EndpointDescription));
 
-    // for(size_t i = 0; i < config->endpointsSize; i++) {
-    //     UA_EndpointDescription *ep = &config->endpoints[i];
+    UA_EndpointDescription_init(&config->endpoints[1]);
+    config->endpoints[1].endpointUrl = UA_STRING_ALLOC("opc.tcp://Asce:4840");
+    config->endpoints[1].securityMode = UA_MESSAGESECURITYMODE_NONE;
+    config->endpoints[1].securityPolicyUri =
+        UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
+    config->endpoints[1].transportProfileUri =
+        UA_STRING_ALLOC("http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary");
 
-    //     UA_String_clear(&ep->endpointUrl);
-    //     ep->endpointUrl = UA_STRING_ALLOC("opc.tcp://Asce:4840");
+    // Configure user identity tokens (anonymous only in this example)
+    config->endpoints[1].userIdentityTokensSize = 1;
+    config->endpoints[1].userIdentityTokens =
+        (UA_UserTokenPolicy *)UA_Array_new(1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
 
-    //     /* Clear existing UserTokenPolicies first */
-    //     if(ep->userIdentityTokens) {
-    //         UA_Array_delete(ep->userIdentityTokens, ep->userIdentityTokensSize,
-    //         &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
-    //     }
+    UA_UserTokenPolicy_init(&config->endpoints[1].userIdentityTokens[0]);
+    config->endpoints[1].userIdentityTokens[0].tokenType = UA_USERTOKENTYPE_ANONYMOUS;
+    config->endpoints[1].userIdentityTokens[0].policyId =
+        UA_STRING_ALLOC("open62541-anonymous-policy");
+    config->endpoints[1].userIdentityTokens[0].securityPolicyUri =
+        UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
 
-    //     config->endpoints[0].securityMode = UA_MESSAGESECURITYMODE_NONE;
-
-    //     /* Set Anonymous UserTokenPolicy */
-    //     ep->userIdentityTokensSize = 1;
-    //     ep->userIdentityTokens = (UA_UserTokenPolicy *) UA_Array_new(1,
-    //     &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
-
-    //     UA_UserTokenPolicy_init(&ep->userIdentityTokens[0]);
-    //     UA_UserTokenPolicy *policy = &ep->userIdentityTokens[0];
-    //     policy->tokenType = UA_USERTOKENTYPE_ANONYMOUS;
-    //     policy->policyId = UA_STRING_ALLOC("Anonymous");
-    //     policy->securityPolicyUri =
-    //     UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#None");
-
-    //     /* Log */
-    //     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Endpoint URL: %.*s",
-    //                 (int)ep->endpointUrl.length, ep->endpointUrl.data);
-    //     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "SecurityPolicy: %.*s",
-    //                 (int)ep->securityPolicyUri.length, ep->securityPolicyUri.data);
-    //     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "SecurityMode: %d",
-    //     ep->securityMode);
-    // }
 
     for(size_t i = 0; i < config->endpointsSize; i++) {
         UA_EndpointDescription *ep = &config->endpoints[i];

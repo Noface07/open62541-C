@@ -13,9 +13,12 @@ struct MappedInfospaceTag{
     int tagId;
     string name;
     string namespaces;
-    bool isSimulationProfile;
-    bool isLogging;
-    bool isVirtual;
+    int samplingInterval;
+    int deadband;
+    int queuesize;
+    // bool isSimulationProfile;
+    // bool isLogging;
+    // bool isVirtual;
 };
 
 struct TagInfo{
@@ -25,6 +28,10 @@ struct TagInfo{
     double scaleMin;
     double scaleMax;
     bool enableExpression;
+    int samplingInterval;
+    int deadband;
+    int queuesize;
+    string rdWtOpt;
     string expression;
     optional<string> namespaceNodeID;
     optional<vector<MappedInfospaceTag>> mappedInfospaceTags;
@@ -42,6 +49,11 @@ struct GroupInfo{
     string parentId;
     string name;
     string nodeId;
+    int publishingInterval;
+    int lifetimeCount;
+    int maxKeepAliveCount;
+    int priority;
+    int maxNotificationsPerPublish;
 };
 
 struct ServerInfoO{

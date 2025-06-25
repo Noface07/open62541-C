@@ -63,6 +63,7 @@ struct ClientContext {
     std::unique_ptr<UA_Client, UA_Client_Deleter> client;
     std::map<std::string, UA_CreateSubscriptionResponse> subscriptions;
     std::atomic<bool> running{true};
+    bool isConnected = false;
     std::thread thread;
     std::mutex taskMutex;
     std::queue<std::function<void()>> taskQueue;
@@ -169,8 +170,11 @@ int main() {
             }
             cout<<endl;
             
-            // Subscribe if it is R/W
-            // if tag.att= r/w{
+
+            if (tag.rdWtOpt == "RD_WRT_RO") {
+                cout << "ReadOnly" << endl;
+            }
+            else if (tag.rdWtOpt == "RD_WRT_RW") {
             if(tag.mappedInfospaceTags) {
                 for(const auto &infoSpace : *tag.mappedInfospaceTags) {
                     cout << infoSpace.namespaces << " ";
@@ -191,7 +195,7 @@ int main() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
             }
-            // }
+            }
         }
     }
     }
@@ -226,7 +230,7 @@ int main() {
         revocationList[0] = revocation_cert;
 
         //FOR SECURITY POLICY and MESSAGE SECURITY MODE
-        
+
         if(server.msgSecurityMode != "NONE") {
         
         UA_ClientConfig *config = UA_Client_getConfig(context->client.get());
@@ -237,11 +241,16 @@ int main() {
             1,  // trustListSize (number of certificates in trust list)
             revocationList,  // RevocationList
             1);  // RevocationListSize
+
+            UA_String_clear(&config->applicationUri);
+            UA_String_clear(&config->clientDescription.applicationUri);
+            UA_LocalizedText_clear(&config->clientDescription.applicationName);
+            UA_String_clear(&config->clientDescription.productUri);
             
-            config->applicationUri = UA_STRING_STATIC("urn:Anexee.server.application");
-            config->clientDescription.applicationUri = UA_STRING_STATIC("urn:Anexee.server.application");
+            config->applicationUri = UA_STRING_ALLOC("urn:Anexee.server.application");
+            config->clientDescription.applicationUri = UA_STRING_ALLOC("urn:Anexee.server.application");
             config->clientDescription.applicationName = UA_LOCALIZEDTEXT_ALLOC("en-US", "Anexee");
-            config->clientDescription.productUri = UA_STRING_STATIC("urn:Anexee");
+            config->clientDescription.productUri = UA_STRING_ALLOC("urn:Anexee");
 
             if (server.msgSecurityMode == "NONE") {
                 config->securityMode = UA_MESSAGESECURITYMODE_NONE;
@@ -257,7 +266,7 @@ int main() {
             // config->securityPolicyUri = UA_STRING_STATIC(full.c_str());
 
             // config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
-            config->securityPolicyUri = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
+            config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
             
             UA_StatusCode retval;
             
@@ -274,8 +283,12 @@ int main() {
 
             if(retval != UA_STATUSCODE_GOOD) {
                 std::cerr << "Could not connect to server: " << server.endpointUrl << std::endl;
+                UA_Client_disconnect(context->client.get());
                 continue;
-        }
+                }
+            else{
+                context->isConnected = true;
+            }
         }
         else{
                 UA_ClientConfig_setDefault(UA_Client_getConfig(context->client.get()));
@@ -284,45 +297,64 @@ int main() {
                     std::cerr << "Could not connect to server: " << server.endpointUrl << std::endl;
                     continue;
                 }
+            else{
+                context->isConnected = true;
+            }
         }
+
+        cout << "HEREEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
+        cout << endl;
+        cout << endl;
+        cout << endl;
+        cout << endl;
+        cout << endl;
 #ifdef UA_ENABLE_SUBSCRIPTIONS
 
         for(const auto &group : server.groups) {
         UA_CreateSubscriptionRequest request = UA_CreateSubscriptionRequest_default();
         //add Group properties here!!!
-        request.requestedMaxKeepAliveCount = 10;
-        request.requestedPublishingInterval = 1000;
-        request.publishingEnabled = true;
-        request.requestedLifetimeCount = 10000;
-        request.priority = 0;
-        request.maxNotificationsPerPublish = 0;
+        request.requestedMaxKeepAliveCount = group.maxKeepAliveCount;
+        request.requestedPublishingInterval = group.publishingInterval;
+        // request.publishingEnabled = true;
+        request.requestedLifetimeCount = group.lifetimeCount;
+        request.priority = group.priority;
+        request.maxNotificationsPerPublish = group.maxNotificationsPerPublish;
 
         UA_CreateSubscriptionResponse sub = UA_Client_Subscriptions_create(
             context->client.get(), request, nullptr, nullptr, nullptr);
 
-            context->subscriptions[group.name] = sub;
+        context->subscriptions[group.name] = sub;
+        cout<<"Subscription Created:" << group.name << endl;
 
         if(context->subscriptions[group.name].responseHeader.serviceResult == UA_STATUSCODE_GOOD) {
             std::cout << "Subscription created successfully for server: "
                       << server.endpointUrl << std::endl;
         }
 
-        // groupIdMap[group.name] = context->subscriptions[group.name].subscriptionId;
         }
 #endif
 
-        context->startLoop();
-        clientPool[context->endpoint] = context.get();
-        clientContexts.push_back(std::move(context));
+            if(context->isConnected) {
+                context->startLoop();  
+                clientPool[context->endpoint] = context.get();
+                clientContexts.push_back(std::move(context));
+            }
 
         for(const auto &group : server.groups) {
             string groupName = group.name;
             for(const auto &tag : group.tags) {
             for(const auto &infoSpace : *tag.mappedInfospaceTags) {
 
-            auto context = clientPool.at(Mapping[infoSpace.tagId].second);
-            std::lock_guard<std::mutex> lock(context->taskMutex);
-            context->taskQueue.push([context, infoSpace, groupName]() {
+                if (!clientPool.count(Mapping[infoSpace.tagId].second)) continue;
+
+                auto context = clientPool.at(Mapping[infoSpace.tagId].second);
+                if (!context->isConnected) {
+                    std::cerr << "Skipping tagId " << infoSpace.tagId << " due to disconnected server\n";
+                    continue;
+                }
+
+                std::lock_guard<std::mutex> lock(context->taskMutex);
+                context->taskQueue.push([context, infoSpace, groupName]() {
                 MyMonitorContext *myContext = new MyMonitorContext{infoSpace, g_mqttHandler};
                 MonitorItem(context->client.get(), context->subscriptions[groupName],
                             Mapping[infoSpace.tagId].first.c_str(), infoSpace.tagId,myContext);
@@ -338,17 +370,11 @@ int main() {
 
     }
 
+
     std::cout << "Client pool initialized. Press Ctrl+C to stop..." << std::endl;
 
     
-
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-
-
-
-        // Set up callback for MQTT messages
-g_mqttHandler->setCallback(
+    g_mqttHandler->setCallback(
     [&clientPool](const std::string &topic, const std::string &payload) {
         std::cout << "Received message on topic " << topic << ": " << payload << "\n\n";
 
@@ -375,6 +401,9 @@ g_mqttHandler->setCallback(
             return;
 
         auto context = clientPool.at(endpoint);
+        if (!context->isConnected) {
+            return;
+        }
         std::cout << "Ready to use client:  (connected to " << context->endpoint << ")" << std::endl;
 
         // if (context->subscriptions[groupName].responseHeader.serviceResult != UA_STATUSCODE_GOOD ||
@@ -422,10 +451,11 @@ g_mqttHandler->setCallback(
 );
 
 
-
     while(g_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(200));
+    std::this_thread::sleep_for(std::chrono::seconds(1));
     }
+
+
 
     std::cout << "Cleaning up..." << std::endl;
 

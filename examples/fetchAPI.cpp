@@ -204,6 +204,11 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                         groupInfo.nodeId = groupItem["nodeId"].get<string>();
                         groupInfo.typeId = groupItem["typeId"].get<string>();
                         groupInfo.parentId = groupItem["parentId"].get<string>();
+                        groupInfo.publishingInterval = groupItem["publishingInterval"].get<int>();
+                        groupInfo.lifetimeCount = groupItem["lifeTimeCount"].get<int>();
+                        groupInfo.maxKeepAliveCount = groupItem["maxKeepAlive"].get<int>();
+                        groupInfo.priority = groupItem["priority"].get<int>();
+                        groupInfo.maxNotificationsPerPublish = groupItem["maxNotificationsPublish"].get<int>();
 
                         if(groupItem.contains("tags") && groupItem["tags"].is_array()) {
                             vector<TagInfo> groupTags;
@@ -223,6 +228,10 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                                 tagInfo.nodeId = tagItem["nodeId"].get<string>();
                                 tagInfo.typeId = tagItem["typeId"].get<string>();
                                 tagInfo.parentId = tagItem["parentId"].get<string>();
+                                tagInfo.samplingInterval = tagItem["samplingInterval"].get<int>();
+                                tagInfo.deadband = tagItem["deadband"].get<int>();
+                                tagInfo.queuesize = tagItem["queueSize"].get<int>();
+                                tagInfo.rdWtOpt = tagItem["rdWtOpt"].get<string>();
 
                                 if(tagItem.contains("mappedInfospaceTags") &&
                                    tagItem["mappedInfospaceTags"].is_array()) {
@@ -235,12 +244,15 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                                         mappedInfo.name = mappedTag["name"].get<string>();
                                         mappedInfo.namespaces =
                                             mappedTag["namespace"].get<string>();
-                                        mappedInfo.isSimulationProfile =
-                                            mappedTag["isSimulationProfile"].get<bool>();
-                                        mappedInfo.isLogging =
-                                            mappedTag["isLogging"].get<bool>();
-                                        mappedInfo.isVirtual =
-                                            mappedTag["isVirtual"].get<bool>();
+                                        //mappedInfo.isSimulationProfile =
+                                        //    mappedTag["isSimulationProfile"].get<bool>();
+                                        //mappedInfo.isLogging =
+                                        //    mappedTag["isLogging"].get<bool>();
+                                        //mappedInfo.isVirtual =
+                                        //    mappedTag["isVirtual"].get<bool>();
+                                        mappedInfo.samplingInterval = mappedTag["samplingInterval"].get<int>();
+                                        mappedInfo.deadband = mappedTag["deadband"].get<int>();
+                                        mappedInfo.queuesize = mappedTag["queueSize"].get<int>();
 
                                         // name to namespace
                                         //  if(tagItem.contains("namespaceNodeID") &&
