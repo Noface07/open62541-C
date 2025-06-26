@@ -302,6 +302,20 @@ int main() {
             }
         }
 
+            UA_CreateSubscriptionRequest request = UA_CreateSubscriptionRequest_default();
+            UA_CreateSubscriptionResponse sub = UA_Client_Subscriptions_create(
+                context->client.get(), request, nullptr, nullptr, nullptr);
+            context->subscriptions[server.name] = sub;
+
+            MonitorEvent(context->client.get(), context->subscriptions[server.name]);
+
+            // cout<<"Event Monitoring Created"<<endl;
+            
+            if(context->subscriptions[server.name].responseHeader.serviceResult == UA_STATUSCODE_GOOD) {
+                std::cout << "Subscription created successfully for server: "
+                        << server.endpointUrl << std::endl;
+            }
+
         cout << "HEREEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
         cout << endl;
         cout << endl;

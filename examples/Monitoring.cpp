@@ -289,3 +289,204 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
         UA_String_clear(&nodeIdStr);
     }
 }
+
+
+
+
+
+
+
+
+void handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext,
+                   UA_UInt32 monId, void *monContext,
+                   size_t nEventFields, UA_Variant *eventFields) {
+    std::cout << "Received Event Notification (" << nEventFields << " fields):" << std::endl;
+    
+    for(size_t i = 0; i < nEventFields; ++i) {
+        if(UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_UINT16])) {
+            UA_UInt16 severity = *(UA_UInt16 *)eventFields[i].data;
+            std::cout << "  Severity: " << severity << std::endl;
+        } else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_LOCALIZEDTEXT])) {
+            UA_LocalizedText *lt = (UA_LocalizedText *)eventFields[i].data;
+            std::cout << "  Message: " << std::string((char*)lt->text.data, lt->text.length) << std::endl;
+        }
+        else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_STRING])) {
+            UA_String *s = (UA_String *)eventFields[i].data;
+            std::cout << "  Source Name: " << std::string((char*)s->data, s->length) << std::endl;
+        }
+
+        else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_DATETIME])) {
+            UA_DateTime dt = *(UA_DateTime *)eventFields[i].data;
+            UA_Int64 UnixTime = UA_DateTime_toUnixTime(dt);
+
+            // Convert to time_t (seconds since epoch)
+            std::time_t t = static_cast<std::time_t>(UnixTime);
+
+            // Convert to local time and print
+            char buf[64];
+            std::tm *tm_info = std::localtime(&t);
+            std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
+
+            std::cout << "  Time: " << buf << std::endl;
+        }
+
+        else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_NODEID])) {
+            UA_NodeId *nid = (UA_NodeId *)eventFields[i].data;
+            std::cout << "  NODE ID: ns=" << nid->namespaceIndex << ";";
+            switch (nid->identifierType) {
+                case UA_NODEIDTYPE_NUMERIC:
+                    std::cout << "i=" << nid->identifier.numeric;
+                    break;
+                case UA_NODEIDTYPE_STRING:
+                    std::cout << "s=" << std::string((char*)nid->identifier.string.data, nid->identifier.string.length);
+                    break;
+                case UA_NODEIDTYPE_GUID:
+                    std::cout << "g=GUID";
+                    break;
+                case UA_NODEIDTYPE_BYTESTRING:
+                    std::cout << "b=ByteString";
+                    break;
+            }
+            std::cout << std::endl;
+        }
+
+         else {
+            std::cout << "  Unknown field type" << std::endl;
+        }
+    }
+    std::cout << std::endl;
+
+    // payload
+            // {
+            // "type": "alarm",
+            // "timestamp": "2025-06-25T15:40:12Z",
+            // "tagId": 128,
+            // "message": "Level exceeded",
+            // "severity": 500
+            // }
+
+}
+
+static void MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse response) {
+
+    UA_Byte eventNotifier = 0;
+    UA_StatusCode sc = UA_Client_readEventNotifierAttribute(client,
+                            UA_NODEID_NUMERIC(0, 2253), &eventNotifier);
+    if(sc == UA_STATUSCODE_GOOD)
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Server.EventNotifier: 0x%02x", eventNotifier);
+    else
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Could not read EventNotifier attribute");
+
+    /* Add a MonitoredItem */
+    UA_MonitoredItemCreateRequest item;
+    UA_MonitoredItemCreateRequest_init(&item);
+    item.itemToMonitor.nodeId = UA_NODEID_NUMERIC(0, 2253); // Root->Objects->Server
+    item.itemToMonitor.attributeId = UA_ATTRIBUTEID_EVENTNOTIFIER;
+    item.monitoringMode = UA_MONITORINGMODE_REPORTING;
+
+    UA_EventFilter filter;
+    UA_EventFilter_init(&filter);
+    
+    // Setup select clauses for Message and Severity (like in tutorial)
+    const size_t nSelectClauses = 5;
+    filter.selectClauses = (UA_SimpleAttributeOperand*)
+        UA_Array_new(nSelectClauses, &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
+    if(!filter.selectClauses) {
+        std::cout << "Failed to allocate select clauses" << std::endl;
+        return;
+    }
+    
+    for(size_t i = 0; i < nSelectClauses; ++i) {
+        UA_SimpleAttributeOperand_init(&filter.selectClauses[i]);
+    }
+
+    // Message field
+    filter.selectClauses[0].typeDefinitionId = UA_NS0ID(BASEEVENTTYPE);
+    filter.selectClauses[0].browsePathSize = 1;
+    filter.selectClauses[0].browsePath = (UA_QualifiedName*)
+        UA_Array_new(filter.selectClauses[0].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
+    if(!filter.selectClauses[0].browsePath) {
+        UA_Array_delete(filter.selectClauses, nSelectClauses, &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
+        return;
+    }
+    filter.selectClauses[0].attributeId = UA_ATTRIBUTEID_VALUE;
+    filter.selectClauses[0].browsePath[0] = UA_QUALIFIEDNAME_ALLOC(0, "Message");
+
+    // Severity field
+    filter.selectClauses[1].typeDefinitionId = UA_NS0ID(BASEEVENTTYPE);
+    filter.selectClauses[1].browsePathSize = 1;
+    filter.selectClauses[1].browsePath = (UA_QualifiedName*)
+        UA_Array_new(filter.selectClauses[1].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
+    if(!filter.selectClauses[1].browsePath) {
+        UA_Array_delete(filter.selectClauses, nSelectClauses, &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
+        return;
+    }
+    filter.selectClauses[1].attributeId = UA_ATTRIBUTEID_VALUE;
+    filter.selectClauses[1].browsePath[0] = UA_QUALIFIEDNAME_ALLOC(0, "Severity");
+
+
+
+        // SourceName
+    filter.selectClauses[2].typeDefinitionId = UA_NS0ID(BASEEVENTTYPE);
+    filter.selectClauses[2].browsePathSize = 1;
+    filter.selectClauses[2].browsePath = (UA_QualifiedName*)
+        UA_Array_new(filter.selectClauses[1].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
+    if(!filter.selectClauses[2].browsePath) {
+        UA_Array_delete(filter.selectClauses, nSelectClauses, &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
+        return;
+    }
+    filter.selectClauses[2].attributeId = UA_ATTRIBUTEID_VALUE;
+    filter.selectClauses[2].browsePath[0] = UA_QUALIFIEDNAME_ALLOC(0, "SourceName");
+
+
+
+    // ReceiveTime
+    filter.selectClauses[3].typeDefinitionId = UA_NS0ID(BASEEVENTTYPE);
+    filter.selectClauses[3].browsePathSize = 1;
+    filter.selectClauses[3].browsePath = (UA_QualifiedName*)
+        UA_Array_new(filter.selectClauses[1].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
+    if(!filter.selectClauses[3].browsePath) {
+        UA_Array_delete(filter.selectClauses, nSelectClauses, &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
+        return;
+    }
+    filter.selectClauses[3].attributeId = UA_ATTRIBUTEID_VALUE;
+    filter.selectClauses[3].browsePath[0] = UA_QUALIFIEDNAME_ALLOC(0, "ReceiveTime");
+
+    // Source Node
+    filter.selectClauses[4].typeDefinitionId = UA_NS0ID(BASEEVENTTYPE);
+    filter.selectClauses[4].browsePathSize = 1;
+    filter.selectClauses[4].browsePath = (UA_QualifiedName*)
+        UA_Array_new(filter.selectClauses[1].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
+    if(!filter.selectClauses[4].browsePath) {
+        UA_Array_delete(filter.selectClauses, nSelectClauses, &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
+        return;
+    }
+    filter.selectClauses[4].attributeId = UA_ATTRIBUTEID_VALUE;
+    filter.selectClauses[4].browsePath[0] = UA_QUALIFIEDNAME_ALLOC(0, "SourceNode");
+
+
+    filter.selectClausesSize = nSelectClauses;
+
+    item.requestedParameters.filter.encoding = UA_EXTENSIONOBJECT_DECODED;
+    item.requestedParameters.filter.content.decoded.data = &filter;
+    item.requestedParameters.filter.content.decoded.type = &UA_TYPES[UA_TYPES_EVENTFILTER];
+
+    UA_UInt32 monId = 0;
+    UA_MonitoredItemCreateResult result =
+        UA_Client_MonitoredItems_createEvent(client, response.subscriptionId,
+                                             UA_TIMESTAMPSTORETURN_BOTH, item,
+                                             &monId, handler_Event, NULL);
+
+    if(result.statusCode != UA_STATUSCODE_GOOD) {
+        std::cout << "Could not add the MonitoredItem: 0x" << std::hex << result.statusCode << std::endl;
+    } else {
+        std::cout << "Monitoring 'Root->Objects->Server', id " << result.monitoredItemId << std::endl;
+    }
+
+    // Cleanup
+    UA_MonitoredItemCreateResult_clear(&result);
+    UA_Array_delete(filter.selectClauses, nSelectClauses, &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
+}
+

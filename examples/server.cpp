@@ -54,6 +54,8 @@
 #include <open62541/plugin/historydata/history_database_default.h>
 #include <open62541/plugin/historydata/history_data_backend.h>
 
+#include <AandC.cpp>
+
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
 
@@ -376,6 +378,282 @@ static void writeCallback(
 
         publish_to_mqtt(topic, payload.dump());
     }
+
+    //Now for Alarms
+
+        if (!UA_Variant_hasScalarType(&data->value, &UA_TYPES[UA_TYPES_INT32]) && 
+        !UA_Variant_hasScalarType(&data->value, &UA_TYPES[UA_TYPES_FLOAT]) && 
+        !UA_Variant_hasScalarType(&data->value, &UA_TYPES[UA_TYPES_DOUBLE])) {
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                       "Process node value written is not a numeric type. Ignoring alarm logic for ns=%d;i=%d.",
+                       nodeId->namespaceIndex, nodeId->identifier.numeric);
+        return;
+    }
+
+    double currentValue;
+    if (UA_Variant_hasScalarType(&data->value, &UA_TYPES[UA_TYPES_INT32])) {
+        currentValue = (double)*(UA_Int32*)(data->value.data);
+    } else if (UA_Variant_hasScalarType(&data->value, &UA_TYPES[UA_TYPES_FLOAT])) {
+        currentValue = (double)*(UA_Float*)(data->value.data);
+    } else { // UA_TYPES_DOUBLE
+        currentValue = *(UA_Double*)(data->value.data);
+    }
+
+
+    // Find the alarm info for this nodeId using the global map
+    auto it = monitoredAlarms.find(*nodeId);
+    if (it == monitoredAlarms.end()) {
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                       "Could not find alarm info for process node (ns=%d;i=%d).",
+                       nodeId->namespaceIndex, nodeId->identifier.numeric);
+        return;
+    }
+
+    MonitoredNodeAlarmInfo *info = &it->second;
+    UA_NodeId alarmInstanceId = info->alarmInstanceId;
+    double hiHi = info->alarmHiHi;
+    double hi = info->alarmHi;
+    double lo = info->alarmLo;
+    double loLo = info->alarmLoLo;
+    double deadband = info->deadband;
+    const std::string& displayName = info->displayName;
+
+    UA_StatusCode setStatus = UA_STATUSCODE_GOOD;
+    UA_Variant val;
+    UA_Boolean stateBool;
+    UA_LocalizedText message;
+    UA_UInt16 severity;
+    bool anyLimitActive = false; // Flag to track if any limit is currently violated
+
+    // Read current states of the ExclusiveLimitAlarm (HighHighState, HighState, LowState, LowLowState)
+    // These are TwoStateVariables, read their 'Id' property (boolean)
+    bool currentHiHiState = false;
+    bool currentHiState = false;
+    bool currentLoState = false;
+    bool currentLoLoState = false;
+
+    UA_Variant currentPropVal;
+    
+    // Read HighHighState
+    UA_QualifiedName highHighStateName = UA_QUALIFIEDNAME_ALLOC(0, "HighHighState");
+    if (UA_Server_readObjectProperty(server, alarmInstanceId, highHighStateName, &currentPropVal) == UA_STATUSCODE_GOOD && 
+        UA_Variant_hasScalarType(&currentPropVal, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+        currentHiHiState = *(UA_Boolean*)currentPropVal.data;
+    }
+    
+    // Read HighState
+    UA_QualifiedName highStateName = UA_QUALIFIEDNAME_ALLOC(0, "HighState");
+    if (UA_Server_readObjectProperty(server, alarmInstanceId, highStateName, &currentPropVal) == UA_STATUSCODE_GOOD && 
+        UA_Variant_hasScalarType(&currentPropVal, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+        currentHiState = *(UA_Boolean*)currentPropVal.data;
+    }
+
+    
+    // Read LowState
+    UA_QualifiedName lowStateName = UA_QUALIFIEDNAME_ALLOC(0, "LowState");
+    if (UA_Server_readObjectProperty(server, alarmInstanceId, lowStateName, &currentPropVal) == UA_STATUSCODE_GOOD && 
+        UA_Variant_hasScalarType(&currentPropVal, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+        currentLoState = *(UA_Boolean*)currentPropVal.data;
+    }
+
+    // Read LowLowState
+    UA_QualifiedName lowLowStateName = UA_QUALIFIEDNAME_ALLOC(0, "LowLowState");
+    if (UA_Server_readObjectProperty(server, alarmInstanceId, lowLowStateName, &currentPropVal) == UA_STATUSCODE_GOOD && 
+        UA_Variant_hasScalarType(&currentPropVal, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+        currentLoLoState = *(UA_Boolean*)currentPropVal.data;
+    }
+
+
+
+    // Determine the highest priority active alarm state
+    std::string currentAlarmMessage = "Normal";
+    UA_UInt16 currentAlarmSeverity = 0;
+    bool alarmTransitionedToNormal = false; // Flag to track if the overall alarm state transitioned to normal
+
+    // Logic for HighHigh Alarm
+    if (currentValue >= hiHi) {
+        if (!currentHiHiState) { // Transition to HighHigh
+            stateBool = true;
+            UA_Variant_setScalar(&val, &stateBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_QualifiedName highHighStateName = UA_QUALIFIEDNAME_ALLOC(0, "HighHighState");
+            UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+            setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                     highHighStateName, idName);
+
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: HighHigh Alarm (%.2f >= %.2f)",
+                        displayName.c_str(), currentValue, hiHi);
+        }
+        anyLimitActive = true;
+        currentAlarmMessage = "Value EXCEEDS HighHigh Limit!";
+        currentAlarmSeverity = 900;
+    } else if (currentValue < (hiHi - deadband) && currentHiHiState) { // Return from HighHigh
+        stateBool = false;
+        UA_Variant_setScalar(&val, &stateBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName highHighStateName = UA_QUALIFIEDNAME_ALLOC(0, "HighHighState");
+        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+        setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                 highHighStateName, idName);
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: HighHigh Alarm Cleared (%.2f < %.2f)",
+                    displayName.c_str(), currentValue, hiHi - deadband);
+    }
+
+    // Logic for High Alarm (but not HighHigh, or after HighHigh clears)
+    // Check if HighHigh is no longer active, and then check High
+    if (currentValue >= hi && currentValue < hiHi) {
+        if (!currentHiState && !currentHiHiState) { // Only transition to High if not already in High or HighHigh
+            stateBool = true;
+            UA_Variant_setScalar(&val, &stateBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_QualifiedName highStateName = UA_QUALIFIEDNAME_ALLOC(0, "HighState");
+            UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+            setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                     highStateName, idName);
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: High Alarm (%.2f >= %.2f)",
+                        displayName.c_str(), currentValue, hi);
+        }
+        anyLimitActive = true;
+        // Prioritize message/severity based on highest active state
+        if (currentAlarmSeverity < 700) { // If HighHigh is not active
+            currentAlarmMessage = "Value EXCEEDS High Limit!";
+            currentAlarmSeverity = 700;
+        }
+    } else if (currentValue < (hi - deadband) && currentHiState) { // Return from High
+        stateBool = false;
+        UA_Variant_setScalar(&val, &stateBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName highStateName = UA_QUALIFIEDNAME_ALLOC(0, "HighState");
+        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+        setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                 highStateName, idName);
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: High Alarm Cleared (%.2f < %.2f)",
+                    displayName.c_str(), currentValue, hi - deadband);
+    }
+
+    // Logic for LowLow Alarm
+    if (currentValue <= loLo) {
+        if (!currentLoLoState) { // Transition to LowLow
+            stateBool = true;
+            UA_Variant_setScalar(&val, &stateBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_QualifiedName lowLowStateName = UA_QUALIFIEDNAME_ALLOC(0, "LowLowState");
+            UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+            setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                     lowLowStateName, idName);
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: LowLow Alarm (%.2f <= %.2f)",
+                        displayName.c_str(), currentValue, loLo);
+        }
+        anyLimitActive = true;
+        // Prioritize message/severity based on highest active state
+        if (currentAlarmSeverity < 900) { // If HighHigh is not active, this is highest for low side
+            currentAlarmMessage = "Value FALLS BELOW LowLow Limit!";
+            currentAlarmSeverity = 900;
+        }
+    } else if (currentValue > (loLo + deadband) && currentLoLoState) { // Return from LowLow
+        stateBool = false;
+        UA_Variant_setScalar(&val, &stateBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName lowLowStateName = UA_QUALIFIEDNAME_ALLOC(0, "LowLowState");
+        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+        setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                 lowLowStateName, idName);
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: LowLow Alarm Cleared (%.2f > %.2f)",
+                    displayName.c_str(), currentValue, loLo + deadband);
+    }
+
+    // Logic for Low Alarm (but not LowLow, or after LowLow clears)
+    // Check if LowLow is no longer active, and then check Low
+    if (currentValue <= lo && currentValue > loLo) {
+        if (!currentLoState && !currentLoLoState) { // Only transition to Low if not already in Low or LowLow
+            stateBool = true;
+            UA_Variant_setScalar(&val, &stateBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_QualifiedName lowStateName = UA_QUALIFIEDNAME_ALLOC(0, "LowState");
+            UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+            setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                     lowStateName, idName);
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: Low Alarm (%.2f <= %.2f)",
+                        displayName.c_str(), currentValue, lo);
+        }
+        anyLimitActive = true;
+        // Prioritize message/severity based on highest active state
+        if (currentAlarmSeverity < 700) { // If HighHigh, High, LowLow are not active
+            currentAlarmMessage = "Value FALLS BELOW Low Limit!";
+            currentAlarmSeverity = 700;
+        }
+    } else if (currentValue > (lo + deadband) && currentLoState) { // Return from Low
+        stateBool = false;
+        UA_Variant_setScalar(&val, &stateBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName lowStateName = UA_QUALIFIEDNAME_ALLOC(0, "LowState");
+        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+        setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                 lowStateName, idName);
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: Low Alarm Cleared (%.2f > %.2f)",
+                    displayName.c_str(), currentValue, lo + deadband);
+    }
+
+    // Handle the overall ActiveState of the alarm
+    // ExclusiveLimitAlarmType automatically sets its ActiveState based on its internal limit states.
+    // We only need to manually trigger an event if the *overall* alarm is going from active to inactive.
+    UA_Variant currentActiveStateVariant;
+    bool wasActive = false;
+    UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
+    if (UA_Server_readObjectProperty(server, alarmInstanceId, activeStateName, &currentActiveStateVariant) == UA_STATUSCODE_GOOD && 
+        UA_Variant_hasScalarType(&currentActiveStateVariant, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+        wasActive = *(UA_Boolean*)currentActiveStateVariant.data;
+    }
+
+    if (!anyLimitActive && wasActive) { // No limits are active, but the alarm was previously active
+        // This signifies a transition to normal for the overall alarm
+        UA_Boolean newActiveState = false;
+        UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
+        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+        setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                 activeStateName, idName);
+        currentAlarmMessage = "Value is within normal limits.";
+        currentAlarmSeverity = 100; // Low severity for normal state
+        alarmTransitionedToNormal = true; // Mark for explicit event trigger
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: Overall Alarm Cleared (%.2f)",
+                    displayName.c_str(), currentValue);
+    } else if (anyLimitActive && !wasActive) { // A limit is active, but the alarm was previously inactive
+        // This signifies a transition to active for the overall alarm
+        UA_Boolean newActiveState = true;
+        UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
+        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+        setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                                 activeStateName, idName);
+        // Message and severity are already set by the specific limit logic above
+    }
+
+    // Update Message and Severity based on the highest priority current active state
+    // This is important because the default `TwoStateVariable` changes won't automatically update Message/Severity
+    UA_LocalizedText newAlarmMessage = UA_LOCALIZEDTEXT_ALLOC("en", currentAlarmMessage.c_str());
+    
+    UA_Variant_setScalar(&val, &newAlarmMessage, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+    
+    UA_QualifiedName messageName = UA_QUALIFIEDNAME_ALLOC(0, "Message");
+    setStatus |= UA_Server_setConditionField(server, alarmInstanceId, &val, messageName);
+
+    UA_Variant_setScalar(&val, &currentAlarmSeverity, &UA_TYPES[UA_TYPES_UINT16]);
+    UA_QualifiedName severityName = UA_QUALIFIEDNAME_ALLOC(0, "Severity");
+    setStatus |= UA_Server_setConditionField(server, alarmInstanceId, &val, severityName);
+
+
+    // Explicitly trigger the condition event if the overall alarm state changed to normal
+    // (open62541 automatically triggers events for changes in TwoStateVariables like HighHighState)
+    bool triggerExplicitEvent = alarmTransitionedToNormal;
+
+    // If a limit is active and we manually set message/severity, we still need to trigger the event
+    if (anyLimitActive) {
+        triggerExplicitEvent = true;
+    }
+
+    if (triggerExplicitEvent) {
+        UA_StatusCode triggerStatus = UA_Server_triggerConditionEvent(server, alarmInstanceId,
+                                                                    *nodeId, NULL);
+        if (triggerStatus != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "Failed to trigger condition event for %s. StatusCode %s",
+                        displayName.c_str(), UA_StatusCode_name(triggerStatus));
+        }
+    }
+
 }
 
 
@@ -687,10 +965,10 @@ int main(int argc, char* argv[]) {
     }
         
     // Accept all certificates for demo/testing
-    config->secureChannelPKI.clear(&config->secureChannelPKI);
-    config->sessionPKI.clear(&config->sessionPKI);
-    UA_CertificateGroup_AcceptAll(&config->secureChannelPKI);
-    UA_CertificateGroup_AcceptAll(&config->sessionPKI);
+    // config->secureChannelPKI.clear(&config->secureChannelPKI);
+    // config->sessionPKI.clear(&config->sessionPKI);
+    // UA_CertificateGroup_AcceptAll(&config->secureChannelPKI);
+    // UA_CertificateGroup_AcceptAll(&config->sessionPKI);
 
     config->applicationDescription.applicationUri = UA_STRING_ALLOC("urn:Anexee.server.application");
     config->applicationDescription.productUri = UA_STRING_ALLOC("urn:Anexee.server");
@@ -722,38 +1000,6 @@ int main(int argc, char* argv[]) {
                 (int)pol->securityPolicyUri.length, pol->securityPolicyUri.data);
         }
     }
-
-    // // Set up multiple endpoints with different security policies
-    // config->endpointsSize = 3;
-    // config->endpoints = (UA_EndpointDescription*)UA_Array_new(3, &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
-    
-    // // Endpoint 1: None (for testing)
-    // UA_EndpointDescription_init(&config->endpoints[0]);
-    // config->endpoints[0].endpointUrl = UA_STRING_ALLOC("opc.tcp://localhost:4840");
-    // config->endpoints[0].securityMode = UA_MESSAGESECURITYMODE_NONE;
-    // config->endpoints[0].securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#None");
-    
-    // // Endpoint 2: Sign
-    // UA_EndpointDescription_init(&config->endpoints[1]);
-    // config->endpoints[1].endpointUrl = UA_STRING_ALLOC("opc.tcp://localhost:4841");
-    // config->endpoints[1].securityMode = UA_MESSAGESECURITYMODE_SIGN;
-    // config->endpoints[1].securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
-    
-    // // Endpoint 3: Sign & Encrypt
-    // UA_EndpointDescription_init(&config->endpoints[2]);
-    // config->endpoints[2].endpointUrl = UA_STRING_ALLOC("opc.tcp://localhost:4842");
-    // config->endpoints[2].securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
-    // config->endpoints[2].securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
-
-    // Add server description
-
-    // UA_QualifiedName_clear(&nameName);
-    // UA_String_clear(&name);
-
-
-        
-
-
 
 //    pqxx::connection c("dbname=postgres user=postgres password=payphone123@007");
 //    pqxx::work txn(c);
@@ -890,6 +1136,41 @@ if (token.contains("access_token")) {
     
     // Process and store API and create Address space.
 
+    // Global structure to hold alarm-related data for each monitored node
+// struct MonitoredNodeAlarmInfo {
+//     UA_NodeId processNodeId;
+//     UA_NodeId alarmInstanceId;
+//     double alarmHiHi;
+//     double alarmHi;
+//     double alarmLo;
+//     double alarmLoLo;
+//     double deadband; // Add deadband for hysteresis
+//     std::string displayName; // To use in alarm messages
+// };
+
+
+// std::map<UA_NodeId, MonitoredNodeAlarmInfo, UA_NodeId_less_than> monitoredAlarms;
+
+// Add an ALARM FOLDER INSIDE SERVER THEN ALL NODES WITH HASEVENTSOURCE WILL BE ADDED TO THIS FOLDER
+UA_NodeId areaNodeId = UA_NODEID_NUMERIC(0, 54624);
+UA_ObjectAttributes objAttr = UA_ObjectAttributes_default;
+objAttr.displayName = UA_LOCALIZEDTEXT((char *)"en", (char *)"Alarms");
+UA_Server_addObjectNode(server,
+    UA_NODEID_NULL,
+    UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
+    UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES),
+    UA_QUALIFIEDNAME(1,(char *)"Alarms"),
+    UA_NODEID_NUMERIC(0, UA_NS0ID_BASEOBJECTTYPE),
+    objAttr, NULL,
+    &areaNodeId);
+
+UA_Server_addReference(server,
+    UA_NODEID_NUMERIC(0, 2253), // Server
+    UA_NODEID_NUMERIC(0, UA_NS0ID_HASNOTIFIER),
+    UA_EXPANDEDNODEID_NUMERIC(areaNodeId.namespaceIndex, areaNodeId.identifier.numeric),
+    UA_TRUE);
+    
+    int count = 0;
 vector<string> topics;
 if (!BearerToken.empty()) {
     auto futureResponse = std::async(std::launch::async, getTopicList, BearerToken);
@@ -921,19 +1202,6 @@ if (!BearerToken.empty()) {
                         attr.historizing = true;
 
 
-
-                        // Set range if available
-                        // if (item.contains("rangeMin") && item.contains("rangeMax")) {
-                        //     UA_Range range;
-                        //     range.min = item["rangeMin"].get<double>();
-                        //     range.max = item["rangeMax"].get<double>();
-                        //     attr.valueRank = 1;
-                        //     attr.arrayDimensionsSize = 1;
-                        //     attr.arrayDimensions = (UA_UInt32*)UA_malloc(sizeof(UA_UInt32));
-                        //     attr.arrayDimensions[0] = 2;
-                        //     attr.valueRange = range;
-                        // }
-
                         // UA_NodeId nodeId = UA_NODEID_STRING_ALLOC(1, currentPath.c_str());
                         UA_NodeId nodeId = UA_NODEID_NUMERIC(1, item["tagId"].get<int>());
                         UA_QualifiedName nodeName = UA_QUALIFIEDNAME_ALLOC(1, parts[i].c_str());
@@ -964,6 +1232,15 @@ if (!BearerToken.empty()) {
                             UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
                             rangeName, UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
                             rangeAttr, NULL, NULL);
+
+
+
+
+
+
+
+
+
 
 
                         
@@ -1001,6 +1278,19 @@ if (!BearerToken.empty()) {
                         addAlarmProperty("AlarmHi", alarmHi, nodeId, 3);
                         addAlarmProperty("AlarmLo", alarmLo, nodeId, 4);
                         addAlarmProperty("AlarmLoLo", alarmLoLo, nodeId, 5);
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1110,11 +1400,6 @@ if (!BearerToken.empty()) {
 
                         nodeMap[currentPath] = nodeId;
 
-                        UA_ValueCallback callback;
-                        callback.onWrite = writeCallback;
-                        callback.onRead = NULL;
-                        UA_Server_setVariableNode_valueCallback(server, nodeId, callback);
-
                         // After creating each variable node, add this:
                         UA_HistorizingNodeIdSettings setting;
                         setting.historizingBackend = UA_HistoryDataBackend_Memory(200, 1000);
@@ -1124,24 +1409,7 @@ if (!BearerToken.empty()) {
                         
                         // Register the node for historizing using the global gathering context
                         UA_StatusCode ret = g_gathering->registerNodeId(server, g_gathering->context, &nodeId, setting);
-                        // UA_StatusCode retv = g_gathering->startPoll(server, g_gathering->context, &nodeId);
-                        // UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "startPoll %s", UA_StatusCode_name(retv));
-                        // if(ret == UA_STATUSCODE_GOOD) {
-                        //     if(nodeId.identifierType == UA_NODEIDTYPE_STRING) {
-                        //         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
-                        //                     "Node registered for historizing: %.*s", 
-                        //                     (int)nodeId.identifier.string.length, 
-                        //                     nodeId.identifier.string.data);
-                        //     } else if(nodeId.identifierType == UA_NODEIDTYPE_NUMERIC) {
-                        //         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
-                        //                     "Node registered for historizing: %u", 
-                        //                     nodeId.identifier.numeric);
-                        //     }
-                        // } else {
-                        //     UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
-                        //                 "Failed to register node for historizing: %s", 
-                        //                 UA_StatusCode_name(ret));
-                        // }
+
 
                         const UA_HistorizingNodeIdSettings* currentSettings = 
                             g_gathering->getHistorizingSetting(server, g_gathering->context, &nodeId);
@@ -1150,6 +1418,43 @@ if (!BearerToken.empty()) {
                                         "Node historizing settings verified - Update Strategy: %d", 
                                         currentSettings->historizingUpdateStrategy);
                         }
+
+
+
+                        
+                        //Link Alarms?
+                        //Added count so it creates alarm for every 25th node thus not overflowing the alarm queue
+                        if (count%25==0) {
+
+                            MonitoredNodeAlarmInfo alarmInfo;
+                            alarmInfo.processNodeId = nodeId;
+                            alarmInfo.displayName = parts[i]; // Use the node's display name for alarm messages
+
+                            // Get alarm thresholds from the JSON item
+
+                            alarmInfo.alarmHiHi = item.contains("alarmHiHi") ? item["alarmHiHi"].get<double>() : 0.0;
+                            alarmInfo.alarmHi = item.contains("alarmHi") ? item["alarmHi"].get<double>() : 0.0;
+                            alarmInfo.alarmLo = item.contains("alarmLo") ? item["alarmLo"].get<double>() : 0.0;
+                            alarmInfo.alarmLoLo = item.contains("alarmLoLo") ? item["alarmLoLo"].get<double>() : 0.0;
+
+                            alarmInfo.deadband = item.contains("deadband") ? item["deadband"].get<double>() : 0.0;
+
+                            UA_StatusCode alarmStatus = createAndLinkExclusiveLimitAlarm(server, &nodeId, alarmInfo.displayName, item, &alarmInfo.alarmInstanceId);
+                            if (alarmStatus != UA_STATUSCODE_GOOD) {
+                                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to create alarm for node %s", parts[i].c_str());
+                                // Handle error, maybe continue or return
+                            } else {
+                                // Store the alarm information in our global map
+                                monitoredAlarms[nodeId] = alarmInfo;
+                            }
+
+                        }
+                        count++;
+
+                            UA_ValueCallback callback;
+                            callback.onWrite = writeCallback;
+                            callback.onRead = NULL;
+                            UA_Server_setVariableNode_valueCallback(server, nodeId, callback);
                     }   
                 }
 
@@ -1249,8 +1554,8 @@ UA_Server_writeObjectProperty_scalar(
 
 /* 4) Finally, trigger the event (don't forget the SourceNode argument) */
 
-// UA_Server_triggerEvent(server, eventNodeId,
-//         UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER), NULL, true);
+UA_Server_triggerEvent(server, eventNodeId,
+        UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER), NULL, true);
 
 
 
