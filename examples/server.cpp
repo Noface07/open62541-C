@@ -282,6 +282,28 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
     });
 };
 
+        static UA_NodeId findChildByBrowseName(UA_Server *server, UA_NodeId parent, char *childName) {
+            UA_BrowseDescription bd;
+            UA_BrowseDescription_init(&bd);
+            bd.nodeId = parent;
+            bd.resultMask = UA_BROWSERESULTMASK_ALL;
+            bd.browseDirection = UA_BROWSEDIRECTION_FORWARD;
+            bd.referenceTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT);
+
+            UA_BrowseResult bres = UA_Server_browse(server, 0, &bd);
+            UA_NodeId result = UA_NODEID_NULL;
+            for (size_t i = 0; i < bres.referencesSize; ++i) {
+                UA_ReferenceDescription *ref = &bres.references[i];
+                UA_String childNameStr = UA_STRING(childName);
+                if(UA_String_equal(&ref->browseName.name, &childNameStr)) {
+                    result = ref->nodeId.nodeId;
+                    break;
+                }
+            }
+            UA_BrowseResult_clear(&bres);
+            return result;
+        }
+
 
 // Write callback for OPC UA node value changes
 static void writeCallback(
@@ -290,10 +312,15 @@ static void writeCallback(
     const UA_NodeId *nodeId, void *nodeContext,
     const UA_NumericRange *range, const UA_DataValue *data
 ) {
-    if (is_internal_write) return;  // 🔒 Prevent feedback loop
-
+    // if (is_internal_write) return;  // 🔒 Prevent feedback loop
+ 
     // Find the topic for this node
     std::string topic;
+    
+    
+    if (is_internal_write) goto Alarms;
+    
+    
     for (const auto& pair : nodeMap) {
         if (UA_NodeId_equal(&pair.second, nodeId)) {
             topic = pair.first;
@@ -379,7 +406,22 @@ static void writeCallback(
         publish_to_mqtt(topic, payload.dump());
     }
 
+
+
+
     //Now for Alarms
+
+    Alarms:
+    
+        // Find the alarm info for this nodeId using the global map
+        auto it = monitoredAlarms.find(*nodeId);
+        if (it == monitoredAlarms.end()) {
+            // UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+            //             "Could not find alarm info for process node (ns=%d;i=%d).",
+            //             nodeId->namespaceIndex, nodeId->identifier.numeric);
+            return;
+        }
+
 
         if (!UA_Variant_hasScalarType(&data->value, &UA_TYPES[UA_TYPES_INT32]) && 
         !UA_Variant_hasScalarType(&data->value, &UA_TYPES[UA_TYPES_FLOAT]) && 
@@ -400,14 +442,6 @@ static void writeCallback(
     }
 
 
-    // Find the alarm info for this nodeId using the global map
-    auto it = monitoredAlarms.find(*nodeId);
-    if (it == monitoredAlarms.end()) {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                       "Could not find alarm info for process node (ns=%d;i=%d).",
-                       nodeId->namespaceIndex, nodeId->identifier.numeric);
-        return;
-    }
 
     MonitoredNodeAlarmInfo *info = &it->second;
     UA_NodeId alarmInstanceId = info->alarmInstanceId;
@@ -418,9 +452,18 @@ static void writeCallback(
     double deadband = info->deadband;
     const std::string& displayName = info->displayName;
 
+    // UA_Variant ackedVariant;
+    // UA_QualifiedName ackedName = UA_QUALIFIEDNAME_ALLOC(0, "AckedState");
+    // if (UA_Server_readObjectProperty(server, alarmInstanceId, ackedName, &ackedVariant) == UA_STATUSCODE_GOOD &&
+    //     UA_Variant_hasScalarType(&ackedVariant, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+    //     info->acked = *(UA_Boolean*)ackedVariant.data;
+    // }
+
     UA_StatusCode setStatus = UA_STATUSCODE_GOOD;
     UA_Variant val;
     UA_Boolean stateBool;
+    UA_Boolean boolFalse = false;
+    UA_Boolean boolTrue = true;
     UA_LocalizedText message;
     UA_UInt16 severity;
     bool anyLimitActive = false; // Flag to track if any limit is currently violated
@@ -466,9 +509,11 @@ static void writeCallback(
 
 
     // Determine the highest priority active alarm state
-    std::string currentAlarmMessage = "Normal";
-    UA_UInt16 currentAlarmSeverity = 0;
-    bool alarmTransitionedToNormal = false; // Flag to track if the overall alarm state transitioned to normal
+        std::string currentAlarmMessage = "Normal";
+        UA_UInt16 currentAlarmSeverity = 0;
+        bool alarmTransitionedToNormal = false; // Flag to track if the overall alarm state transitioned to normal
+
+        
 
     // Logic for HighHigh Alarm
     if (currentValue >= hiHi) {
@@ -586,6 +631,11 @@ static void writeCallback(
                     displayName.c_str(), currentValue, lo + deadband);
     }
 
+
+
+
+
+
     // Handle the overall ActiveState of the alarm
     // ExclusiveLimitAlarmType automatically sets its ActiveState based on its internal limit states.
     // We only need to manually trigger an event if the *overall* alarm is going from active to inactive.
@@ -597,42 +647,116 @@ static void writeCallback(
         wasActive = *(UA_Boolean*)currentActiveStateVariant.data;
     }
 
-    if (!anyLimitActive && wasActive) { // No limits are active, but the alarm was previously active
-        // This signifies a transition to normal for the overall alarm
-        UA_Boolean newActiveState = false;
-        UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
-        UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
-        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
-        setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
-                                                                 activeStateName, idName);
-        currentAlarmMessage = "Value is within normal limits.";
-        currentAlarmSeverity = 100; // Low severity for normal state
-        alarmTransitionedToNormal = true; // Mark for explicit event trigger
-        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: Overall Alarm Cleared (%.2f)",
-                    displayName.c_str(), currentValue);
-    } else if (anyLimitActive && !wasActive) { // A limit is active, but the alarm was previously inactive
-        // This signifies a transition to active for the overall alarm
-        UA_Boolean newActiveState = true;
-        UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
-        UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
-        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
-        setStatus |= UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
-                                                                 activeStateName, idName);
-        // Message and severity are already set by the specific limit logic above
-    }
 
-    // Update Message and Severity based on the highest priority current active state
-    // This is important because the default `TwoStateVariable` changes won't automatically update Message/Severity
-    UA_LocalizedText newAlarmMessage = UA_LOCALIZEDTEXT_ALLOC("en", currentAlarmMessage.c_str());
-    
-    UA_Variant_setScalar(&val, &newAlarmMessage, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-    
-    UA_QualifiedName messageName = UA_QUALIFIEDNAME_ALLOC(0, "Message");
-    setStatus |= UA_Server_setConditionField(server, alarmInstanceId, &val, messageName);
 
-    UA_Variant_setScalar(&val, &currentAlarmSeverity, &UA_TYPES[UA_TYPES_UINT16]);
-    UA_QualifiedName severityName = UA_QUALIFIEDNAME_ALLOC(0, "Severity");
-    setStatus |= UA_Server_setConditionField(server, alarmInstanceId, &val, severityName);
+        // Usage:
+        UA_NodeId ackedStateNodeId = findChildByBrowseName(server, alarmInstanceId, (char *)"AckedState");
+        if(!UA_NodeId_isNull(&ackedStateNodeId)) {
+            UA_Boolean acked = false;
+            UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+            UA_Variant idValueVariant;
+            UA_StatusCode idStatus = UA_Server_readObjectProperty(server, ackedStateNodeId, idName, &idValueVariant);
+            if (idStatus == UA_STATUSCODE_GOOD && UA_Variant_hasScalarType(&idValueVariant, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+                acked = *(UA_Boolean*)idValueVariant.data;
+                info->acked = acked;
+                // cout << "info->acked: " << info->acked << endl;
+            }
+        }
+
+        //do same with wasactive and fix!!!
+
+
+
+        // if (!anyLimitActive && wasActive) {
+        // // When alarm becomes inactive and acknowledged
+        if(!anyLimitActive && info->acked) {
+            // ... existing code ...
+            // Set Retain = false
+            cout<<"Inside 1"<<endl;
+            UA_QualifiedName retainName = UA_QUALIFIEDNAME_ALLOC(0, "Retain");
+            UA_Variant_setScalar(&val, &boolFalse, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_StatusCode status = UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
+            cout << "Set Retain status: " << UA_StatusCode_name(status) << endl;
+        } else if(!anyLimitActive) {  // No limits are active, but the alarm was
+                                      // previously active
+            // This signifies a transition to normal for the overall alarm
+            UA_Boolean newActiveState = false;
+            UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
+            UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+            setStatus |= UA_Server_setConditionVariableFieldProperty(
+                server, alarmInstanceId, &val, activeStateName, idName);
+            currentAlarmMessage = "Value is within normal limits.";
+            currentAlarmSeverity = 100;        // Low severity for normal state
+            alarmTransitionedToNormal = true;  // Mark for explicit event trigger
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "%s: Overall Alarm Cleared (%.2f)", displayName.c_str(),
+                        currentValue);
+
+        } else if(anyLimitActive && !wasActive) {  // A limit is active, but the alarm was
+                                                   // previously inactive
+            // This signifies a transition to active for the overall alarm
+            UA_Boolean newActiveState = true;
+            UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
+            UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+            setStatus |= UA_Server_setConditionVariableFieldProperty(
+                server, alarmInstanceId, &val, activeStateName, idName);
+
+            //     // Set Retain = true, AckedState = false
+            UA_Boolean retain = true;
+            UA_Variant_setScalar(&val, &retain, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_QualifiedName retainName = UA_QUALIFIEDNAME_ALLOC(0, "Retain");
+            UA_Variant_setScalar(&val, &boolTrue, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
+
+            info->acked = false;
+            UA_QualifiedName ackedName = UA_QUALIFIEDNAME_ALLOC(0, "AckedState");
+            UA_Variant_setScalar(&val, &boolFalse, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
+                                                        ackedName, idName);
+            // Message and severity are already set by the specific limit logic above
+        }
+
+    // // Update Message and Severity based on the highest priority current active state
+    // // This is important because the default `TwoStateVariable` changes won't automatically update Message/Severity
+
+UA_Variant_setScalar(&val, &currentAlarmSeverity, &UA_TYPES[UA_TYPES_UINT16]);
+
+UA_QualifiedName severityName = UA_QUALIFIEDNAME_ALLOC(0, "Severity");
+setStatus = UA_Server_setConditionField(server, alarmInstanceId, &val, severityName);
+
+
+// UA_Variant_clear(&val);
+// UA_QualifiedName_clear(&severityName);
+
+// Step 2 — Set the Message
+
+// Create LocalizedText from your message string
+// cout << "currentAlarmMessage: " << currentAlarmMessage << endl;
+
+UA_LocalizedText newAlarmMessage =
+    UA_LOCALIZEDTEXT_ALLOC("en", currentAlarmMessage.c_str());
+
+
+UA_Variant_setScalar(&val, &newAlarmMessage, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+
+// write to server
+UA_QualifiedName messageName = UA_QUALIFIEDNAME_ALLOC(0, "Message");
+setStatus = UA_Server_setConditionField(server, alarmInstanceId, &val, messageName);
+
+
+// Cleanup
+// UA_Variant_clear(&val);
+// UA_QualifiedName_clear(&messageName);
+
+// DO NOT clear newAlarmMessage separately
+
+    
+    // if (val.type == &UA_TYPES[UA_TYPES_UINT16] && val.data) {
+    // std::cout << "Message value: " << (UA_LocalizedText *)val.data << std::endl;
+
+
 
 
     // Explicitly trigger the condition event if the overall alarm state changed to normal
@@ -653,6 +777,28 @@ static void writeCallback(
                         displayName.c_str(), UA_StatusCode_name(triggerStatus));
         }
     }
+
+
+// // Set Retain = true when alarm becomes active
+// UA_Boolean retain = true;
+// UA_Variant_setScalar(&val, &retain, &UA_TYPES[UA_TYPES_BOOLEAN]);
+// UA_QualifiedName retainName = UA_QUALIFIEDNAME_ALLOC(0, "Retain");
+// UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
+
+// // Set Retain = false when alarm is inactive and acknowledged
+// retain = false;
+// UA_Variant_setScalar(&val, &retain, &UA_TYPES[UA_TYPES_BOOLEAN]);
+// UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
+
+// // Set AckedState = false when alarm becomes active
+// UA_Boolean acked = false;
+// UA_Variant_setScalar(&val, &acked, &UA_TYPES[UA_TYPES_BOOLEAN]);
+// UA_QualifiedName ackedName = UA_QUALIFIEDNAME_ALLOC(0, "AckedState");
+// UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+// UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val, ackedName, idName);
+
+// // When client calls Acknowledge, open62541 will set AckedState = true automatically
+
 
 }
 
@@ -1137,16 +1283,6 @@ if (token.contains("access_token")) {
     // Process and store API and create Address space.
 
     // Global structure to hold alarm-related data for each monitored node
-// struct MonitoredNodeAlarmInfo {
-//     UA_NodeId processNodeId;
-//     UA_NodeId alarmInstanceId;
-//     double alarmHiHi;
-//     double alarmHi;
-//     double alarmLo;
-//     double alarmLoLo;
-//     double deadband; // Add deadband for hysteresis
-//     std::string displayName; // To use in alarm messages
-// };
 
 
 // std::map<UA_NodeId, MonitoredNodeAlarmInfo, UA_NodeId_less_than> monitoredAlarms;
@@ -1425,17 +1561,18 @@ if (!BearerToken.empty()) {
                         //Link Alarms?
                         //Added count so it creates alarm for every 25th node thus not overflowing the alarm queue
                         if (count%25==0) {
-
+                            
+                            
                             MonitoredNodeAlarmInfo alarmInfo;
                             alarmInfo.processNodeId = nodeId;
                             alarmInfo.displayName = parts[i]; // Use the node's display name for alarm messages
 
                             // Get alarm thresholds from the JSON item
 
-                            alarmInfo.alarmHiHi = item.contains("alarmHiHi") ? item["alarmHiHi"].get<double>() : 0.0;
-                            alarmInfo.alarmHi = item.contains("alarmHi") ? item["alarmHi"].get<double>() : 0.0;
-                            alarmInfo.alarmLo = item.contains("alarmLo") ? item["alarmLo"].get<double>() : 0.0;
-                            alarmInfo.alarmLoLo = item.contains("alarmLoLo") ? item["alarmLoLo"].get<double>() : 0.0;
+                            alarmInfo.alarmHiHi = (item["alarmHiHi"].get<double>() == 0) ? 20.0 : item["alarmHiHi"].get<double>();
+                            alarmInfo.alarmHi = (item["alarmHi"].get<double>() == 0) ? 10.0 :item["alarmHi"].get<double>();
+                            alarmInfo.alarmLo = (item["alarmLo"].get<double>() == 0) ? -10.0 : item["alarmLo"].get<double>();
+                            alarmInfo.alarmLoLo = (item["alarmLoLo"].get<double>() == 0) ? -20.0 : item["alarmLoLo"].get<double>();
 
                             alarmInfo.deadband = item.contains("deadband") ? item["deadband"].get<double>() : 0.0;
 
