@@ -1346,6 +1346,7 @@ struct MonitoredNodeAlarmInfo {
     double deadband; // Add deadband for hysteresis
     std::string displayName; // To use in alarm messages
     bool acked = false; //Acknowledged state
+    bool callbackSetup = false; // Flag to track if method callback is already set up
 };
 std::map<UA_NodeId, MonitoredNodeAlarmInfo , UA_NodeId_less_than> monitoredAlarms;
 
@@ -1361,17 +1362,29 @@ static UA_StatusCode createAndLinkExclusiveLimitAlarm(UA_Server *server,
     std::string alarmName = displayName + "_ExclusiveLimitAlarm";
     UA_QualifiedName alarmQualifiedName = UA_QUALIFIEDNAME_ALLOC(0, alarmName.c_str());
 
-    UA_Server_addReference(server,
-    UA_NODEID_NUMERIC(0, 54624),
-    UA_NS0ID(HASCOMPONENT),
-    UA_EXPANDEDNODEID_NUMERIC(processNodeId->namespaceIndex, processNodeId->identifier.numeric),
-    UA_TRUE);
+    // UA_Server_addReference(server,
+    // UA_NODEID_NUMERIC(0, 54624),
+    // UA_NS0ID(HASCOMPONENT),
+    // UA_EXPANDEDNODEID_NUMERIC(processNodeId->namespaceIndex, processNodeId->identifier.numeric),
+    // UA_TRUE);
+
+    // UA_Server_addReference(server,
+    // UA_NODEID_NUMERIC(0, 54624),
+    // UA_NS0ID(HASEVENTSOURCE),
+    // UA_EXPANDEDNODEID_NUMERIC(processNodeId->namespaceIndex, processNodeId->identifier.numeric),
+    // UA_TRUE);
 
     UA_Server_addReference(server,
-    UA_NODEID_NUMERIC(0, 54624),
+    UA_NODEID_STRING(1,(char *)"TDSPL/PLANT-001"),
     UA_NS0ID(HASEVENTSOURCE),
     UA_EXPANDEDNODEID_NUMERIC(processNodeId->namespaceIndex, processNodeId->identifier.numeric),
     UA_TRUE);
+
+    UA_Server_addReference(server, UA_NODEID_STRING(1, (char *)"TDSPL/PLANT-001"),
+                           UA_NS0ID(HASNOTIFIER),
+                           UA_EXPANDEDNODEID_NUMERIC(processNodeId->namespaceIndex,
+                                                     processNodeId->identifier.numeric),
+        UA_TRUE);
 
 
     // Now create the alarm

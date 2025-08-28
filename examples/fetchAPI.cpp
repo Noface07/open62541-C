@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include "structs.h"
+#include "Logger.h"
 
 
 using json = nlohmann::ordered_json;
@@ -78,7 +79,7 @@ json getBearerToken() {
         beast::http::read(stream, buffer, res);
 
         json result = json::parse(res.body());
-        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, res.body().c_str());
+        log(res.body().c_str(),LogLevel::DEBUG);
 
         // Gracefully close the connection
         beast::error_code ec;
@@ -88,7 +89,7 @@ json getBearerToken() {
 
         return result;
     } catch (const std::exception &e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        log("Error: " + string(e.what()),LogLevel::ERRORS);
         return json{};
     }
 }
@@ -157,7 +158,7 @@ try{
     
     // Output response
 
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, res.body().c_str());
+    log(res.body().c_str(),LogLevel::DEBUG);
     json result = json::parse(res.body());
     // Shutdown connection
     beast::error_code ec;
@@ -166,7 +167,7 @@ try{
     return result;
 
     } catch (const std::exception &e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+    log("Error: " + string(e.what()),LogLevel::ERRORS);
         return json{};
     }
     
@@ -348,9 +349,9 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
         }
     }
 
-    cout << "Mapping: " << endl;
+    log("Mapping: ");
     for(const auto &mapping : Mapping) {
-        cout << mapping.first << " " << mapping.second.first << " " << mapping.second.second << endl;
+        log(mapping.first + " " + mapping.second.first + " " + mapping.second.second);
     }
     cout << endl;
 

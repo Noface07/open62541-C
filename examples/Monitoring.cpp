@@ -11,6 +11,7 @@
 #include "structs.h"
 #include <nlohmann/json.hpp>
 #include "MQTThandler.h"
+#include "Logger.h"
 
 using namespace std;
 using json = nlohmann::ordered_json;
@@ -22,7 +23,9 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
                          UA_UInt32 monId, void *monContext, UA_DataValue *value) {
 
     auto* myContext = static_cast<MyMonitorContext*>(monContext);
-    cout << "myContext->infoSpace.Namespace: " << myContext->infoSpace.namespaces << endl;
+
+    log("myContext->infoSpace.Namespace: " + myContext->infoSpace.namespaces, LogLevel::DEBUG);
+
     json data;
     data["TagId"] = myContext->infoSpace.tagId;
 
@@ -114,42 +117,40 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
     // std::cout << payload.dump(4) << std::endl;
     
 
-    std::cout << "The Monitored Item " << monId << " has changed!"<< std::endl;
+    log(" The Monitored Item " + to_string(monId) + " has changed!");
 
 
     if (!myContext->mqttHandler) {
-        std::cout << "MQTT handler is null!" << std::endl;
+        log("MQTT handler is null!", LogLevel::ERRORS);
     } else {
         bool published = myContext->mqttHandler->publish(myContext->infoSpace.namespaces, payload.dump());
         if (!published) {
-            std::cout << "MQTT publish failed!" << std::endl;
+            log("MQTT publish failed!", LogLevel::ERRORS);
         } else {
-            std::cout << "MQTT publish succeeded!" << std::endl;
+            log("MQTT publish succeeded!", LogLevel::DEBUG);
         }
     }
 
     UA_Variant *variant = &value->value;
 
     if(variant->type == &UA_TYPES[UA_TYPES_INT32]) {
-        std::cout << "New value (int32): " << *(UA_Int32 *)variant->data << std::endl;
+        log("New value (int32): " + *(UA_Int32 *)variant->data);
         cout << endl;
     } else if(variant->type == &UA_TYPES[UA_TYPES_DOUBLE]) {
-        std::cout << "New value (double): " << *(UA_Double *)variant->data << std::endl;
+        log("New value (double): " + to_string(*(UA_Double *)variant->data));
         cout << endl;
     } else if(variant->type == &UA_TYPES[UA_TYPES_FLOAT]) {
-        std::cout << "New value (float): " << *(UA_Float *)variant->data << std::endl;
+        log("New value (float): " + to_string(*(UA_Float *)variant->data));
         cout << endl;
     } else if(variant->type == &UA_TYPES[UA_TYPES_BOOLEAN]) {
-        std::cout << "New value (bool): "
-                  << (*(UA_Boolean *)variant->data ? "true" : "false") << std::endl;
+        log("New value (bool): " + *(UA_Boolean *)variant->data ? "true" : "false");
         cout << endl;
     } else if(variant->type == &UA_TYPES[UA_TYPES_STRING]) {
         UA_String str = *(UA_String *)variant->data;
-        std::cout << "New value (string): " << std::string((char *)str.data, str.length)
-                  << std::endl;
+        log("New value (string): " + string((char *)str.data, str.length));
         cout << endl;
     } else {
-        std::cout << "Unsupported data type: " << variant->type->typeName << std::endl;
+        log("Unsupported data type: " + string(variant->type->typeName));
         cout << endl;
     }
 }
@@ -253,7 +254,7 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
 
     UA_NodeId nodeId = parseNodeId(nodeIdStr);
     if(UA_NodeId_isNull(&nodeId)) {
-        cout << "Invalid node ID format: " << nodeIdStr << endl;
+        log("Invalid node ID format: " + string(nodeIdStr), LogLevel::ERRORS);
         return;
     }
     
@@ -284,8 +285,8 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
     if(monResponse.statusCode == UA_STATUSCODE_GOOD) {
         UA_String nodeIdStr = UA_STRING_NULL;
         UA_NodeId_print(&monRequest.itemToMonitor.nodeId, &nodeIdStr);
-        cout << "Monitoring Node " << string((char *)nodeIdStr.data, nodeIdStr.length)
-             << ", id " << monResponse.monitoredItemId << tagID << endl;
+        log("Monitoring Node " + string((char *)nodeIdStr.data, nodeIdStr.length) +
+            ", id " + to_string(monResponse.monitoredItemId) + to_string(tagID));
         UA_String_clear(&nodeIdStr);
     }
 }
@@ -300,19 +301,19 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
 void handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext,
                    UA_UInt32 monId, void *monContext,
                    size_t nEventFields, UA_Variant *eventFields) {
-    std::cout << "Received Event Notification (" << nEventFields << " fields):" << std::endl;
+    ("Received Event Notification (" + to_string(nEventFields) + " fields):");
     
     for(size_t i = 0; i < nEventFields; ++i) {
         if(UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_UINT16])) {
             UA_UInt16 severity = *(UA_UInt16 *)eventFields[i].data;
-            std::cout << "  Severity: " << severity << std::endl;
+            log("  Severity: " + severity);
         } else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_LOCALIZEDTEXT])) {
             UA_LocalizedText *lt = (UA_LocalizedText *)eventFields[i].data;
-            std::cout << "  Message: " << std::string((char*)lt->text.data, lt->text.length) << std::endl;
+            log("  Message: " + std::string((char *)lt->text.data, lt->text.length));
         }
         else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_STRING])) {
             UA_String *s = (UA_String *)eventFields[i].data;
-            std::cout << "  Source Name: " << std::string((char*)s->data, s->length) << std::endl;
+            log("  Source Name: " + std::string((char *)s->data, s->length));
         }
 
         else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_DATETIME])) {
@@ -327,31 +328,32 @@ void handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext,
             std::tm *tm_info = std::localtime(&t);
             std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
 
-            std::cout << "  Time: " << buf << std::endl;
+            log("  Time: " + string(buf));
         }
 
         else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_NODEID])) {
             UA_NodeId *nid = (UA_NodeId *)eventFields[i].data;
-            std::cout << "  NODE ID: ns=" << nid->namespaceIndex << ";";
+            log("  NODE ID: ns=" + to_string(nid->namespaceIndex) + ";");
             switch (nid->identifierType) {
                 case UA_NODEIDTYPE_NUMERIC:
-                    std::cout << "i=" << nid->identifier.numeric;
+                    log("i=" + nid->identifier.numeric);
                     break;
                 case UA_NODEIDTYPE_STRING:
-                    std::cout << "s=" << std::string((char*)nid->identifier.string.data, nid->identifier.string.length);
+                    log("s=" + std::string((char *)nid->identifier.string.data,
+                                            nid->identifier.string.length));
                     break;
                 case UA_NODEIDTYPE_GUID:
-                    std::cout << "g=GUID";
+                    log("g=GUID");
                     break;
                 case UA_NODEIDTYPE_BYTESTRING:
-                    std::cout << "b=ByteString";
+                    log("b=ByteString");
                     break;
             }
             std::cout << std::endl;
         }
 
          else {
-            std::cout << "  Unknown field type" << std::endl;
+            log("  Unknown field type" , LogLevel::ERRORS);
         }
     }
     std::cout << std::endl;
@@ -394,7 +396,7 @@ static void MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse respon
     filter.selectClauses = (UA_SimpleAttributeOperand*)
         UA_Array_new(nSelectClauses, &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
     if(!filter.selectClauses) {
-        std::cout << "Failed to allocate select clauses" << std::endl;
+        log("Failed to allocate select clauses",LogLevel::ERRORS);
         return;
     }
     
@@ -480,9 +482,13 @@ static void MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse respon
                                              &monId, handler_Event, NULL);
 
     if(result.statusCode != UA_STATUSCODE_GOOD) {
-        std::cout << "Could not add the MonitoredItem: 0x" << std::hex << result.statusCode << std::endl;
+        std::ostringstream oss;
+        oss << "Could not add the MonitoredItem: 0x" << std::hex << hex << " "
+            << result.statusCode;
+        log(oss.str() , LogLevel :: ERRORS);
     } else {
-        std::cout << "Monitoring 'Root->Objects->Server', id " << result.monitoredItemId << std::endl;
+        log( "Monitoring 'Root->Objects->Server', id "
+                   + result.monitoredItemId);
     }
 
     // Cleanup

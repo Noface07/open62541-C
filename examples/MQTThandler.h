@@ -48,7 +48,7 @@ private:
     bool m_connected;
 
 public:
-    MQTTHandler(boost::asio::io_context& ioc);
+    MQTTHandler(boost::asio::io_context &ioc);
     ~MQTTHandler();
 
     bool connect(const std::string& broker, const std::string& port,

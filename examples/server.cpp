@@ -248,6 +248,9 @@ static void updateCounterAndTriggerEvent(UA_Server *server, void *data) {
     if (nodeMap.count(path)) return nodeMap[path];
     UA_ObjectAttributes oAttr = UA_ObjectAttributes_default;
     oAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", name.c_str());
+    if(name == "PLANT-001") {
+        oAttr.eventNotifier = 1;
+    }
     UA_NodeId nodeId = UA_NODEID_STRING_ALLOC(1, path.c_str());
     UA_QualifiedName qName = UA_QUALIFIEDNAME_ALLOC(1, name.c_str());
     UA_Server_addObjectNode(server, nodeId, parent, UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), qName, UA_NODEID_NUMERIC(0, UA_NS0ID_FOLDERTYPE), oAttr, NULL, NULL);
@@ -282,6 +285,8 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
     });
 };
 
+
+
         static UA_NodeId findChildByBrowseName(UA_Server *server, UA_NodeId parent, char *childName) {
             UA_BrowseDescription bd;
             UA_BrowseDescription_init(&bd);
@@ -303,6 +308,116 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
             UA_BrowseResult_clear(&bres);
             return result;
         }
+
+
+
+
+
+// Define a structure to hold method callback context
+struct MethodCallbackContext {
+    UA_NodeId ackedStateNodeId;
+    MonitoredNodeAlarmInfo *alarmInfo;
+};
+
+// Add a flag to track if callback is already set up
+// struct MonitoredNodeAlarmInfo {
+//     UA_NodeId processNodeId;
+//     UA_NodeId alarmInstanceId;
+//     double alarmHiHi;
+//     double alarmHi;
+//     double alarmLo;
+//     double alarmLoLo;
+//     double deadband;
+//     std::string displayName;
+//     bool acked;
+//     bool callbackSetup;  // Flag to track if method callback is already set up
+// };
+
+static UA_StatusCode
+CustomAckCallback(UA_Server *server,
+                    const UA_NodeId *sessionId,
+                    void *sessionContext,
+                    const UA_NodeId *methodId,
+                    void *methodContext,
+                    const UA_NodeId *objectId,
+                    void *objectContext,
+                    size_t inputSize,
+                    const UA_Variant *input,
+                    size_t outputSize,
+                    UA_Variant *output) {
+
+    // Get the context from methodContext
+    MethodCallbackContext *context = (MethodCallbackContext*)methodContext;
+    
+    if(!context || !context->alarmInfo) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Invalid context in method callback");
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    UA_NodeId *ackedStateNodeId = &context->ackedStateNodeId;
+    MonitoredNodeAlarmInfo *info = context->alarmInfo;
+
+    // 1. Set AckedState.Id = true
+    UA_Boolean acked = true;
+    UA_Variant value;
+    UA_Variant_setScalar(&value, &acked, &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+    UA_QualifiedName ackedStateName = UA_QUALIFIEDNAME(0, (char *)"AckedState");
+    UA_QualifiedName idName = UA_QUALIFIEDNAME(0, (char *)"Id");
+
+    UA_Server_setConditionVariableFieldProperty(
+        server,
+        *objectId,
+        &value,
+        ackedStateName,
+        idName);
+
+    // // 2. Update Comment field
+    // if(inputSize > 1) {
+    //     UA_QualifiedName commentFieldName = UA_QUALIFIEDNAME(0, (char *)"Comment");
+    //     UA_Server_setConditionVariableFieldProperty(
+    //         server,
+    //         *objectId,
+    //         (UA_Variant*)&input[1],
+    //         commentFieldName,
+    //         UA_QUALIFIEDNAME(0, (char *)"Value"));
+    // }
+
+    // 3. Optionally fire a condition refresh / event:
+    // UA_Server_triggerConditionEvent(
+    //     server,
+    //     *objectId,
+    //     info->processNodeId,
+    //     NULL);
+
+    // custom logic
+    if(!UA_NodeId_isNull(ackedStateNodeId)) {
+        UA_Boolean acked = false;
+        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+        UA_Variant idValueVariant;
+        UA_StatusCode idStatus = UA_Server_readObjectProperty(server, *ackedStateNodeId, idName, &idValueVariant);
+        if (idStatus == UA_STATUSCODE_GOOD && UA_Variant_hasScalarType(&idValueVariant, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+            acked = *(UA_Boolean*)idValueVariant.data;
+            info->acked = acked;
+        }
+    }
+
+    cout << "Custom acknowledgment logic triggered!" << endl; 
+    
+    // Debug logging to verify context
+    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
+                "Method callback context - AckedStateNodeId: ns=%d;i=%d, AlarmInfo: %p", 
+                ackedStateNodeId->namespaceIndex, ackedStateNodeId->identifier.numeric, 
+                (void*)info);
+    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
+                "Alarm info - DisplayName: %s, ProcessNodeId: ns=%d;i=%d", 
+                info->displayName.c_str(), 
+                info->processNodeId.namespaceIndex, info->processNodeId.identifier.numeric);
+
+    return UA_STATUSCODE_GOOD;
+}
+
+
 
 
 // Write callback for OPC UA node value changes
@@ -356,51 +471,11 @@ static void writeCallback(
         dataPoint["TagType"] = topicMap[topic].tagType;
         dataPoint["DatapointId"] = topicMap[topic].tagId;
 
-        // auto now = std::chrono::system_clock::now();
-        // auto in_time_t = std::chrono::system_clock::to_time_t(now);
-        // auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        //             now.time_since_epoch()) %
-        //         1000;
 
-        // std::ostringstream oss;
-        // oss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%dT%H:%M:%S")
-        //     << "." << std::setfill('0') << std::setw(3) << ms.count()
-        //     << "+05:30";  // Or dynamically detect timezone if needed
-        // dataPoint["TimeStamp"] = oss.str();
         dataPoint["TimeStamp"] = UA_DateTime_now();
 
 
-        // dataPoint["TagId"] = topicMap[topic].tagId;
-        // payload["TagId"].push_back(dataPoint);
-        // dataPoint["TagType"] = topicMap[topic].tagType;
-        // payload["TagType"].push_back(dataPoint);
 
-        // // dataPoint["Name"] = topicMap[topic].name;
-        // // payload["Name"].push_back(dataPoint);
-
-        // dataPoint["DatapointId"] = topicMap[topic].tagId;
-        // payload["DatapointId"].push_back(dataPoint);
-
-
-        //  payload["TimeStamp"].push_back(dataPoint);
-
-        // source , infoId , quality , updateType
-
-            // TODO --------------------------------------------------------------
-
-                //     // Hardcoded or lookup-based metadata
-                //     dataPoint["TagId"] = 194;           // Replace with actual lookup if dynamic
-                //     dataPoint["TagType"] = "INFO_INST"; // Replace with tag-specific type
-                //     dataPoint["Source"] = 2;
-                //     dataPoint["DatapointId"] = 194;
-                //     dataPoint["InfoId"] = 1001;
-                //     dataPoint["Quality"] = 1;
-                //     dataPoint["UpdateType"] = 1;
-
-                // NEED TO ADD ALL OF THIS DYNAMICALLY
-
-
-            // ---------------------------------------------------------------------
         payload["Data"] = json::array({dataPoint});
 
         publish_to_mqtt(topic, payload.dump());
@@ -416,9 +491,7 @@ static void writeCallback(
         // Find the alarm info for this nodeId using the global map
         auto it = monitoredAlarms.find(*nodeId);
         if (it == monitoredAlarms.end()) {
-            // UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-            //             "Could not find alarm info for process node (ns=%d;i=%d).",
-            //             nodeId->namespaceIndex, nodeId->identifier.numeric);
+
             return;
         }
 
@@ -437,7 +510,7 @@ static void writeCallback(
         currentValue = (double)*(UA_Int32*)(data->value.data);
     } else if (UA_Variant_hasScalarType(&data->value, &UA_TYPES[UA_TYPES_FLOAT])) {
         currentValue = (double)*(UA_Float*)(data->value.data);
-    } else { // UA_TYPES_DOUBLE
+    } else {
         currentValue = *(UA_Double*)(data->value.data);
     }
 
@@ -452,12 +525,6 @@ static void writeCallback(
     double deadband = info->deadband;
     const std::string& displayName = info->displayName;
 
-    // UA_Variant ackedVariant;
-    // UA_QualifiedName ackedName = UA_QUALIFIEDNAME_ALLOC(0, "AckedState");
-    // if (UA_Server_readObjectProperty(server, alarmInstanceId, ackedName, &ackedVariant) == UA_STATUSCODE_GOOD &&
-    //     UA_Variant_hasScalarType(&ackedVariant, &UA_TYPES[UA_TYPES_BOOLEAN])) {
-    //     info->acked = *(UA_Boolean*)ackedVariant.data;
-    // }
 
     UA_StatusCode setStatus = UA_STATUSCODE_GOOD;
     UA_Variant val;
@@ -509,9 +576,9 @@ static void writeCallback(
 
 
     // Determine the highest priority active alarm state
-        std::string currentAlarmMessage = "Normal";
-        UA_UInt16 currentAlarmSeverity = 0;
-        bool alarmTransitionedToNormal = false; // Flag to track if the overall alarm state transitioned to normal
+    std::string currentAlarmMessage = "Normal";
+    UA_UInt16 currentAlarmSeverity = 0;
+    bool alarmTransitionedToNormal = false; // Flag to track if the overall alarm state transitioned to normal
 
         
 
@@ -528,6 +595,7 @@ static void writeCallback(
             UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s: HighHigh Alarm (%.2f >= %.2f)",
                         displayName.c_str(), currentValue, hiHi);
         }
+
         anyLimitActive = true;
         currentAlarmMessage = "Value EXCEEDS HighHigh Limit!";
         currentAlarmSeverity = 900;
@@ -633,93 +701,119 @@ static void writeCallback(
 
 
 
-
-
-
     // Handle the overall ActiveState of the alarm
     // ExclusiveLimitAlarmType automatically sets its ActiveState based on its internal limit states.
     // We only need to manually trigger an event if the *overall* alarm is going from active to inactive.
-    UA_Variant currentActiveStateVariant;
-    bool wasActive = false;
-    UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
-    if (UA_Server_readObjectProperty(server, alarmInstanceId, activeStateName, &currentActiveStateVariant) == UA_STATUSCODE_GOOD && 
-        UA_Variant_hasScalarType(&currentActiveStateVariant, &UA_TYPES[UA_TYPES_BOOLEAN])) {
-        wasActive = *(UA_Boolean*)currentActiveStateVariant.data;
-    }
-
-
-
-        // Usage:
-        UA_NodeId ackedStateNodeId = findChildByBrowseName(server, alarmInstanceId, (char *)"AckedState");
-        if(!UA_NodeId_isNull(&ackedStateNodeId)) {
-            UA_Boolean acked = false;
+    UA_Boolean wasActive = false;
+    UA_NodeId ActiveStateNodeId = findChildByBrowseName(server, alarmInstanceId, (char *)"ActiveState");
+    if(!UA_NodeId_isNull(&ActiveStateNodeId)) {
             UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
-            UA_Variant idValueVariant;
-            UA_StatusCode idStatus = UA_Server_readObjectProperty(server, ackedStateNodeId, idName, &idValueVariant);
-            if (idStatus == UA_STATUSCODE_GOOD && UA_Variant_hasScalarType(&idValueVariant, &UA_TYPES[UA_TYPES_BOOLEAN])) {
-                acked = *(UA_Boolean*)idValueVariant.data;
-                info->acked = acked;
-                // cout << "info->acked: " << info->acked << endl;
+            UA_Variant ASidValueVariant;
+            UA_StatusCode idStatus = UA_Server_readObjectProperty(server, ActiveStateNodeId, idName, &ASidValueVariant);
+            if (idStatus == UA_STATUSCODE_GOOD && UA_Variant_hasScalarType(&ASidValueVariant, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+                wasActive = *(UA_Boolean*)ASidValueVariant.data;
             }
         }
 
-        //do same with wasactive and fix!!!
+
+
+    //Setting up CALLBACk
+    if(!info->callbackSetup) {
+    UA_NodeId ackedStateNodeId = findChildByBrowseName(server, alarmInstanceId, (char *)"AckedState");
+
+    UA_NodeId acknowledgeMethodNodeId = findChildByBrowseName(server, alarmInstanceId, (char *)"Acknowledge");
+
+    cout<<"Inside Setting Callback"<<endl;
+
+    // Use the existing info pointer (MonitoredNodeAlarmInfo *info = &it->second) that's already available in this function
+    // Allocate memory for the context and set both pieces of information
+    MethodCallbackContext *context = (MethodCallbackContext*)UA_malloc(sizeof(MethodCallbackContext));
+    if(context) {
+        context->ackedStateNodeId = ackedStateNodeId;
+        context->alarmInfo = info;  // Use the existing info pointer from writeCallback
+        
+        // Set the node context first
+        UA_Server_setNodeContext(server, acknowledgeMethodNodeId, context);
+        
+        // Then set the method callback
+        UA_Server_setMethodNodeCallback(
+            server,
+            acknowledgeMethodNodeId,
+            CustomAckCallback);
+    }
+
+    info->callbackSetup = true;
+    }
+        
 
 
 
-        // if (!anyLimitActive && wasActive) {
-        // // When alarm becomes inactive and acknowledged
-        if(!anyLimitActive && info->acked) {
-            // ... existing code ...
-            // Set Retain = false
-            cout<<"Inside 1"<<endl;
-            UA_QualifiedName retainName = UA_QUALIFIEDNAME_ALLOC(0, "Retain");
-            UA_Variant_setScalar(&val, &boolFalse, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            UA_StatusCode status = UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
-            cout << "Set Retain status: " << UA_StatusCode_name(status) << endl;
-        } else if(!anyLimitActive) {  // No limits are active, but the alarm was
-                                      // previously active
-            // This signifies a transition to normal for the overall alarm
-            UA_Boolean newActiveState = false;
-            UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
-            UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
-            setStatus |= UA_Server_setConditionVariableFieldProperty(
-                server, alarmInstanceId, &val, activeStateName, idName);
-            currentAlarmMessage = "Value is within normal limits.";
-            currentAlarmSeverity = 100;        // Low severity for normal state
-            alarmTransitionedToNormal = true;  // Mark for explicit event trigger
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                        "%s: Overall Alarm Cleared (%.2f)", displayName.c_str(),
-                        currentValue);
+if (anyLimitActive) {
+    // Alarm is ACTIVE
+    if (!wasActive) {
+        // transition from inactive → active
+        UA_Boolean newActiveState = true;
+        UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
+        UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
 
-        } else if(anyLimitActive && !wasActive) {  // A limit is active, but the alarm was
-                                                   // previously inactive
-            // This signifies a transition to active for the overall alarm
-            UA_Boolean newActiveState = true;
-            UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
-            UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
-            setStatus |= UA_Server_setConditionVariableFieldProperty(
-                server, alarmInstanceId, &val, activeStateName, idName);
+        setStatus |= UA_Server_setConditionVariableFieldProperty(
+            server, alarmInstanceId, &val, activeStateName, idName);
 
-            //     // Set Retain = true, AckedState = false
-            UA_Boolean retain = true;
-            UA_Variant_setScalar(&val, &retain, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            UA_QualifiedName retainName = UA_QUALIFIEDNAME_ALLOC(0, "Retain");
-            UA_Variant_setScalar(&val, &boolTrue, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
+        // Retain = true
+        UA_Boolean retain = true;
+        UA_Variant_setScalar(&val, &retain, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName retainName = UA_QUALIFIEDNAME_ALLOC(0, "Retain");
+        UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
 
-            info->acked = false;
-            UA_QualifiedName ackedName = UA_QUALIFIEDNAME_ALLOC(0, "AckedState");
-            UA_Variant_setScalar(&val, &boolFalse, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val,
-                                                        ackedName, idName);
-            // Message and severity are already set by the specific limit logic above
-        }
+        // AckedState = false
+        info->acked = false;
+        UA_QualifiedName ackedName = UA_QUALIFIEDNAME_ALLOC(0, "AckedState");
+        UA_Variant_setScalar(&val, &boolFalse, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_Server_setConditionVariableFieldProperty(
+            server, alarmInstanceId, &val, ackedName, idName);
+    }
+}
+else {
+    // Alarm is INACTIVE
+
+    currentHiHiState = false;
+    currentHiState = false;
+    currentLoState = false;
+    currentLoLoState = false;
+
+    UA_Boolean newActiveState = false;
+    UA_Variant_setScalar(&val, &newActiveState, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_QualifiedName activeStateName = UA_QUALIFIEDNAME_ALLOC(0, "ActiveState");
+    UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
+
+    setStatus |= UA_Server_setConditionVariableFieldProperty(
+        server, alarmInstanceId, &val, activeStateName, idName);
+
+    if (info->acked) {
+        // acknowledged → Retain = false
+        UA_Boolean retain = false;
+        UA_Variant_setScalar(&val, &retain, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName retainName = UA_QUALIFIEDNAME_ALLOC(0, "Retain");
+        UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
+    } else {
+        // not acknowledged → Retain = true
+        UA_Boolean retain = true;
+        UA_Variant_setScalar(&val, &retain, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_QualifiedName retainName = UA_QUALIFIEDNAME_ALLOC(0, "Retain");
+        UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
+    }
+}
+
+
+
+
 
     // // Update Message and Severity based on the highest priority current active state
     // // This is important because the default `TwoStateVariable` changes won't automatically update Message/Severity
+
+
+
 
 UA_Variant_setScalar(&val, &currentAlarmSeverity, &UA_TYPES[UA_TYPES_UINT16]);
 
@@ -727,13 +821,7 @@ UA_QualifiedName severityName = UA_QUALIFIEDNAME_ALLOC(0, "Severity");
 setStatus = UA_Server_setConditionField(server, alarmInstanceId, &val, severityName);
 
 
-// UA_Variant_clear(&val);
-// UA_QualifiedName_clear(&severityName);
 
-// Step 2 — Set the Message
-
-// Create LocalizedText from your message string
-// cout << "currentAlarmMessage: " << currentAlarmMessage << endl;
 
 UA_LocalizedText newAlarmMessage =
     UA_LOCALIZEDTEXT_ALLOC("en", currentAlarmMessage.c_str());
@@ -746,15 +834,6 @@ UA_QualifiedName messageName = UA_QUALIFIEDNAME_ALLOC(0, "Message");
 setStatus = UA_Server_setConditionField(server, alarmInstanceId, &val, messageName);
 
 
-// Cleanup
-// UA_Variant_clear(&val);
-// UA_QualifiedName_clear(&messageName);
-
-// DO NOT clear newAlarmMessage separately
-
-    
-    // if (val.type == &UA_TYPES[UA_TYPES_UINT16] && val.data) {
-    // std::cout << "Message value: " << (UA_LocalizedText *)val.data << std::endl;
 
 
 
@@ -764,9 +843,14 @@ setStatus = UA_Server_setConditionField(server, alarmInstanceId, &val, messageNa
     bool triggerExplicitEvent = alarmTransitionedToNormal;
 
     // If a limit is active and we manually set message/severity, we still need to trigger the event
-    if (anyLimitActive) {
-        triggerExplicitEvent = true;
-    }
+        if (anyLimitActive && !wasActive) {
+            triggerExplicitEvent = true;
+        } else if (!anyLimitActive && wasActive) {
+            triggerExplicitEvent = true;
+        }
+
+
+    
 
     if (triggerExplicitEvent) {
         UA_StatusCode triggerStatus = UA_Server_triggerConditionEvent(server, alarmInstanceId,
@@ -777,29 +861,6 @@ setStatus = UA_Server_setConditionField(server, alarmInstanceId, &val, messageNa
                         displayName.c_str(), UA_StatusCode_name(triggerStatus));
         }
     }
-
-
-// // Set Retain = true when alarm becomes active
-// UA_Boolean retain = true;
-// UA_Variant_setScalar(&val, &retain, &UA_TYPES[UA_TYPES_BOOLEAN]);
-// UA_QualifiedName retainName = UA_QUALIFIEDNAME_ALLOC(0, "Retain");
-// UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
-
-// // Set Retain = false when alarm is inactive and acknowledged
-// retain = false;
-// UA_Variant_setScalar(&val, &retain, &UA_TYPES[UA_TYPES_BOOLEAN]);
-// UA_Server_setConditionField(server, alarmInstanceId, &val, retainName);
-
-// // Set AckedState = false when alarm becomes active
-// UA_Boolean acked = false;
-// UA_Variant_setScalar(&val, &acked, &UA_TYPES[UA_TYPES_BOOLEAN]);
-// UA_QualifiedName ackedName = UA_QUALIFIEDNAME_ALLOC(0, "AckedState");
-// UA_QualifiedName idName = UA_QUALIFIEDNAME_ALLOC(0, "Id");
-// UA_Server_setConditionVariableFieldProperty(server, alarmInstanceId, &val, ackedName, idName);
-
-// // When client calls Acknowledge, open62541 will set AckedState = true automatically
-
-
 }
 
 
@@ -1337,7 +1398,6 @@ if (!BearerToken.empty()) {
                         attr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE | UA_ACCESSLEVELMASK_HISTORYREAD;
                         attr.historizing = true;
 
-
                         // UA_NodeId nodeId = UA_NODEID_STRING_ALLOC(1, currentPath.c_str());
                         UA_NodeId nodeId = UA_NODEID_NUMERIC(1, item["tagId"].get<int>());
                         UA_QualifiedName nodeName = UA_QUALIFIEDNAME_ALLOC(1, parts[i].c_str());
@@ -1556,11 +1616,10 @@ if (!BearerToken.empty()) {
                         }
 
 
-
                         
                         //Link Alarms?
                         //Added count so it creates alarm for every 25th node thus not overflowing the alarm queue
-                        if (count%25==0) {
+                        if (nodeId.identifier.numeric == 1618 || nodeId.identifier.numeric == 1569) {
                             
                             
                             MonitoredNodeAlarmInfo alarmInfo;
@@ -1956,6 +2015,12 @@ UA_Server_triggerEvent(server, eventNodeId,
             UA_ByteString_clear(&issuerList[i]);
         UA_free(issuerList);
     }
+
+    // Clean up method callback contexts
+    // Note: In a production environment, you might want to keep track of all allocated contexts
+    // and clean them up individually. For this example, the server will handle most cleanup.
+    // The MethodCallbackContext structures are stored as node contexts and will be cleaned up
+    // when the server is deleted.
 
     UA_Server_delete(server);
 
