@@ -36,8 +36,7 @@ using namespace std;
 // Global MQTT handler instance
 MQTTHandler *g_mqttHandler = nullptr;
 
-// Global Debug Flag
-bool g_debug = false;
+// Global Debug Flag comes from Logger.h (inline variable)
 
 unordered_map<string, int> groupIdMap;
 
@@ -223,9 +222,24 @@ runClient(bool isService, int argc, char *argv[]) {
         return 0;  // Exit if user chooses No
     }
 
+    // Global logging control - only enable file logging with --debug
+    g_logging_enabled = false; // Default: no file logging
+    
     if(argc > 1 && std::string(argv[1]) == "--debug") {
         g_debug = true;
+        g_logging_enabled = true; // Enable file logging in debug mode
+    } else {
+        g_debug = false;
     }
+    
+    // Initialize logging with client-specific folder (only if logging is enabled)
+    init_logging("logs/client", "client", true);
+    if (g_logging_enabled) {
+        log("Client logging initialized with day-wise log files", LogLevel::INFO);
+    } else {
+        std::cout << "Client started - no file logging (use --debug to enable)" << std::endl;
+    }
+    
     if(g_debug && !isService) {
         // Allocate a console at runtime
         if(AllocConsole()) {

@@ -54,7 +54,10 @@
 #include <open62541/plugin/historydata/history_database_default.h>
 #include <open62541/plugin/historydata/history_data_backend.h>
 
+
 #include <AandC.cpp>
+#include "Logger.h"
+
 
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
@@ -91,29 +94,81 @@ static UA_UsernamePasswordLogin usernamePasswordLogin[2] = {
 //     return UA_BYTESTRING_NULL;
 // }
 
+
+
+// Your custom logger callback
+static void
+myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg,
+      va_list /*args*/) {
+
+    // Never format with va_list to avoid specifier/argument mismatches. Just pass through.
+    try {
+        const char *text = msg ? msg : "";
+        switch(level) {
+            case UA_LOGLEVEL_FATAL:
+            case UA_LOGLEVEL_ERROR:
+                log(std::string(text), LogLevel::ERRORS);
+                break;
+            case UA_LOGLEVEL_WARNING:
+                log(std::string(text), LogLevel::INFO);
+                break;
+            case UA_LOGLEVEL_INFO:
+                log(std::string(text), LogLevel::INFO);
+                break;
+            case UA_LOGLEVEL_DEBUG:
+                log(std::string(text), LogLevel::DEBUG);
+                break;
+        }
+    } catch (...) {
+        // Swallow all exceptions to avoid unwinding across C boundary
+    }
+}
+
+// Custom logger plugin
+static UA_Logger myLogger = {myLog, nullptr, nullptr};
+
+
+
+
 static UA_StatusCode
 myLoginCallback(const UA_String *username, const UA_ByteString *password,
                 size_t usernamePasswordLoginSize,
                 const UA_UsernamePasswordLogin *usernamePasswordLogin,
                 void **sessionContext, void *loginContext) {
+    // Safely convert username to string, avoiding problematic format specifiers
+    std::string usernameStr;
+    if (username && username->data && username->length > 0) {
+        // Ensure we don't exceed buffer bounds
+        size_t maxLen = std::min(username->length, (size_t)255);
+        usernameStr.assign((char*)username->data, maxLen);
+    } else {
+        usernameStr = "unknown";
+    }
+    
     for(size_t i = 0; i < usernamePasswordLoginSize; i++) {
         if(UA_String_equal(username, &usernamePasswordLogin[i].username) &&
            UA_ByteString_equal(password, &usernamePasswordLogin[i].password)) {
             // Grant admin access to user1
             if(UA_String_equal(username, &usernamePasswordLogin[0].username)) {
                 *sessionContext = (void*)1; // Mark as admin
+                log("Admin user login successful: " + usernameStr, LogLevel::INFO);
+            } else {
+                log("Regular user login successful: " + usernameStr, LogLevel::INFO);
             }
             return UA_STATUSCODE_GOOD;
         }
     }
-    UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Login failed for user: %.*s",
-                   (int)username->length, username->data);
+    
+    log("Login failed for user: " + usernameStr, LogLevel::ERRORS);
+    UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Login failed for user: %s",
+                   usernameStr.c_str());
     return UA_STATUSCODE_BADUSERACCESSDENIED;
 }
 
 
 static void
 stopHandler(int sign) {
+    log("Received shutdown signal", LogLevel::INFO);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "received ctrl-c");
     running = false;
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "stopping server");
@@ -277,7 +332,7 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
                 try {
                     co_await amcl.async_publish(topic, payload, am::qos::at_most_once);
                 } catch(const std::exception &e) {
-                    std::cerr << "MQTT publish error: " << e.what() << std::endl;
+                    log("MQTT publish error: " + std::string(e.what()), LogLevel::ERRORS);
                 }
                 co_return;
             },
@@ -402,7 +457,7 @@ CustomAckCallback(UA_Server *server,
         }
     }
 
-    cout << "Custom acknowledgment logic triggered!" << endl; 
+    log("Custom acknowledgment logic triggered!", LogLevel::DEBUG);
     
     // Debug logging to verify context
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
@@ -723,7 +778,7 @@ static void writeCallback(
 
     UA_NodeId acknowledgeMethodNodeId = findChildByBrowseName(server, alarmInstanceId, (char *)"Acknowledge");
 
-    cout<<"Inside Setting Callback"<<endl;
+    log("Inside Setting Callback", LogLevel::DEBUG);
 
     // Use the existing info pointer (MonitoredNodeAlarmInfo *info = &it->second) that's already available in this function
     // Allocate memory for the context and set both pieces of information
@@ -874,7 +929,6 @@ void mqtt_subscribe_and_update(UA_Server* server, const std::vector<std::string>
             try {
                 // Connect to broker
                 co_await amcl.async_underlying_handshake("216.48.184.131", "15579", as::use_awaitable);
-                std::cerr << "Connected" << std::endl;
 
                 // Start MQTT session with username/password
                 auto connack_opt = co_await amcl.async_start(
@@ -889,7 +943,7 @@ void mqtt_subscribe_and_update(UA_Server* server, const std::vector<std::string>
                     as::use_awaitable
                 );
                 if (!connack_opt) {
-                    std::cerr << "Failed to connect to MQTT broker" << std::endl;
+                    log("Failed to connect to MQTT broker", LogLevel::ERRORS);
                     co_return;
                 }
 
@@ -906,7 +960,7 @@ void mqtt_subscribe_and_update(UA_Server* server, const std::vector<std::string>
                     as::use_awaitable
                 );
                 if (!suback_opt) {
-                    std::cerr << "Failed to subscribe" << std::endl;
+                    log("Failed to subscribe", LogLevel::ERRORS);
                     co_return;
                 }
 
@@ -951,7 +1005,7 @@ void mqtt_subscribe_and_update(UA_Server* server, const std::vector<std::string>
                                             }
                                         }
                                     } catch (const std::exception& e) {
-                                        std::cerr << "JSON parse error: " << e.what() << std::endl;
+                                        log("JSON parse error: " + std::string(e.what()), LogLevel::ERRORS);
                                     }
                                 }
                             },
@@ -960,7 +1014,7 @@ void mqtt_subscribe_and_update(UA_Server* server, const std::vector<std::string>
                     );
                 }
             } catch (const std::exception& e) {
-                std::cerr << "MQTT error: " << e.what() << std::endl;
+                log("MQTT error: " + std::string(e.what()), LogLevel::ERRORS);
             }
             co_return;
         },
@@ -1020,7 +1074,7 @@ json getBearerToken() {
 
         return result;
     } catch (const std::exception &e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        log("Error: " + std::string(e.what()), LogLevel::ERRORS);
         return json{};
     }
 }
@@ -1098,7 +1152,7 @@ try{
     return result;
 
     } catch (const std::exception &e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        log("Error: " + std::string(e.what()), LogLevel::ERRORS);
         return json{};
     }
     
@@ -1114,32 +1168,63 @@ try{
 
 
 int main(int argc, char* argv[]) {
+
+    // Global logging control - only enable file logging with --debug
+    g_logging_enabled = false; // Default: no file logging
+    
+    if(argc > 1 && std::string(argv[1]) == "--debug") {
+        g_debug = true;
+        g_logging_enabled = true; // Enable file logging in debug mode
+        log("Debug mode enabled - file logging active", LogLevel::INFO);
+    } else {
+        g_debug = false;
+        log("Debug mode disabled - no file logging", LogLevel::DEBUG);
+    }
+    
     signal(SIGINT, stopHandler);
     signal(SIGTERM, stopHandler);
+
+    // Initialize logging with server-specific folder
+    init_logging("logs/server", "server", true);
+    log("Server logging initialized with day-wise log files", LogLevel::INFO);
 
     UA_ByteString certificate = loadFile("server/own/certs/server_cert.der");  
     UA_ByteString privateKey  = loadFile("server/own/certs/server_key.der");
     
     if(certificate.length == 0 || privateKey.length == 0) {
+        log("Failed to load server certificate or key", LogLevel::ERRORS);
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                      "Could not load server certificate or key from certs/own/");
         return EXIT_FAILURE;
     }
+    
+    log("Server certificate and private key loaded successfully", LogLevel::INFO);
 
     UA_ByteString *trustList = NULL;
     size_t trustListSize = loadCertsFromDirectory("server/trusted/certs", &trustList);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Loaded %zu trusted certificate(s).", trustListSize);
+    log("Loaded " + std::to_string(trustListSize) + " trusted certificate(s)", LogLevel::INFO);
     
     UA_ByteString *issuerList = NULL;
     size_t issuerListSize = loadCertsFromDirectory("server/issuers/certs", &issuerList);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Loaded %zu issuer certificate(s).", issuerListSize);
+    log("Loaded " + std::to_string(issuerListSize) + " issuer certificate(s)", LogLevel::INFO);
 
     size_t revocationListSize = 0;
     UA_ByteString *revocationList = NULL;
 
     UA_Server *server = UA_Server_new();
     UA_ServerConfig *config = UA_Server_getConfig(server);
+    
+        // Custom logger is now enabled with safe format string handling
+    // The myLog function now sanitizes problematic format specifiers before processing
+    config->logging = &myLogger;
+    
+    log("OPC UA Server initialized", LogLevel::INFO);
+    log("Setting up server configuration", LogLevel::DEBUG);
+    
     size_t nsIdx = UA_Server_addNamespace(server, "urn:my.properties");
+    log("Added namespace: urn:my.properties", LogLevel::DEBUG);
 
     // broker_start(argc, argv);
     // #ifdef UA_ENABLE_ENCRYPTION
@@ -1160,6 +1245,13 @@ int main(int argc, char* argv[]) {
         trustList, trustListSize,
         issuerList, issuerListSize,
         revocationList, revocationListSize);
+        
+    if(retval == UA_STATUSCODE_GOOD) {
+        log("Security policies configured successfully", LogLevel::INFO);
+        log("Server will listen on port 53531", LogLevel::DEBUG);
+    } else {
+        log("Failed to configure security policies", LogLevel::ERRORS);
+    }
 
     // if(retval != UA_STATUSCODE_GOOD) {
     //     UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to set default security policies");
@@ -1170,6 +1262,8 @@ int main(int argc, char* argv[]) {
         UA_String_clear(&config->endpoints[i].endpointUrl);
         config->endpoints[i].endpointUrl = UA_STRING_ALLOC("opc.tcp://0.0.0.0:53531");
     }
+    
+    log("Configured server endpoints", LogLevel::DEBUG);
         
     // Accept all certificates for demo/testing
     // config->secureChannelPKI.clear(&config->secureChannelPKI);
@@ -1180,6 +1274,8 @@ int main(int argc, char* argv[]) {
     config->applicationDescription.applicationUri = UA_STRING_ALLOC("urn:Anexee.server.application");
     config->applicationDescription.productUri = UA_STRING_ALLOC("urn:Anexee.server");
     config->applicationDescription.applicationName = UA_LOCALIZEDTEXT_ALLOC("en-US", "Anexee");
+    
+    log("Application description configured: Anexee Server", LogLevel::DEBUG);
 
 
 
@@ -1190,9 +1286,11 @@ int main(int argc, char* argv[]) {
     config->historyDatabase = UA_HistoryDatabase_default(*g_gathering);
 
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Historizing configuration initialized");
+    log("Historizing configuration initialized successfully", LogLevel::INFO);
 
 // ----------------
     UA_AccessControl_defaultWithLoginCallback(config, true, NULL, 2, usernamePasswordLogin, myLoginCallback, NULL);
+    log("Access control configured with login callback", LogLevel::DEBUG);
 
     for(size_t i = 0; i < config->endpointsSize; i++) {
         UA_EndpointDescription *ep = &config->endpoints[i];
@@ -1855,9 +1953,14 @@ UA_Server_triggerEvent(server, eventNodeId,
     g_counterNodeId = &myDoubleNodeId;
     g_eventNodeId = &eventNodeId;
     UA_Server_addRepeatedCallback(server, updateCounterAndTriggerEvent, NULL, 10000, NULL);
+    
+    log("Starting OPC UA Server...", LogLevel::INFO);
+    log("Added repeated callback for counter updates", LogLevel::DEBUG);
 
     UA_Server_run_startup(server);
-        // Register server with LDS now that it's running
+        log("Server startup completed successfully", LogLevel::INFO);
+    log("Server is ready to accept connections", LogLevel::INFO);
+    // Register server with LDS now that it's running
 
             // register server
         // UA_ClientConfig cc;
@@ -1951,8 +2054,13 @@ UA_Server_triggerEvent(server, eventNodeId,
         //    return EXIT_FAILURE;
         // }
 
-    while(running)
+    log("Server is now running and listening for connections", LogLevel::INFO);
+    
+    while(running) {
         UA_Server_run_iterate(server, true);
+    }
+    
+    log("Server shutdown initiated", LogLevel::INFO);
     //    // Unregister from LDS before shutdown
     //    memset(&cc, 0, sizeof(UA_ClientConfig));
     //    UA_ClientConfig_setDefault(&cc);
@@ -1984,6 +2092,8 @@ UA_Server_triggerEvent(server, eventNodeId,
     //        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Unregistered from discovery server.");
 
 
+    log("Cleaning up server resources", LogLevel::DEBUG);
+    
     UA_VariableAttributes_clear(&attr);
     UA_VariableAttributes_clear(&attr2);
     //UA_VariableAttributes_clear(&attr3);
@@ -2015,17 +2125,21 @@ UA_Server_triggerEvent(server, eventNodeId,
             UA_ByteString_clear(&issuerList[i]);
         UA_free(issuerList);
     }
-
     // Clean up method callback contexts
     // Note: In a production environment, you might want to keep track of all allocated contexts
     // and clean them up individually. For this example, the server will handle most cleanup.
     // The MethodCallbackContext structures are stored as node contexts and will be cleaned up
     // when the server is deleted.
-
+    log("Deleting server instance", LogLevel::DEBUG);
     UA_Server_delete(server);
-
-
-    return retval == UA_STATUSCODE_GOOD ? EXIT_SUCCESS : EXIT_FAILURE;
+    
+    if(retval == UA_STATUSCODE_GOOD) {
+        log("Server shutdown completed successfully", LogLevel::INFO);
+        return EXIT_SUCCESS;
+    } else {
+        log("Server shutdown completed with errors", LogLevel::ERRORS);
+        return EXIT_FAILURE;
+    }
 }
 
 
