@@ -3,10 +3,12 @@
 #include <vector>
 #include <string>
 #include <optional>
+#include "SqliteQueueService.h"
 
 using namespace std;
 
 class MQTTHandler; // Forward declaration
+
 
 struct MappedInfospaceTag{
     int id;
@@ -16,6 +18,7 @@ struct MappedInfospaceTag{
     int samplingInterval;
     int deadband;
     int queuesize;
+    int orgId;
     // bool isSimulationProfile;
     // bool isLogging;
     // bool isVirtual;
@@ -35,7 +38,7 @@ struct TagInfo{
     string expression;
     optional<string> namespaceNodeID;
     optional<vector<MappedInfospaceTag>> mappedInfospaceTags;
-    optional<int> dataPointId;
+    int dataPointId;
     optional<string> name;
     optional<string> nodeId;
     optional<string> typeId;
@@ -74,6 +77,7 @@ struct ServerInfoO{
 struct MyMonitorContext {
     MappedInfospaceTag infoSpace;
     MQTTHandler* mqttHandler;
+    SqliteQueueService* sqliteService;
     // unordered_map<int, string> TopicMapping;
     // json payload;
     // Add more fields as needed

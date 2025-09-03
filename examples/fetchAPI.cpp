@@ -89,8 +89,8 @@ json getBearerToken() {
 
         return result;
     } catch (const std::exception &e) {
-        log("Error: " + string(e.what()),LogLevel::ERRORS);
-        return json{};
+        log("getBearerToken Error: " + string(e.what()),LogLevel::ERRORS);
+        throw; // Re-throw to allow retry logic to handle it
     }
 }
 
@@ -167,8 +167,8 @@ try{
     return result;
 
     } catch (const std::exception &e) {
-    log("Error: " + string(e.what()),LogLevel::ERRORS);
-        return json{};
+    log("getHierarchy Error: " + string(e.what()),LogLevel::ERRORS);
+        throw; // Re-throw to allow retry logic to handle it
     }
     
 }
@@ -234,6 +234,12 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                                 tagInfo.queuesize = tagItem["queueSize"].get<int>();
                                 tagInfo.rdWtOpt = tagItem["rdWtOpt"].get<string>();
 
+                                // Extract the OPC UA namespace field from the tag
+                                string opcUaNamespace = "";
+                                if(tagItem.contains("namespace") && tagItem["namespace"].is_string()) {
+                                    opcUaNamespace = tagItem["namespace"].get<string>();
+                                }
+
                                 if(tagItem.contains("mappedInfospaceTags") &&
                                    tagItem["mappedInfospaceTags"].is_array()) {
                                     vector<MappedInfospaceTag> mappedTags;
@@ -255,12 +261,18 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
                                         mappedInfo.deadband = mappedTag["deadband"].get<int>();
                                         mappedInfo.queuesize = mappedTag["queueSize"].get<int>();
 
-                                        // name to namespace
-                                        //  if(tagItem.contains("namespaceNodeID") &&
-                                        //  tagItem["namespaceNodeID"].is_string() &&
-                                        //  tagInfo.namespaceNodeID.has_value()) {
+                                        // Extract orgId if available in the JSON
+                                        if(mappedTag.contains("orgId")) {
+                                            mappedInfo.orgId = mappedTag["orgId"].get<int>();
+                                        } else {
+                                            mappedInfo.orgId = 1; // Default fallback
+                                        }
+
+                                        // CRITICAL FIX: Use the OPC UA namespace from the tag, not the MQTT namespace from mappedInfo
+                                        // opcUaNamespace contains the OPC UA node path like "Node2/ns=3;i=1002"
+                                        // mappedInfo.namespaces contains the MQTT topic like "TDSPL/NNNN/TEST/TEST"
                                         pair<string, string> NodePair = {
-                                            tagInfo.name.value(), serverInfo.endpointUrl};
+                                            opcUaNamespace, serverInfo.endpointUrl};
                                         Mapping[mappedInfo.tagId] = NodePair;
 
                                         // }
@@ -351,7 +363,7 @@ vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
 
     log("Mapping: ");
     for(const auto &mapping : Mapping) {
-        log(mapping.first + " " + mapping.second.first + " " + mapping.second.second);
+        log(std::to_string(mapping.first) + " " + mapping.second.first + " " + mapping.second.second);
     }
     cout << endl;
 

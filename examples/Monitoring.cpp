@@ -11,7 +11,9 @@
 #include "structs.h"
 #include <nlohmann/json.hpp>
 #include "MQTThandler.h"
+#include "SqliteQueueService.h"
 #include "Logger.h"
+#include <string> 
 
 using namespace std;
 using json = nlohmann::ordered_json;
@@ -21,139 +23,93 @@ using json = nlohmann::ordered_json;
 static void
 handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
                          UA_UInt32 monId, void *monContext, UA_DataValue *value) {
-
     auto* myContext = static_cast<MyMonitorContext*>(monContext);
-
-    log("myContext->infoSpace.Namespace: " + myContext->infoSpace.namespaces, LogLevel::DEBUG);
-
-    json data;
-    data["TagId"] = myContext->infoSpace.tagId;
-
-
-
-    // Convert UA_Variant to a native type for JSON
-    if (UA_Variant_isScalar(&value->value)) {
-        if (value->value.type == &UA_TYPES[UA_TYPES_INT32]) {
-            data["Value"] = *(UA_Int32*)value->value.data;
-        } else if (value->value.type == &UA_TYPES[UA_TYPES_DOUBLE]) {
-            data["Value"] = *(UA_Double*)value->value.data;
-        }
-        else if(value->value.type == &UA_TYPES[UA_TYPES_FLOAT])
-        {data["Value"] = *(UA_Float*)value->value.data;}
-        else if(value->value.type == &UA_TYPES[UA_TYPES_BOOLEAN])
-        {data["Value"] = *(UA_Boolean*)value->value.data;} 
-        else if(value->value.type == &UA_TYPES[UA_TYPES_STRING])
-        {
-            UA_String str = *(UA_String*)value->value.data;
-            data["Value"] = std::string((char*)str.data, str.length);
-        }
-        else {
-            data["Value"] = nullptr; // or a string "unsupported"
-        }
-    } else {
-        data["Value"] = nullptr;
+    if (!myContext) {
+        log("Monitoring context is null!", LogLevel::ERRORS);
+        return;
     }
 
+    MqttPayload p;
+    p.datapointId = myContext->infoSpace.tagId;
+    p.name        = myContext->infoSpace.name;
+    p.tagId       = myContext->infoSpace.tagId;
+    p.tagType     = "INFO_DCR";   // TODO: parameterize
+    p.source      = "4";          // TODO: parameterize
+    p.infoId      = 1001;         // TODO: parameterize
 
-
-
-
-    data["TagType"] = "INFO_DCR";
-    
-
-
-
-    // Extract and format timestamp in local time with high precision
-    std::string timestamp;
-    UA_DateTime utc_dt_val;
-
-    if (value->hasSourceTimestamp) {
-        utc_dt_val = value->sourceTimestamp;
-    } else if (value->hasServerTimestamp) {
-        utc_dt_val = value->serverTimestamp;
+    // Convert UA_Variant to string
+    UA_Variant* variant = &value->value;
+    if (UA_Variant_isScalar(variant) && variant->data) {
+        if (variant->type == &UA_TYPES[UA_TYPES_INT32]) {
+            p.value = std::to_string(*static_cast<UA_Int32*>(variant->data));
+        } else if (variant->type == &UA_TYPES[UA_TYPES_DOUBLE]) {
+            p.value = std::to_string(*static_cast<UA_Double*>(variant->data));
+        } else if (variant->type == &UA_TYPES[UA_TYPES_FLOAT]) {
+            p.value = std::to_string(*static_cast<UA_Float*>(variant->data));
+        } else if (variant->type == &UA_TYPES[UA_TYPES_BOOLEAN]) {
+            p.value = (*static_cast<UA_Boolean*>(variant->data)) ? "true" : "false";
+        } else if (variant->type == &UA_TYPES[UA_TYPES_STRING]) {
+            UA_String str = *static_cast<UA_String*>(variant->data);
+            if (str.length > 0 && str.data) {
+                p.value.assign(reinterpret_cast<char*>(str.data), str.length);
+            } else {
+                p.value = "";
+            }
+        } else {
+            p.value = "unsupported";
+        }
     } else {
-        utc_dt_val = UA_DateTime_now();
+        p.value = "null";
     }
 
-    UA_Int64 offset_100ns = UA_DateTime_localTimeUtcOffset();
-    UA_DateTime local_dt_val = utc_dt_val + offset_100ns;
-    UA_DateTimeStruct dt = UA_DateTime_toStruct(local_dt_val);
-
-    long offset_seconds = offset_100ns / UA_DATETIME_SEC;
-    char offset_sign = (offset_seconds >= 0) ? '+' : '-';
-    long offset_hours = labs(offset_seconds / 3600);
-    long offset_minutes = labs((offset_seconds % 3600) / 60);
+    // Timestamp
+    UA_DateTime ts = value->hasSourceTimestamp ? value->sourceTimestamp :
+                     (value->hasServerTimestamp ? value->serverTimestamp : UA_DateTime_now());
+    UA_DateTimeStruct dts = UA_DateTime_toStruct(ts);
 
     char buffer[64];
-    snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02d.%03d%03d%01d%c%02ld:%02ld",
-             dt.year, dt.month, dt.day,
-             dt.hour, dt.min, dt.sec,
-             dt.milliSec, dt.microSec, dt.nanoSec / 100,
-             offset_sign, offset_hours, offset_minutes);
-    timestamp = std::string(buffer);
+    snprintf(buffer, sizeof(buffer), "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+             dts.year, dts.month, dts.day, dts.hour, dts.min, dts.sec, dts.milliSec);
+    p.timeStamp = buffer;
 
+    // Quality
+    p.quality = std::to_string(value->hasStatus ? value->status : UA_STATUSCODE_GOOD);
 
+    // Publish or queue
+    if (myContext->mqttHandler && myContext->mqttHandler->isConnected()) {
+        log("MQTT online. Publishing message for name: " + p.name, LogLevel::DEBUG);
+        log("The Monitored Item " + std::to_string(monId) + " " + (p.value) +
+                myContext->infoSpace.namespaces +
+                " has changed!",
+            LogLevel::DEBUG);
 
+        json data = {
+            {"TagId",       p.tagId},
+            {"Value",       p.value},
+            {"TagType",     p.tagType},
+            {"TimeStamp",   p.timeStamp},
+            {"Source",      std::stoi(p.source)},
+            {"DatapointId", p.datapointId},
+            {"InfoId",      p.infoId},
+            {"Quality",     p.quality},
+            {"UpdateType",  1}
+        };
 
+        json payload;
+        payload["Data"] = json::array({data});
 
-    
-    data["TimeStamp"] = timestamp;
-    data["Source"] = 4;
-    data["DatapointId"] = myContext->infoSpace.tagId;
-    data["InfoId"] = 1001;
-    
-    // Add quality information if available
-    if (value->hasStatus) {
-        data["Quality"] = value->status;
+        myContext->mqttHandler->publish(myContext->infoSpace.namespaces, payload.dump());
+
+    } else if (myContext->sqliteService) {
+        log("MQTT offline. Queuing message for tagId: " + std::to_string(p.tagId), LogLevel::INFO);
+        long orgId = 1; // TODO: replace with real myContext->infoSpace.orgId
+        myContext->sqliteService->EnqueueMessage(myContext->infoSpace.namespaces, p, orgId);
     } else {
-        data["Quality"] = UA_STATUSCODE_GOOD; // Default to good quality
-    }
-    
-    data["UpdateType"] = 1;
-
-    json payload;
-    payload["Data"] = json::array({data});
-
-    // std::cout << payload.dump(4) << std::endl;
-    
-
-    log(" The Monitored Item " + to_string(monId) + " has changed!");
-
-
-    if (!myContext->mqttHandler) {
-        log("MQTT handler is null!", LogLevel::ERRORS);
-    } else {
-        bool published = myContext->mqttHandler->publish(myContext->infoSpace.namespaces, payload.dump());
-        if (!published) {
-            log("MQTT publish failed!", LogLevel::ERRORS);
-        } else {
-            log("MQTT publish succeeded!", LogLevel::DEBUG);
-        }
-    }
-
-    UA_Variant *variant = &value->value;
-
-    if(variant->type == &UA_TYPES[UA_TYPES_INT32]) {
-        log("New value (int32): " + *(UA_Int32 *)variant->data);
-        cout << endl;
-    } else if(variant->type == &UA_TYPES[UA_TYPES_DOUBLE]) {
-        log("New value (double): " + to_string(*(UA_Double *)variant->data));
-        cout << endl;
-    } else if(variant->type == &UA_TYPES[UA_TYPES_FLOAT]) {
-        log("New value (float): " + to_string(*(UA_Float *)variant->data));
-        cout << endl;
-    } else if(variant->type == &UA_TYPES[UA_TYPES_BOOLEAN]) {
-        log("New value (bool): " + *(UA_Boolean *)variant->data ? "true" : "false");
-        cout << endl;
-    } else if(variant->type == &UA_TYPES[UA_TYPES_STRING]) {
-        UA_String str = *(UA_String *)variant->data;
-        log("New value (string): " + string((char *)str.data, str.length));
-        cout << endl;
-    } else {
-        log("Unsupported data type: " + string(variant->type->typeName));
-        cout << endl;
+        log("MQTT offline, SqliteService unavailable. Data lost for tagId: " +
+            std::to_string(p.tagId), LogLevel::ERRORS);
     }
 }
+
 
 #endif
 

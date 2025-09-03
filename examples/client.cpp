@@ -23,6 +23,7 @@
 #include <vector>
 #include <windows.h>
 
+#include "SqliteQueueService.h"
 #include "Logger.h"
 #include "MQTThandler.h"
 #include "Monitoring.cpp"
@@ -30,11 +31,15 @@
 #include "structs.h"
 #include <boost/asio.hpp>
 #include <unordered_map>
+#include <nlohmann/json.hpp>
 
 using namespace std;
 
 // Global MQTT handler instance
 MQTTHandler *g_mqttHandler = nullptr;
+
+//Global SqliteQueueService instance
+SqliteQueueService *g_sqliteService = nullptr;
 
 // Global Debug Flag comes from Logger.h (inline variable)
 
@@ -190,6 +195,10 @@ myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg
 // Custom logger plugin
 static UA_Logger myLogger = {myLog, nullptr, nullptr};
 
+
+
+
+
 // Extracted main logic so it can be reused by console and service
 static int
 runClient(bool isService, int argc, char *argv[]) {
@@ -250,17 +259,256 @@ runClient(bool isService, int argc, char *argv[]) {
             std::cout << "[DEBUG] Console attached" << std::endl;
         }
     }
-    // Initialize global MQTT handler
-    boost::asio::io_context ioc;
-    g_mqttHandler = new MQTTHandler(ioc);
 
-    // Connect to MQTT broker
+
+    // Retry logic for API calls with constant 10-second intervals
+    string BearerToken = "";
+    vector<ServerInfoO> serverList;
+    
+    log("Attempting to fetch configuration from API...", LogLevel::INFO);
+    
+    // Retry getBearerToken with constant 10-second intervals (infinite retries)
+    const int retryDelay = 10; // seconds
+    bool tokenSuccess = false;
+    int attempt = 1;
+    
+    while (!tokenSuccess) {
+        try {
+            log("Attempt " + std::to_string(attempt) + " - Fetching bearer token...", LogLevel::INFO);
+            
+            auto futureToken = std::async(std::launch::async, getBearerToken);
+            json token = futureToken.get();
+            
+            // Extract access_token
+            if(token.contains("access_token")) {
+                BearerToken = token["access_token"].get<std::string>();
+                tokenSuccess = true;
+                log("Bearer token fetched successfully!", LogLevel::INFO);
+            } else {
+                log("Invalid token response - retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::ERRORS);
+            }
+        } catch (const std::exception& e) {
+            log("Token fetch failed: " + std::string(e.what()), LogLevel::ERRORS);
+        }
+        
+        if (!tokenSuccess) {
+            log("Retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::INFO);
+            std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
+            attempt++;
+        }
+    }
+    
+    // Retry ParseServerHierarchy with constant 10-second intervals (infinite retries)
+    bool hierarchySuccess = false;
+    attempt = 1;
+    
+    while (!hierarchySuccess) {
+        try {
+            log("Attempt " + std::to_string(attempt) + " - Fetching server hierarchy...", LogLevel::INFO);
+            
+            serverList = ParseServerHierarchy(BearerToken);
+            
+            if (!serverList.empty()) {
+                hierarchySuccess = true;
+                log("Server hierarchy fetched successfully! Found " + std::to_string(serverList.size()) + " servers.", LogLevel::INFO);
+            } else {
+                log("Empty server hierarchy response - retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::ERRORS);
+            }
+        } catch (const std::exception& e) {
+            log("Hierarchy fetch failed: " + std::string(e.what()), LogLevel::ERRORS);
+        }
+        
+        if (!hierarchySuccess) {
+            log("Retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::INFO);
+            std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
+            attempt++;
+        }
+    }
+
+    // Build datapointId -> orgId map from your server/device config (declare outside try block)
+    std::map<int, long> dpToOrg;
+    for (const auto& server : serverList) {
+        for (const auto& group : server.groups) {
+            for (const auto& tag : group.tags) {
+                if (tag.mappedInfospaceTags) {
+                    for (const auto& m : *tag.mappedInfospaceTags) {
+                        dpToOrg[tag.dataPointId] = static_cast<long>(m.orgId);
+                    }
+                }
+            }
+        }
+    }
+    
+    // The Mapping variable is already populated by ParseServerHierarchy in fetchAPI.cpp
+    // Let's log the populated mapping for debugging
+    log("Mapping populated with " + std::to_string(Mapping.size()) + " entries:");
+    for (const auto& entry : Mapping) {
+        log("TagId " + std::to_string(entry.first) + " -> " + entry.second.first + " @ " + entry.second.second);
+    }
+
+    // Initialize SqliteQueueService
+    try {
+        OfflineQueueOptions options;
+        options.batchSize = 100; // Example value
+        options.uploadIntervalSeconds = 15; // Example value
+        // The DB file will be created in the current working directory
+        g_sqliteService = new SqliteQueueService("OfflineData.db", options);
+        g_sqliteService->StartQueueWorker(); // Start the DB writer thread immediately
+        log("SqliteQueueService initialized.", LogLevel::INFO);
+
+        // After: g_sqliteService = new SqliteQueueService("OfflineData.db", options);
+        g_sqliteService->SetApiUrl("http://your-api-host:port/path");   // required
+        g_sqliteService->SetApiAuth("api_user", "api_password");        // optional
+
+        nlohmann::json apiMetadata;
+        apiMetadata["OrgId"] = 123;
+        apiMetadata["RoleId"] = "role_xyz";
+        apiMetadata["UserId"] = 456;
+        apiMetadata["ModuleId"] = 789;
+        apiMetadata["UserType"] = "system";
+        apiMetadata["IpAddress"] = "127.0.0.1";
+        apiMetadata["OriginName"] = "OPCUAClient";
+        apiMetadata["EntityId"] = 42;
+        g_sqliteService->SetApiMetadata(apiMetadata);
+
+        g_sqliteService->SetConfigurations(dpToOrg);
+
+    } catch (const std::exception& e) {
+        log("FATAL: Failed to initialize SqliteQueueService: " + std::string(e.what()), LogLevel::ERRORS);
+        return EXIT_FAILURE;
+    }
+
+    // Initialize global MQTT handler OUTSIDE the try block to ensure proper scope
+    log("Creating MQTT handler...", LogLevel::INFO);
+    boost::asio::io_context ioc;
+    try {
+        g_mqttHandler = new MQTTHandler(ioc);
+        log("MQTT handler initialized successfully", LogLevel::INFO);
+        
+        // Connect MQTTHandler with SqliteQueueService for proper state management
+        if (g_sqliteService) {
+            g_mqttHandler->setSqliteService(g_sqliteService);
+            log("Connected MQTTHandler with SqliteQueueService", LogLevel::INFO);
+        }
+        
+        // Give the MQTT thread a moment to start
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // Define callbacks for MQTT connection status
+        auto onMqttConnect = []() {
+            log("CLIENT CALLBACK: MQTT (re)connected. Processing any offline data...", LogLevel::INFO);
+            if (g_sqliteService) {
+                // Requirement 1 & 4: Publish latest values to MQTT
+                log("CLIENT CALLBACK: About to call PublishLatestValuesToMqtt...", LogLevel::INFO);
+                g_sqliteService->PublishLatestValuesToMqtt(
+                    [](const std::string& topic, const std::string& payload) {
+                        log("CLIENT CALLBACK LAMBDA: Publishing to topic: " + topic + " with payload size: " + std::to_string(payload.size()), LogLevel::INFO);
+                        if (g_mqttHandler) {
+                            log("CLIENT CALLBACK LAMBDA: Calling g_mqttHandler->publish", LogLevel::INFO);
+                            bool result = g_mqttHandler->publish(topic, payload);
+                            log("CLIENT CALLBACK LAMBDA: Publish result: " + std::string(result ? "SUCCESS" : "FAILED"), LogLevel::INFO);
+                        } else {
+                            log("CLIENT CALLBACK LAMBDA: g_mqttHandler is null!", LogLevel::ERRORS);
+                        }
+                    }
+                );
+                log("CLIENT CALLBACK: PublishLatestValuesToMqtt completed", LogLevel::INFO);
+                // Requirement 1 & 4: Start uploading the full backlog to the API
+                log("CLIENT CALLBACK: Starting API upload timer...", LogLevel::INFO);
+                g_sqliteService->StartApiUploadTimer();
+                log("CLIENT CALLBACK: API upload timer started!", LogLevel::INFO);
+            } else {
+                log("CLIENT CALLBACK: g_sqliteService is null!", LogLevel::ERRORS);
+            }
+        };
+    
+        auto onMqttDisconnect = []() {
+            log("CLIENT CALLBACK: MQTT disconnected. Switching to offline mode. Data will be queued.", LogLevel::ERRORS);
+            if (g_sqliteService) {
+                // Requirement 3: Stop trying to upload to API when MQTT is down
+                log("CLIENT CALLBACK: Stopping API upload timer...", LogLevel::INFO);
+                g_sqliteService->StopApiUploadTimer();
+                log("CLIENT CALLBACK: API upload timer stopped!", LogLevel::INFO);
+            }
+        };
+        
+        // Handle failed messages that couldn't be published
+        auto onFailedMessages = [&dpToOrg](const std::vector<PendingMessage>& failedMessages) {
+            if (!g_sqliteService) {
+                log("Cannot save failed messages: SqliteService not available", LogLevel::ERRORS);
+                return;
+            }
+            
+            log("Processing " + std::to_string(failedMessages.size()) + " failed MQTT messages for database storage", LogLevel::INFO);
+            int successCount = 0;
+            int errorCount = 0;
+            
+            for (const auto& msg : failedMessages) {
+                try {
+                    // Parse the JSON payload to extract the MqttPayload data
+                    nlohmann::json payload = nlohmann::json::parse(msg.payload);
+                    if (payload.contains("Data") && payload["Data"].is_array() && !payload["Data"].empty()) {
+                        auto data = payload["Data"][0];
+                        
+                        MqttPayload p;
+                        p.datapointId = data.value("DatapointId", 0);
+                        p.name = ""; // We don't have the name in the JSON
+                        p.tagId = data.value("TagId", 0);
+                        p.tagType = data.value("TagType", "INFO_DCR");
+                        p.source = std::to_string(data.value("Source", 4));
+                        p.infoId = data.value("InfoId", 1001);
+                        p.value = data.value("Value", "");
+                        p.timeStamp = data.value("TimeStamp", "");
+                        p.quality = data.value("Quality", "0");
+                        
+                        // Improved orgId lookup with proper fallback
+                        long orgId = 1; // default fallback
+                        if (p.datapointId > 0) {
+                            auto it = dpToOrg.find(p.datapointId);
+                            if (it != dpToOrg.end()) {
+                                orgId = it->second;
+                                log("Found orgId " + std::to_string(orgId) + " for datapointId " + std::to_string(p.datapointId), LogLevel::DEBUG);
+                            } else {
+                                log("No orgId mapping found for datapointId " + std::to_string(p.datapointId) + ", using fallback", LogLevel::INFO);
+                            }
+                        }
+                        
+                        g_sqliteService->EnqueueMessage(msg.topic, p, orgId);
+                        successCount++;
+                        log("Queued failed message to database: " + msg.topic + " (orgId: " + std::to_string(orgId) + ")", LogLevel::DEBUG);
+                    } else {
+                        log("Failed message has invalid JSON structure: " + msg.payload, LogLevel::ERRORS);
+                        errorCount++;
+                    }
+                } catch (const std::exception& e) {
+                    log("Failed to parse failed message payload: " + std::string(e.what()) + " | Payload: " + msg.payload, LogLevel::ERRORS);
+                    errorCount++;
+                }
+            }
+            
+            log("Failed message processing complete: " + std::to_string(successCount) + " saved, " + std::to_string(errorCount) + " errors", LogLevel::INFO);
+        };
+
+        g_mqttHandler->setOnConnectCallback(onMqttConnect);
+        g_mqttHandler->setOnDisconnectCallback(onMqttDisconnect);
+        g_mqttHandler->setOnFailedMessageCallback(onFailedMessages);
+
+    } catch (const std::exception& e) {
+        log("FATAL: Failed to initialize MQTT handler: " + std::string(e.what()), LogLevel::ERRORS);
+        return EXIT_FAILURE;
+    }
+
+    // Connect to MQTT broker (non-blocking)
+    log("Attempting to connect to MQTT broker...", LogLevel::INFO);
     if(!g_mqttHandler->connect("216.48.184.131", "15579", "portal", "dt0Unw7QRh")) {
-        log("Failed to connect to MQTT broker", LogLevel::ERRORS);
+        log("Failed to initiate MQTT broker connection", LogLevel::ERRORS);
         return EXIT_FAILURE;
     } else {
-        log("Connected to MQTT broker");
+        log("MQTT connection initiated (async)", LogLevel::INFO);
     }
+    
+    // Give MQTT a moment to start connecting
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
 #ifdef UA_ENABLE_SUBSCRIPTIONS
     signal(SIGINT, stopHandler);
@@ -270,15 +518,7 @@ runClient(bool isService, int argc, char *argv[]) {
     std::vector<std::unique_ptr<ClientContext>> clientContexts;
     std::unordered_map<std::string, ClientContext *> clientPool;
 
-    auto futureToken = std::async(std::launch::async, getBearerToken);
-    string BearerToken = "";
-    json token = futureToken.get();
-    // Extract access_token
-    if(token.contains("access_token")) {
-        BearerToken = token["access_token"].get<std::string>();
-    }
 
-    vector<ServerInfoO> serverList = ParseServerHierarchy(BearerToken);
 
     log("endpoints: ");
     for(const auto &server : serverList) {
@@ -438,7 +678,7 @@ runClient(bool isService, int argc, char *argv[]) {
                     for(const auto &infoSpace : *tag.mappedInfospaceTags) {
                         std::lock_guard<std::mutex> lock(ctx->taskMutex);
                         ctx->taskQueue.push([ctx, infoSpace, groupName]() {
-                            MyMonitorContext *myContext = new MyMonitorContext{infoSpace, g_mqttHandler};
+                            MyMonitorContext *myContext = new MyMonitorContext{infoSpace, g_mqttHandler , g_sqliteService};
                             MonitorItem(ctx->client.get(),
                                         ctx->subscriptions[groupName],
                                         Mapping[infoSpace.tagId].first.c_str(),
@@ -553,7 +793,13 @@ runClient(bool isService, int argc, char *argv[]) {
     clientContexts.clear();
 
     // Clean up MQTT handler at the end
-    delete g_mqttHandler;
+    if(g_sqliteService) {
+        g_sqliteService->DisposeDB();
+        delete g_sqliteService;
+    }
+    if (g_mqttHandler) {
+       delete g_mqttHandler;
+    }
 
     if(hMutex) {
         ReleaseMutex(hMutex);

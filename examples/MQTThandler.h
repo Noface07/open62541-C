@@ -1,61 +1,114 @@
 #pragma once
 
-#include <string>
-#include <functional>
-#include <boost/asio/io_context.hpp>
-#include <thread>
-#include <memory>
 #include <atomic>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include <unordered_map>
+#include <chrono>
+
+// Required Boost & MQTT headers
 #include <async_mqtt/all.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
 
-// Move this outside the class!
-using client_t = async_mqtt::client<async_mqtt::protocol_version::v5, async_mqtt::protocol::mqtt>;
+enum UpdateType { TELEMETERY = 1, COMMAND = 2, BULKDATA = 3 };
+// Forward declare the client type to keep this header clean
+using client_t =
+    async_mqtt::client<async_mqtt::protocol_version::v5, async_mqtt::protocol::mqtt>;
 
-// Shared enums (if needed by other files)
-enum DataSourceType {
-    INFO_STATE, //State
-    INFO_INST, //Instentaionus
-    INFO_INC, //Counter
-    INFO_DCR,
-    DT_TYP_TXT, //String
-};
-enum DataSource {
-    OpcDADataSource = 1, //OPC DA
-    SIMULATOR = 2,
-    EXPRESSION = 3,
-    OpcUADataSource = 4
-};
-enum DataQuality {
-    GOOD = 1,
-    BAD = 2,
-    UNKNOWN = 3,
-};
-enum UpdateType {
-    TELEMETERY = 1,
-    COMMAND = 2,
-    BULKDATA= 3,
+// Structure to track pending messages
+struct PendingMessage {
+    std::string topic;
+    std::string payload;
+    std::chrono::steady_clock::time_point timestamp;
+    
+    PendingMessage(const std::string& t, const std::string& p) 
+        : topic(t), payload(p), timestamp(std::chrono::steady_clock::now()) {}
 };
 
 class MQTTHandler {
-private:
-    boost::asio::io_context& m_ioc;
+  public:
+    MQTTHandler(boost::asio::io_context &ioc);
+    ~MQTTHandler();
+    
+    // Set reference to SqliteQueueService for notifications
+    void setSqliteService(class SqliteQueueService* service);
+
+    // --- Public API ---
+    bool
+    connect(const std::string &broker, const std::string &port,
+            const std::string &username, const std::string &password);
+    void
+    disconnect();
+    bool
+    publish(const std::string &topic, const std::string &payload);
+    bool
+    subscribe(const std::string &topic);
+    bool
+    isConnected() const;
+
+    // --- Callbacks ---
+    void
+    setCallback(std::function<void(const std::string &, const std::string &)> callback);
+    void
+    setOnConnectCallback(std::function<void()> cb);
+    void
+    setOnDisconnectCallback(std::function<void()> cb);
+    void
+    setOnFailedMessageCallback(std::function<void(const std::vector<PendingMessage>&)> cb);
+
+  private:
+    // --- Internal Methods ---
+    void
+    start_receive();
+    void
+    try_reconnect();
+    void
+    notifyConnected();
+    void
+    notifyDisconnected();
+    void
+    clearPendingMessages();
+    void
+    processPendingMessages();
+
+    // --- Member Variables ---
+    boost::asio::io_context &m_ioc;
     std::unique_ptr<client_t> m_client;
     std::thread m_mqtt_thread;
     std::atomic<bool> m_running;
-    std::mutex m_mutex;
-    std::function<void(const std::string&, const std::string&)> m_callback;
+
+    // State Management
+    mutable std::mutex m_mutex;  // Protects m_connected, callbacks, and connection params
     bool m_connected;
+    std::atomic<bool> m_is_connecting{false};  // Prevents concurrent connect attempts
 
-public:
-    MQTTHandler(boost::asio::io_context &ioc);
-    ~MQTTHandler();
+    using packet_id_t = async_mqtt::packet_id_type;  // adjust if the library exposes a typedef
+    std::unordered_map<packet_id_t, PendingMessage> m_pending_messages;
 
-    bool connect(const std::string& broker, const std::string& port,
-                 const std::string& username, const std::string& password);
-    bool isConnected();
-    void disconnect();
-    bool publish(const std::string& topic, const std::string& payload);
-    bool subscribe(const std::string& topic);
-    void setCallback(std::function<void(const std::string&, const std::string&)> callback);
+    uint16_t m_next_message_id{1};
+    std::chrono::seconds m_message_timeout{10}; // Messages older than this are considered failed
+
+    // Callbacks
+    std::function<void(const std::string &, const std::string &)> m_message_callback;
+    std::function<void()> m_connect_callback;
+    std::function<void()> m_disconnect_callback;
+    std::function<void(const std::vector<PendingMessage>&)> m_failed_message_callback;
+
+    // Connection Parameters (for reconnect)
+    std::string m_broker;
+    std::string m_port;
+    std::string m_username;
+    std::string m_password;
+
+    // Asio Timer for Reconnection (replaces the manual thread)
+    boost::asio::steady_timer m_reconnect_timer;
+    std::chrono::seconds m_reconnect_interval{5};
+    
+    // Forward declaration for SqliteQueueService
+    class SqliteQueueService* sqliteService_;
 };
