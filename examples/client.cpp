@@ -41,7 +41,7 @@ MQTTHandler *g_mqttHandler = nullptr;
 //Global SqliteQueueService instance
 SqliteQueueService *g_sqliteService = nullptr;
 
-// Global Debug Flag comes from Logger.h (inline variable)
+static std::once_flag security_policies_loaded;
 
 unordered_map<string, int> groupIdMap;
 
@@ -106,7 +106,7 @@ struct ClientContext {
                             if(onConnected) onConnected();
                             log("Connected to " + endpoint);
                         } else {
-                            std::this_thread::sleep_for(std::chrono::seconds(5));
+                            std::this_thread::sleep_for(std::chrono::seconds(10));
                             continue;
                         }
                     } else {
@@ -129,6 +129,10 @@ struct ClientContext {
                     log(name + ": UA_Client_run_iterate failed with " +
                             UA_StatusCode_name(code), LogLevel::ERRORS);
                     UA_Client_disconnect(client.get());
+
+                    client.reset(); 
+
+
                     isConnected = false;
                     // optional: clear subscriptions to avoid duplicates
                     subscriptions.clear();
@@ -560,82 +564,84 @@ runClient(bool isService, int argc, char *argv[]) {
     }
     cout << endl;
 
-    // g_mqttHandler->mqtt_subscribe_and_update("TDSPL/Test31-01/tag20-1");
+    // *** FIX START ***
+    // Add this block BEFORE the main "for" loop
+    std::call_once(security_policies_loaded, []() {
+        log("Performing one-time global security policy initialization...", LogLevel::INFO);
+        // Create a temporary client just to trigger the OpenSSL policy loading
+        UA_Client *tempClient = UA_Client_new();
+        UA_ClientConfig_setDefault(UA_Client_getConfig(tempClient));
+        // Deleting the client is enough to ensure policies are loaded and ready
+        UA_Client_delete(tempClient);
+        log("Global security policies initialized.", LogLevel::INFO);
+    });
+    // *** FIX END ***
 
-    // std::vector<ServerInfo> servers = { {"Anexee", "opc.tcp://localhost:53531"},
-    //                                     {"Prosys", "opc.tcp://localhost:53530"} };
+    
 
     for(const auto &server : serverList) {
+        auto server_copy = server;
         auto context = std::make_unique<ClientContext>();
         context->name = server.name;
         context->endpoint = server.endpointUrl;
-        context->client.reset(UA_Client_new());
+        
+        
+    
+        // The rest of your loop (connectOnce, onConnected lambdas) remains the same as the previous fix
+        context->connectOnce = [ctx=context.get(), server = server_copy]() -> UA_StatusCode {
 
-        // ADD LOGIC FOR CERTIFICATES
-        /* TODO */
-        UA_ByteString client_cert = loadFile("client/own/certs/client_cert.der");
-        UA_ByteString client_key = loadFile("client/own/certs/client_key.der");
-        UA_ByteString server_cert = loadFile("server/own/certs/server_cert.der");
-        UA_ByteString ca_cert = loadFile("ca/certs/ca.crt");
-        UA_ByteString revocation_cert = loadFile("server/trusted/crl/crl.crl");
-
-        // Create trust list array
-        UA_STACKARRAY(UA_ByteString, trustList, 1);
-        trustList[0] = ca_cert;
-
-        UA_STACKARRAY(UA_ByteString, revocationList, 1);
-        revocationList[0] = revocation_cert;
-
-        // FOR SECURITY POLICY and MESSAGE SECURITY MODE
-
-        if(server.msgSecurityMode != "NONE") {
-
-            UA_ClientConfig *config = UA_Client_getConfig(context->client.get());
-            config->logging = &myLogger;
-            UA_ClientConfig_setDefaultEncryption(
-                config, client_cert, client_key,
-                trustList,       // trustList array
-                1,               // trustListSize (number of certificates in trust list)
-                revocationList,  // RevocationList
-                1);              // RevocationListSize
-
-            UA_String_clear(&config->applicationUri);
-            UA_String_clear(&config->clientDescription.applicationUri);
-            UA_LocalizedText_clear(&config->clientDescription.applicationName);
-            UA_String_clear(&config->clientDescription.productUri);
-
-            config->applicationUri = UA_STRING_ALLOC("urn:Anexee.server.application");
-            config->clientDescription.applicationUri =
-                UA_STRING_ALLOC("urn:Anexee.server.application");
-            config->clientDescription.applicationName =
-                UA_LOCALIZEDTEXT_ALLOC("en-US", "Anexee");
-            config->clientDescription.productUri = UA_STRING_ALLOC("urn:Anexee");
-
-            if(server.msgSecurityMode == "NONE") {
-                config->securityMode = UA_MESSAGESECURITYMODE_NONE;
-            } else if(server.msgSecurityMode == "OPC_UA_SM_SG") {
+            // Create a new client and get its fresh config
+        ctx->client.reset(UA_Client_new());
+        UA_ClientConfig *config = UA_Client_getConfig(ctx->client.get());
+        UA_ClientConfig_setDefault(config); // Start with a default config for EVERY client
+        config->logging = &myLogger; // Apply your custom logger
+    
+        // --- Start of Corrected Security Logic ---
+    
+        if(server.msgSecurityMode != "NONE" && !server.msgSecurityMode.empty()) {
+            // This server requires security. Load certificates and apply them.
+            UA_ByteString client_cert = loadFile("client/own/certs/client_cert.der");
+            UA_ByteString client_key = loadFile("client/own/certs/client_key.der");
+            UA_ByteString ca_cert = loadFile("ca/certs/ca.crt");
+            UA_ByteString revocation_cert = loadFile("server/trusted/crl/crl.crl");
+    
+            if (client_cert.length > 0 && client_key.length > 0 && ca_cert.length > 0) {
+                UA_STACKARRAY(UA_ByteString, trustList, 1);
+                trustList[0] = ca_cert;
+    
+                UA_STACKARRAY(UA_ByteString, revocationList, 1);
+                revocationList[0] = (revocation_cert.length > 0) ? revocation_cert : UA_BYTESTRING_NULL;
+    
+                UA_ClientConfig_setDefaultEncryption(
+                    config, client_cert, client_key,
+                    trustList, 1,
+                    revocationList, (revocation_cert.length > 0) ? 1 : 0);
+            } else {
+                 log("Warning: Could not load certificate files for secure server " + server.name, LogLevel::ERRORS);
+            }
+    
+            // Clean up byte strings after use
+            UA_ByteString_clear(&client_cert);
+            UA_ByteString_clear(&client_key);
+            UA_ByteString_clear(&ca_cert);
+            UA_ByteString_clear(&revocation_cert);
+    
+            // Set security mode and policy based on this server's config
+            if(server.msgSecurityMode == "OPC_UA_SM_SG") {
                 config->securityMode = UA_MESSAGESECURITYMODE_SIGN;
             } else if(server.msgSecurityMode == "OPC_UA_SM_SG_ENC") {
                 config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
-            } else {
-                config->securityMode = UA_MESSAGESECURITYMODE_INVALID;
             }
-            // std::string base = "http://opcfoundation.org/UA/SecurityPolicy#";
-            // std::string full = base + server.securityPolicy;
-            // config->securityPolicyUri = UA_STRING_STATIC(full.c_str());
-
-            // config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
-            config->securityPolicyUri = UA_STRING_ALLOC(
-                "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
-        } else {
-            UA_ClientConfig *config = UA_Client_getConfig(context->client.get());
-            config->logging = &myLogger;
-            UA_ClientConfig_setDefault(config);
-        }
-
-        // after you configured UA_ClientConfig based on server settings
-        context->connectOnce = [ctx=context.get(), server]() -> UA_StatusCode {
-            if(server.authType == "anonymous") {
+            
+            // This part needs to be dynamic based on your securityPolicy from JSON
+            // For now, we'll keep your hardcoded value as an example
+            config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
+    
+        } 
+        // If msgSecurityMode is "NONE", we do nothing extra. The UA_ClientConfig_setDefault already handled it.
+    
+        // --- End of Corrected Security Logic ---
+            if(server.authType == "anonymous" || server.authType == "anonymus") {
                 return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
             } else if(server.authType == "user") {
                 return UA_Client_connectUsername(ctx->client.get(),
@@ -645,7 +651,7 @@ runClient(bool isService, int argc, char *argv[]) {
             return UA_STATUSCODE_BADIDENTITYTOKENINVALID;
         };
 
-        context->onConnected = [ctx=context.get(), server]() {
+        context->onConnected = [ctx=context.get(), server = server_copy]() {
             // base subscription (events)
             UA_CreateSubscriptionRequest req = UA_CreateSubscriptionRequest_default();
             UA_CreateSubscriptionResponse sub =
