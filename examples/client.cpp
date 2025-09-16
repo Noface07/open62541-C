@@ -208,9 +208,12 @@ static UA_Logger myLogger = {myLog, nullptr, nullptr};
 static int
 runClient(bool isService, int argc, char *argv[]) {
 
+    SetWorkingDirectoryToExe(); // ensure CWD is the exe folder
+
     std::ifstream file("appsettings.json");
     if (!file.is_open()) {
-        std::cerr << "Could not open appsettings.json" << std::endl;
+        char cwd[MAX_PATH]; GetCurrentDirectoryA(MAX_PATH, cwd);
+        log(std::string("Could not open appsettings.json. CWD=") + cwd, LogLevel::ERRORS);
         return 1;
     }
 
@@ -224,7 +227,7 @@ runClient(bool isService, int argc, char *argv[]) {
         // Extract AppSettings
         std::string applicationEndURL = config["AppSettings"]["ApplicationEndURL"].get<std::string>();
         std::string applicationEndURLHost = config["AppSettings"]["ApplicationEndURLHost"].get<std::string>();
-        std::string applicationEndURLPort = config["AppSettings"]["ApplicationEndURLPort"].get<std::string>();
+        int applicationEndURLPort = config["AppSettings"]["ApplicationEndURLPort"].get<int>();
 
         // Extract MqttConfig
         std::string brokerAddress = config["MqttConfig"]["MqttSettings"][0]["BrokerAddress"].get<std::string>();
@@ -316,7 +319,7 @@ runClient(bool isService, int argc, char *argv[]) {
         try {
             log("Attempt " + std::to_string(attempt) + " - Fetching bearer token...", LogLevel::INFO);
             
-            auto futureToken = std::async(std::launch::async, getBearerToken, applicationEndURLHost, applicationEndURLPort, authUsername, authPassword);
+            auto futureToken = std::async(std::launch::async, getBearerToken, applicationEndURLHost, std::to_string(applicationEndURLPort), authUsername, authPassword);
             json token = futureToken.get();
             
             // Extract access_token
@@ -346,7 +349,7 @@ runClient(bool isService, int argc, char *argv[]) {
         try {
             log("Attempt " + std::to_string(attempt) + " - Fetching server hierarchy...", LogLevel::INFO);
             
-            serverList = ParseServerHierarchy(applicationEndURLHost, applicationEndURLPort, BearerToken);
+            serverList = ParseServerHierarchy(applicationEndURLHost, std::to_string(applicationEndURLPort), BearerToken);
             
             if (!serverList.empty()) {
                 hierarchySuccess = true;
@@ -740,45 +743,51 @@ runClient(bool isService, int argc, char *argv[]) {
 
     log("Client pool initialized. Press Ctrl+C to stop...");
 
-    g_mqttHandler->setCallback([&clientPool](const std::string &topic,
-                                             const std::string &payload) {
-        log("Received message on topic " + topic + ": " + payload + "\n\n",
-            LogLevel::DEBUG);
+    g_mqttHandler->setCallback([&clientPool](const std::string &topic, const std::string &payload) {
+        log("Received MQTT message on topic: " + topic, LogLevel::DEBUG);
 
-        json json_payload = json::parse(payload);
-
-        if(!json_payload.contains("Data") || !json_payload["Data"].is_array())
-            return;
-
-        auto data = json_payload["Data"][0];
-        if(!data.contains("TagId") || !data["TagId"].is_number_integer())
-            return;
-
-        int tagId = data["TagId"].get<int>();
-        log("TagId: " + std::to_string(tagId) + "\n", LogLevel::DEBUG);
-
-        if(!data.contains("UpdateType") || !data["UpdateType"].is_string())
-            return;
-
-        int updateType = data["UpdateType"].get<int>();
-        log("UpdateType: " + std::to_string(updateType), LogLevel::DEBUG);
-
-        std::string endpoint = Mapping[tagId].second;
-        if(!clientPool.count(endpoint))
-            return;
-
-        auto context = clientPool.at(endpoint);
-        if(!context->isConnected) {
+        // Parse and validate JSON payload
+        json json_payload;
+        try {
+            json_payload = json::parse(payload);
+        } catch (const std::exception& e) {
+            log("Invalid JSON payload: " + std::string(e.what()), LogLevel::ERRORS);
             return;
         }
-        log("Ready to use client:  (connected to " + context->endpoint + ")");
 
-        // if (context->subscriptions[groupName].responseHeader.serviceResult !=
-        // UA_STATUSCODE_GOOD ||
-        //     context->subscriptions[groupName].subscriptionId == 0) {
-        //     std::cerr << "Failed to create subscription" << std::endl;
-        //     return;
-        // }
+        if (!json_payload.contains("Data") || !json_payload["Data"].is_array() || json_payload["Data"].empty()) {
+            log("Invalid payload structure - missing or empty Data array", LogLevel::ERRORS);
+            return;
+        }
+
+        auto data = json_payload["Data"][0];
+        
+        // Extract and validate required fields
+        if (!data.contains("TagId") || !data["TagId"].is_number_integer() ||
+            !data.contains("UpdateType") || !data["UpdateType"].is_number_integer()) {
+            log("Missing required fields: TagId or UpdateType", LogLevel::ERRORS);
+            return;
+        }
+
+        int tagId = data["TagId"].get<int>();
+        int updateType = data["UpdateType"].get<int>();
+        
+        log("Processing TagId: " + std::to_string(tagId) + ", UpdateType: " + std::to_string(updateType), LogLevel::DEBUG);
+
+        // Find client context for this tag
+        if (Mapping.find(tagId) == Mapping.end()) {
+            log("TagId " + std::to_string(tagId) + " not found in mapping", LogLevel::ERRORS);
+            return;
+        }
+
+        std::string endpoint = Mapping[tagId].second;
+        auto it = clientPool.find(endpoint);
+        if (it == clientPool.end() || !it->second->isConnected) {
+            log("Client not connected for endpoint: " + endpoint, LogLevel::ERRORS);
+            return;
+        }
+
+        auto context = it->second;
 
         if(updateType == UpdateType::TELEMETERY) {
             // std::lock_guard<std::mutex> lock(context->taskMutex);
@@ -786,37 +795,70 @@ runClient(bool isService, int argc, char *argv[]) {
             //     MonitorItem(context->client.get(), context->subscription,
             //                 Mapping[tagId].first.c_str(), tagId);
             // });
-
-            log("TELEMETERY");
-
         } else if(updateType == UpdateType::COMMAND) {
-            std::lock_guard<std::mutex> lock(context->taskMutex);
-            context->taskQueue.push([context, tagId, data, topic,
-                                     json_payload]() mutable {
-                UA_Variant value;
-                UA_Variant_init(&value);
-                double val = data["Value"].get<double>();
-                UA_Variant_setScalar(&value, &val, &UA_TYPES[UA_TYPES_DOUBLE]);
-
-                auto nsAndValue = extractNsAndValue(Mapping[tagId].first);
-                UA_StatusCode retval = UA_Client_writeValueAttribute(
-                    context->client.get(),
-                    UA_NODEID_STRING(nsAndValue.first,
-                                     const_cast<char *>(nsAndValue.second.c_str())),
-                    &value);
-
-                if(retval != UA_STATUSCODE_GOOD) {
-                    log("Failed to write value: " + string(UA_StatusCode_name(retval)),
-                        LogLevel::ERRORS);
-                } else {
-                    log("Value written successfully");
-                    g_mqttHandler->publish(topic, json_payload.dump());
+                // Extract NodeId from mapping
+                std::string nodeIdStr = Mapping[tagId].first;
+                size_t lastSlash = nodeIdStr.find_last_of('/');
+                if (lastSlash != std::string::npos) {
+                    nodeIdStr = nodeIdStr.substr(lastSlash + 1); // Extract "ns=1;i=194"
                 }
 
-                UA_Variant_clear(&value);
-            });
-        } else if(updateType == UpdateType::BULKDATA) {
-            log("BULKDATA");
+                // Queue write operation
+                std::lock_guard<std::mutex> lock(context->taskMutex);
+                context->taskQueue.push([context, tagId, data, nodeIdStr]() {
+                    log("Executing COMMAND write for TagId: " + std::to_string(tagId), LogLevel::DEBUG);
+                    
+                    // Parse value from payload
+                    double val = 0.0;
+                    try {
+                        if (data.contains("Value")) {
+                            if (data["Value"].is_number()) {
+                                val = data["Value"].get<double>();
+                            } else if (data["Value"].is_string()) {
+                                val = std::stod(data["Value"].get<std::string>());
+                            } else {
+                                log("Invalid Value type in payload", LogLevel::ERRORS);
+                                return;
+                            }
+                        } else {
+                            log("Missing Value field in payload", LogLevel::ERRORS);
+                            return;
+                        }
+                    } catch (const std::exception& e) {
+                        log("Failed to parse Value: " + std::string(e.what()), LogLevel::ERRORS);
+                        return;
+                    }
+
+                    // Create UA_Variant with the value
+                    UA_Variant value;
+                    UA_Variant_init(&value);
+                    UA_Variant_setScalar(&value, &val, &UA_TYPES[UA_TYPES_DOUBLE]);
+
+                    // Parse NodeId string safely
+                    int ns = 0, identifier = 0;
+                    if (sscanf(nodeIdStr.c_str(), "ns=%d;i=%d", &ns, &identifier) != 2) {
+                        log("Failed to parse NodeId: " + nodeIdStr, LogLevel::ERRORS);
+                        UA_Variant_clear(&value);
+                        return;
+                    }
+
+                    // Create NodeId and write to OPC UA server
+                    UA_NodeId nid = UA_NODEID_NUMERIC(ns, identifier);
+                    log("Writing value " + std::to_string(val) + " to ns=" + std::to_string(ns) + ";i=" + std::to_string(identifier), LogLevel::DEBUG);
+                    
+                    UA_StatusCode retval = UA_Client_writeValueAttribute(context->client.get(), nid, &value);
+
+                    if (retval == UA_STATUSCODE_GOOD) {
+                        log("Value written successfully to OPC UA server", LogLevel::INFO);
+                    } else {
+                        log("Failed to write value: " + std::string(UA_StatusCode_name(retval)), LogLevel::ERRORS);
+                    }
+                });
+            }
+         else if(updateType == UpdateType::BULKDATA) {
+            log("BULKDATA update received", LogLevel::DEBUG);
+        } else {
+            log("Unknown UpdateType: " + std::to_string(updateType), LogLevel::ERRORS);
         }
     });
 

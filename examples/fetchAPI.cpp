@@ -45,11 +45,11 @@ json getBearerToken(string host, string port , string username, string password)
         std::string target = "/api/Login";
         int version = 11;
 
-        // JSON body
-        std::string json_body = R"({
-        "Username":username,
-        "password":password
-        })";
+        // JSON body built from provided credentials
+        json jbody;
+        jbody["Username"] = username;
+        jbody["password"] = password;
+        std::string json_body = jbody.dump();
 
         // Set up I/O context and resolver
         // as::io_context ioc;
