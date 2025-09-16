@@ -38,17 +38,17 @@ as::io_context ioc;
 unordered_map<int, pair<string, string>> Mapping;
 unordered_map<int, string> TopicMapping;
 
-json getBearerToken() {
+json getBearerToken(string host, string port , string username, string password) {
     try {
-        std::string host = "164.52.221.177";
-        std::string port = "5128";
+        // std::string host = "164.52.221.177";
+        // std::string port = "5128";
         std::string target = "/api/Login";
         int version = 11;
 
         // JSON body
         std::string json_body = R"({
-        "Username":"ajay.sharma@techondater.co.in",
-        "password":"VvvQVRdH7JheYR7lLgbPCp4fcNEslXnKqhR59bdFMK8="
+        "Username":username,
+        "password":password
         })";
 
         // Set up I/O context and resolver
@@ -96,11 +96,11 @@ json getBearerToken() {
 
 
 
-json getHierarchy(string bearerToken) {
+json getHierarchy(string host , string port , string bearerToken) {
 
 try{
-    std::string host = "164.52.221.177";
-    std::string port = "5128";
+    // std::string host = host;
+    // std::string port = port;
     std::string target = "/api/GetOpcUaHierarchy";
     int version = 11;
 
@@ -173,11 +173,11 @@ try{
     
 }
 
-vector<ServerInfoO> ParseServerHierarchy(string bearerToken) {
+vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearerToken) {
 
     vector<ServerInfoO> servers;
     if(!bearerToken.empty()) {
-        auto futureResponse = std::async(std::launch::async, getHierarchy, bearerToken);
+        auto futureResponse = std::async(std::launch::async, getHierarchy, host, port,bearerToken);
         json response = futureResponse.get();
 
         if(response.contains("servers") && response["servers"].is_array()) {

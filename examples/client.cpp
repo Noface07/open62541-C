@@ -13,6 +13,7 @@
 #include <chrono>
 #include <csignal>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -207,6 +208,41 @@ static UA_Logger myLogger = {myLog, nullptr, nullptr};
 static int
 runClient(bool isService, int argc, char *argv[]) {
 
+    std::ifstream file("appsettings.json");
+    if (!file.is_open()) {
+        std::cerr << "Could not open appsettings.json" << std::endl;
+        return 1;
+    }
+
+    // Parse JSON
+    json config;
+    file >> config;
+
+    // Extract values
+
+
+        // Extract AppSettings
+        std::string applicationEndURL = config["AppSettings"]["ApplicationEndURL"].get<std::string>();
+        std::string applicationEndURLHost = config["AppSettings"]["ApplicationEndURLHost"].get<std::string>();
+        std::string applicationEndURLPort = config["AppSettings"]["ApplicationEndURLPort"].get<std::string>();
+
+        // Extract MqttConfig
+        std::string brokerAddress = config["MqttConfig"]["MqttSettings"][0]["BrokerAddress"].get<std::string>();
+        int brokerPort = config["MqttConfig"]["MqttSettings"][0]["BrokerPort"].get<int>();
+        std::string mqttUsername = config["MqttConfig"]["MqttSettings"][0]["Username"].get<std::string>();
+        std::string mqttPassword = config["MqttConfig"]["MqttSettings"][0]["Password"].get<std::string>();
+    
+        // Extract Authorization
+        std::string authUsername = config["Authorization"]["Username"].get<std::string>();
+        std::string authPassword = config["Authorization"]["Password"].get<std::string>();
+    
+        // Extract Payload
+        std::string dbPath = config["Payload"]["OfflineQueueOptions"]["DbPath"].get<std::string>();
+        int retentionDays = config["Payload"]["OfflineQueueOptions"]["RetentionDays"].get<int>();
+        int retryBatchSize = config["Payload"]["OfflineQueueOptions"]["RetryBatchSize"].get<int>();
+
+
+
     HANDLE hMutex = CreateMutexA(NULL, TRUE, "Global\\AnexeeMutex");
 
     if(hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -280,7 +316,7 @@ runClient(bool isService, int argc, char *argv[]) {
         try {
             log("Attempt " + std::to_string(attempt) + " - Fetching bearer token...", LogLevel::INFO);
             
-            auto futureToken = std::async(std::launch::async, getBearerToken);
+            auto futureToken = std::async(std::launch::async, getBearerToken, applicationEndURLHost, applicationEndURLPort, authUsername, authPassword);
             json token = futureToken.get();
             
             // Extract access_token
@@ -310,7 +346,7 @@ runClient(bool isService, int argc, char *argv[]) {
         try {
             log("Attempt " + std::to_string(attempt) + " - Fetching server hierarchy...", LogLevel::INFO);
             
-            serverList = ParseServerHierarchy(BearerToken);
+            serverList = ParseServerHierarchy(applicationEndURLHost, applicationEndURLPort, BearerToken);
             
             if (!serverList.empty()) {
                 hierarchySuccess = true;
@@ -356,7 +392,7 @@ runClient(bool isService, int argc, char *argv[]) {
         options.batchSize = 100; // Example value
         options.uploadIntervalSeconds = 15; // Example value
         // The DB file will be created in the current working directory
-        g_sqliteService = new SqliteQueueService("OfflineData.db", options);
+        g_sqliteService = new SqliteQueueService(dbPath, options);
         g_sqliteService->StartQueueWorker(); // Start the DB writer thread immediately
         log("SqliteQueueService initialized.", LogLevel::INFO);
 
@@ -504,7 +540,7 @@ runClient(bool isService, int argc, char *argv[]) {
 
     // Connect to MQTT broker (non-blocking)
     log("Attempting to connect to MQTT broker...", LogLevel::INFO);
-    if(!g_mqttHandler->connect("216.48.184.131", "15579", "portal", "dt0Unw7QRh")) {
+    if(!g_mqttHandler->connect(brokerAddress, std::to_string(brokerPort), mqttUsername, mqttPassword)) {
         log("Failed to initiate MQTT broker connection", LogLevel::ERRORS);
         return EXIT_FAILURE;
     } else {

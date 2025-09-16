@@ -4,14 +4,6 @@
 //  ./server D:\OPC UA Server\OPCUA- open 62451\open62541-C\certs\server_cert.der D:\OPC UA Server\OPCUA- open 62451\open62541-C\certs\server_key.der [trust1.der trust2.der ...]
 //  ./server D:\OPC UA Server\OPCUA- open 62451\open62541-C\certs\server_cert.der D:\OPC UA Server\OPCUA- open 62451\open62541-C\certs\server_key.der
 
-// #include <async_mqtt/all.hpp>
-//#include <nanoMQ/include/bridge.h>
-//#include <nanoMQ/include/broker.h>
-
-//#include <nanoMQ/include/nanomq.h>
-//#include <nng/nng.h>
-//#include <nanoMQ/include/nng/protocol/mqtt/mqtt.h>
-// #include <async_mqtt/asio_bind/predefined_layer/mqtts.hpp>
 #include <open62541/server_config_default.h>
 #include <open62541/plugin/log_stdout.h>
 #include <open62541/plugin/securitypolicy_default.h>
@@ -62,12 +54,6 @@
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
 
-// extern "C" {
-// #include "nanoMQ/include/nanomq.h"  // This has nanomq_cli_start and related APIs
-// }
-
-/* Build Instructions (Linux)
- * - g++ server.cpp -lopen62541 -o server */
 
 using namespace std;
 namespace as = boost::asio;
@@ -921,105 +907,140 @@ setStatus = UA_Server_setConditionField(server, alarmInstanceId, &val, messageNa
 
 
 
-void mqtt_subscribe_and_update(UA_Server* server, const std::vector<std::string>& topics) {
+void
+mqtt_subscribe_and_update(UA_Server *server, const std::vector<std::string> &topics) {
     // Use global ioc and amcl
     as::co_spawn(
         ioc,
         [&topics, server]() -> as::awaitable<void> {
-            try {
-                // Connect to broker
-                co_await amcl.async_underlying_handshake("216.48.184.131", "15579", as::use_awaitable);
+            // Reconnection loop
+            while(running) {
+                try {
+                    log("Attempting to connect to MQTT broker...", LogLevel::INFO);
+                    // Connect to broker
+                    co_await amcl.async_underlying_handshake("216.48.184.131", "15579",
+                                                             as::use_awaitable);
 
-                // Start MQTT session with username/password
-                auto connack_opt = co_await amcl.async_start(
-                    am::v5::connect_packet{
-                        true,   // clean_start
-                        0x1234, // keep_alive
-                        "",     // Client Identifier
-                        std::nullopt, // no will
-                        "portal",   // username
-                        "dt0Unw7QRh" // password
-                    },
-                    as::use_awaitable
-                );
-                if (!connack_opt) {
-                    log("Failed to connect to MQTT broker", LogLevel::ERRORS);
-                    co_return;
-                }
+                    // Start MQTT session with username/password
+                    auto connack_opt = co_await amcl.async_start(
+                        am::v5::connect_packet{
+                            true,          // clean_start
+                            0x1234,        // keep_alive
+                            "",            // Client Identifier
+                            std::nullopt,  // no will
+                            "portal",      // username
+                            "dt0Unw7QRh"   // password
+                        },
+                        as::use_awaitable);
+                    if(!connack_opt) {
+                        throw std::runtime_error(
+                            "Failed to start MQTT session (CONNACK not received).");
+                    }
+                    log("Successfully connected to MQTT broker.", LogLevel::INFO);
 
-                // Subscribe to all topics
-                std::vector<am::topic_subopts> sub_entry;
-                for (const auto& topic : topics) {
-                    sub_entry.push_back({topic, am::qos::at_most_once});
-                }
-                auto suback_opt = co_await amcl.async_subscribe(
-                    am::v5::subscribe_packet{
-                        *amcl.acquire_unique_packet_id(),
-                        am::force_move(sub_entry)
-                    },
-                    as::use_awaitable
-                );
-                if (!suback_opt) {
-                    log("Failed to subscribe", LogLevel::ERRORS);
-                    co_return;
-                }
+                    // Subscribe to all topics
+                    std::vector<am::topic_subopts> sub_entry;
+                    for(const auto &topic : topics) {
+                        sub_entry.push_back({topic, am::qos::at_most_once});
+                    }
+                    auto suback_opt = co_await amcl.async_subscribe(
+                        am::v5::subscribe_packet{*amcl.acquire_unique_packet_id(),
+                                                 am::force_move(sub_entry)},
+                        as::use_awaitable);
+                    if(!suback_opt) {
+                        throw std::runtime_error("Failed to subscribe to topics.");
+                    }
+                    log("Successfully subscribed to " + std::to_string(topics.size()) +
+                            " topics.",
+                        LogLevel::INFO);
 
-                // Receive loop
-                while (true) {
-                    auto pv_opt = co_await amcl.async_recv(as::use_awaitable);
-                    if (!pv_opt) break;
-                    pv_opt->visit(
-                        am::overload{
-                            [&](client_t::publish_packet& p) {
+                    // Receive loop
+                    while(running) {
+                        auto pv_opt = co_await amcl.async_recv(as::use_awaitable);
+                        if(!pv_opt) {
+                            // This indicates a graceful disconnect or an issue.
+                            log("MQTT connection closed by broker or network issue.",
+                                LogLevel::ERRORS);
+                            break;  // Exit receive loop to trigger reconnection
+                        }
+                        pv_opt->visit(am::overload{
+                            [&](client_t::publish_packet &p) {
                                 std::string topic = p.topic();
                                 std::string payload = p.payload();
-                                // std::cout << "Received payload: " << payload << std::endl;
                                 auto it = nodeMap.find(topic);
-                                if (it != nodeMap.end()) {
+                                if(it != nodeMap.end()) {
                                     try {
                                         auto j = json::parse(payload);
-                                        if (j.contains("Data") && j["Data"].is_array() && !j["Data"].empty()) {
-                                            if (j["Data"][0]["Value"].is_number()) {
-                                                double value = j["Data"][0]["Value"].get<double>();
+                                        if(j.contains("Data") && j["Data"].is_array() &&
+                                           !j["Data"].empty()) {
+                                            if(j["Data"][0]["Value"].is_number()) {
+                                                double value =
+                                                    j["Data"][0]["Value"].get<double>();
                                                 UA_Variant var;
-                                                UA_Variant_setScalar(&var, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                                UA_Variant_setScalar(
+                                                    &var, &value,
+                                                    &UA_TYPES[UA_TYPES_DOUBLE]);
                                                 is_internal_write = true;
-                                                UA_Server_writeValue(server, it->second, var);
+                                                UA_Server_writeValue(server, it->second,
+                                                                     var);
                                                 is_internal_write = false;
-                                            } else if (j["Data"][0]["Value"].is_boolean()) {
-                                                UA_Boolean value = j["Data"][0]["Value"].get<bool>();
+                                            } else if(j["Data"][0]["Value"]
+                                                          .is_boolean()) {
+                                                UA_Boolean value =
+                                                    j["Data"][0]["Value"].get<bool>();
                                                 UA_Variant var;
-                                                UA_Variant_setScalar(&var, &value, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                                                UA_Variant_setScalar(
+                                                    &var, &value,
+                                                    &UA_TYPES[UA_TYPES_BOOLEAN]);
                                                 is_internal_write = true;
-                                                UA_Server_writeValue(server, it->second, var);
+                                                UA_Server_writeValue(server, it->second,
+                                                                     var);
                                                 is_internal_write = false;
-                                            } else if (j["Data"][0]["Value"].is_string()) {
-                                                std::string strValue = j["Data"][0]["Value"].get<std::string>();
-                                                UA_String value = UA_STRING_ALLOC(strValue.c_str());
+                                            } else if(j["Data"][0]["Value"].is_string()) {
+                                                std::string strValue =
+                                                    j["Data"][0]["Value"]
+                                                        .get<std::string>();
+                                                UA_String value =
+                                                    UA_STRING_ALLOC(strValue.c_str());
                                                 UA_Variant var;
-                                                UA_Variant_setScalar(&var, &value, &UA_TYPES[UA_TYPES_STRING]);
+                                                UA_Variant_setScalar(
+                                                    &var, &value,
+                                                    &UA_TYPES[UA_TYPES_STRING]);
                                                 is_internal_write = true;
-                                                UA_Server_writeValue(server, it->second, var);
+                                                UA_Server_writeValue(server, it->second,
+                                                                     var);
                                                 is_internal_write = false;
                                                 UA_String_clear(&value);
                                             }
                                         }
-                                    } catch (const std::exception& e) {
-                                        log("JSON parse error: " + std::string(e.what()), LogLevel::ERRORS);
+                                    } catch(const std::exception &e) {
+                                        log("JSON parse error: " + std::string(e.what()),
+                                            LogLevel::ERRORS);
                                     }
                                 }
                             },
-                            [](auto&) {}
-                        }
-                    );
+                            [](auto &) {}  // Ignore other packet types
+                        });
+                    }
+                } catch(const std::exception &e) {
+                    log("MQTT error: " + std::string(e.what()) +
+                            ". Reconnecting in 5 seconds...",
+                        LogLevel::ERRORS);
                 }
-            } catch (const std::exception& e) {
-                log("MQTT error: " + std::string(e.what()), LogLevel::ERRORS);
+
+                // If we've reached here, it's due to an error or disconnect.
+                // Reset the client before attempting to reconnect.
+                amcl = client_t{ioc.get_executor()};
+
+                // Wait before retrying, but exit if the server is shutting down.
+                for(int i = 0; i < 5 && running; ++i) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
             }
+            log("MQTT reconnection loop stopped due to server shutdown.", LogLevel::INFO);
             co_return;
         },
-        as::detached
-    );
+        as::detached);
 }
 
 
