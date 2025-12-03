@@ -19,6 +19,18 @@ struct MappedInfospaceTag{
     int deadband;
     int queuesize;
     int orgId;
+
+
+    bool scaling;
+    double rawMin;
+    double rawMax;
+    double scaleMin;
+    double scaleMax;
+    string sourceDatatype;
+    bool enableExpression;
+    string expression;
+
+
     // bool isSimulationProfile;
     // bool isLogging;
     // bool isVirtual;
@@ -30,6 +42,7 @@ struct TagInfo{
     double rawMax;
     double scaleMin;
     double scaleMax;
+    string sourceDatatype;
     bool enableExpression;
     int samplingInterval;
     int deadband;

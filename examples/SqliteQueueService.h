@@ -89,7 +89,7 @@ public:
 
     // Configuration setters
     void SetApiUrl(const std::string& url);
-    void SetApiAuth(const std::string& user, const std::string& pass);
+    void SetApiAuth(const std::string& bearerToken);
     void SetApiMetadata(const nlohmann::json& metadata);
     
     // MQTT connection state management
@@ -147,8 +147,7 @@ private:
 
     // API configuration
     std::string apiUrl_;
-    std::string apiUser_;
-    std::string apiPass_;
+    std::string apiBearerToken_;
     nlohmann::json apiMetadata_;
 
 };

@@ -3,6 +3,7 @@
 #include <open62541/client_subscriptions.h>
 #include <open62541/plugin/log_stdout.h>
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <signal.h>
@@ -13,12 +14,59 @@
 #include "MQTThandler.h"
 #include "SqliteQueueService.h"
 #include "Logger.h"
-#include <string> 
+#include <string>
+ #include <exprtk.hpp>
 
 using namespace std;
 using json = nlohmann::ordered_json;
 
 #ifdef UA_ENABLE_SUBSCRIPTIONS
+
+
+/**
+ * @brief Scales a value from one range to another.
+ * @return The scaled value. Returns scaleMin if the raw range is zero to prevent division by zero.
+ */
+double ScaleValue(double rawValue, double rawMin, double rawMax, double scaleMin, double scaleMax)
+{
+    if (rawMax - rawMin == 0) {
+        return scaleMin; 
+    }
+    double scaleValue = scaleMin + (rawValue - rawMin) * (scaleMax - scaleMin) / (rawMax - rawMin);
+    return scaleValue;
+}
+
+/**
+ * @brief Evaluates a logical string expression (e.g., "value > 50 and value < 100").
+ * @param expression The expression string. It should use the variable name "value".
+ * @param value The double value to substitute for the "value" variable in the expression.
+ * @return True or false based on the expression's result.
+ */
+bool EvaluateExpression(std::string expression, double value) 
+{
+    exprtk::symbol_table<double> symbol_table;
+    symbol_table.add_variable("value", value);
+
+    exprtk::expression<double> expr;
+    expr.register_symbol_table(symbol_table);
+
+    exprtk::parser<double> parser;
+    std::transform(expression.begin(), expression.end(), expression.begin(), ::tolower);
+    
+    // Parse the expression. If it fails, the condition is considered false.
+    if (!parser.compile(expression, expr)) {
+        // Log the error for debugging if needed
+        // fprintf(stderr, "ExprTk Error: %s\tExpression: %s\n", parser.error().c_str(), expression.c_str());
+        return false;
+    }
+
+    double result = expr.value();
+
+    // The key change: Convert the numeric result to a boolean.
+    // 0.0 is false, any non-zero value is true.
+    return result != 0.0;
+}
+
 
 static void
 handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
@@ -29,37 +77,76 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
         return;
     }
 
+
+
     MqttPayload p;
     p.datapointId = myContext->infoSpace.tagId;
     p.name        = myContext->infoSpace.name;
     p.tagId       = myContext->infoSpace.tagId;
-    p.tagType     = "INFO_DCR";   // TODO: parameterize
+    p.tagType     = myContext->infoSpace.sourceDatatype;
     p.source      = "4";          // TODO: parameterize
     p.infoId      = 1001;         // TODO: parameterize
 
+    
     // Convert UA_Variant to string
+
     UA_Variant* variant = &value->value;
+    std::optional<double> numericValue;
+    bool valueIsFinal = false; // Flag to check if p.value has been definitively set
+
+    // Step 1: Extract value from UA_Variant and handle non-numeric types
     if (UA_Variant_isScalar(variant) && variant->data) {
-        if (variant->type == &UA_TYPES[UA_TYPES_INT32]) {
-            p.value = std::to_string(*static_cast<UA_Int32*>(variant->data));
-        } else if (variant->type == &UA_TYPES[UA_TYPES_DOUBLE]) {
-            p.value = std::to_string(*static_cast<UA_Double*>(variant->data));
-        } else if (variant->type == &UA_TYPES[UA_TYPES_FLOAT]) {
-            p.value = std::to_string(*static_cast<UA_Float*>(variant->data));
-        } else if (variant->type == &UA_TYPES[UA_TYPES_BOOLEAN]) {
+        if (variant->type == &UA_TYPES[UA_TYPES_BOOLEAN]) {
             p.value = (*static_cast<UA_Boolean*>(variant->data)) ? "true" : "false";
+            valueIsFinal = true;
         } else if (variant->type == &UA_TYPES[UA_TYPES_STRING]) {
             UA_String str = *static_cast<UA_String*>(variant->data);
-            if (str.length > 0 && str.data) {
-                p.value.assign(reinterpret_cast<char*>(str.data), str.length);
-            } else {
-                p.value = "";
-            }
+            p.value = (str.length > 0 && str.data) ? std::string(reinterpret_cast<char*>(str.data), str.length) : "";
+            valueIsFinal = true;
+        } else if (variant->type == &UA_TYPES[UA_TYPES_INT32]) {
+            numericValue = static_cast<double>(*static_cast<UA_Int32*>(variant->data));
+        } else if (variant->type == &UA_TYPES[UA_TYPES_DOUBLE]) {
+            numericValue = *static_cast<UA_Double*>(variant->data);
+        } else if (variant->type == &UA_TYPES[UA_TYPES_FLOAT]) {
+            numericValue = static_cast<double>(*static_cast<UA_Float*>(variant->data));
         } else {
             p.value = "unsupported";
+            valueIsFinal = true;
         }
     } else {
         p.value = "null";
+        valueIsFinal = true;
+    }
+    // Step 2: If we have a numeric value, apply transformations
+    if (numericValue.has_value() && !valueIsFinal) {
+        double processedValue = numericValue.value();
+        // const auto& config = myContext->infoSpace; // Shortcut for readability
+
+        // Check for INFO_STATE first, as it's a special case that results in a boolean string
+        if (p.tagType == "INFO_STATE") {
+            if (myContext->infoSpace.enableExpression && !myContext->infoSpace.expression.empty()) {
+                bool state = EvaluateExpression(myContext->infoSpace.expression, processedValue);
+                p.value = state ? "true" : "false";
+            } else {
+                // If expression is disabled, just use the original numeric value
+                p.value = std::to_string(processedValue);
+            }
+        } else if (p.tagType == "INFO_INST") {
+            if (myContext->infoSpace.scaling) {
+                processedValue = ScaleValue(processedValue, myContext->infoSpace.rawMin, myContext->infoSpace.rawMax, myContext->infoSpace.scaleMin, myContext->infoSpace.scaleMax);
+            }
+        } else if (p.tagType == "INFO_INC") {
+            // Handle counter logic here if needed
+        } else if (p.tagType == "INFO_DCR") {
+            // Handle decrement logic here if needed
+        } else if (p.tagType == "DT_TYP_TXT") {
+            // Handle text data type logic here if needed
+        } else {
+            // Default case - no transformation needed
+        }
+
+        // Step 3: Convert the final processed value to a string
+        p.value = std::to_string(processedValue);
     }
 
     // Timestamp
@@ -199,7 +286,7 @@ parseNodeId(const char *nodeIdStr) {
 
 
 
-static void
+void
 MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
             const char *nodeIdStr, int tagID, MyMonitorContext *myContext) {
 
@@ -257,7 +344,7 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
 void handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext,
                    UA_UInt32 monId, void *monContext,
                    size_t nEventFields, UA_Variant *eventFields) {
-    ("Received Event Notification (" + to_string(nEventFields) + " fields):");
+                    log("Received Event Notification (" + to_string(nEventFields) + " fields):");
     
     for(size_t i = 0; i < nEventFields; ++i) {
         if(UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_UINT16])) {
@@ -325,7 +412,7 @@ void handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext,
 
 }
 
-static void MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse response) {
+void MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse response) {
 
     UA_Byte eventNotifier = 0;
     UA_StatusCode sc = UA_Client_readEventNotifierAttribute(client,

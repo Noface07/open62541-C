@@ -1,38 +1,44 @@
 /* This work is licensed under a Creative Commons CCZero 1.0 Universal License.
  * See http://creativecommons.org/publicdomain/zero/1.0/ for more information. */
 
-/* This work is licensed under a Creative Commons CCZero 1.0 Universal License.
- * See http://creativecommons.org/publicdomain/zero/1.0/ for more information. */
-
-#include <open62541/client_config_default.h>
-#include <open62541/client_highlevel.h>
-#include <open62541/client_subscriptions.h>
-#include <open62541/plugin/log_stdout.h>
-
-#include <atomic>
-#include <chrono>
-#include <csignal>
-#include <functional>
-#include <future>
-#include <iomanip>
-#include <iostream>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <queue>
-#include <thread>
-#include <vector>
-#include <windows.h>
-
-#include "SqliteQueueService.h"
-#include "Logger.h"
-#include "MQTThandler.h"
-#include "Monitoring.cpp"
-#include "fetchAPI.cpp"
-#include "structs.h"
-#include <boost/asio.hpp>
-#include <unordered_map>
-#include <nlohmann/json.hpp>
+ #include <open62541/client_config_default.h>
+ #include <open62541/client_highlevel.h>
+ #include <open62541/client_subscriptions.h>
+ #include <open62541/plugin/log_stdout.h>
+ 
+ #include <atomic>
+ #include <chrono>
+ #include <csignal>
+ #include <functional>
+ #include <future>
+ #include <iomanip>
+ #include <iostream>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+ #include <queue>
+ #include <thread>
+ #include <vector>
+ 
+ #ifdef _WIN32
+     #include <windows.h> // For Sleep(), service APIs
+     #include <dirent.h> // for Directory functions
+ #else
+     #include <unistd.h>  // For usleep(), readlink, chdir
+     #include <sys/file.h> // flock
+     #include <fcntl.h>    // open
+     #include <limits.h>   // PATH_MAX
+ #endif
+ 
+ #include "SqliteQueueService.h"
+ #include "Logger.h"
+ #include "MQTThandler.h"
+ #include "Monitoring.h"
+ #include "fetchAPI.h"
+ #include "structs.h"
+ #include <boost/asio.hpp>
+ #include <unordered_map>
+ #include <nlohmann/json.hpp>
 
 using namespace std;
 
@@ -43,11 +49,15 @@ MQTTHandler *g_mqttHandler = nullptr;
 SqliteQueueService *g_sqliteService = nullptr;
 
 static std::once_flag security_policies_loaded;
+static std::mutex cert_loading_mutex;
 
 unordered_map<string, int> groupIdMap;
 
 std::atomic<bool> g_running(true);
 
+
+
+#ifdef _WIN32
 // Windows Service globals
 static SERVICE_STATUS g_ServiceStatus;
 static SERVICE_STATUS_HANDLE g_StatusHandle = nullptr;
@@ -55,12 +65,15 @@ static HANDLE g_ServiceStopEvent = nullptr;
 static const char *SERVICE_NAME = "AnexeeOPCUAClient";
 static HANDLE g_EventLog = nullptr;
 
-// Forward declarations for service
+// Forward declarations for service (Windows only)
 static void ReportSvcStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint);
 static void WINAPI ServiceMain(DWORD argc, LPTSTR *argv);
 static void WINAPI ServiceCtrlHandler(DWORD controlCode);
 static DWORD WINAPI ServiceWorkerThread(LPVOID lpParam);
 static void LogEventWord(WORD type, const char *msg);
+
+#endif
+
 static void SetWorkingDirectoryToExe();
 
 void
@@ -124,6 +137,14 @@ struct ClientContext {
                         task();
                     }
                 }
+                
+                                // ADD NULL CHECK HERE
+                                if (!client) {
+                                    log(name + ": Client is null, reconnecting...", LogLevel::ERRORS);
+                                    isConnected = false;
+                                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                                    continue;
+                                }
 
                 UA_StatusCode code = UA_Client_run_iterate(client.get(), 100);
                 if(code != UA_STATUSCODE_GOOD) {
@@ -170,6 +191,68 @@ loadFile(const char *path) {
     return fileContents;
 }
 
+#ifdef _WIN32
+static size_t
+loadCertsFromDirectory(const char *dirPath, UA_ByteString **certs) {
+    char searchPath[512];
+    snprintf(searchPath, sizeof(searchPath), "%s\\*.der", dirPath);
+
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(searchPath, &findData);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    std::vector<std::string> derFiles;
+    do {
+        derFiles.push_back(findData.cFileName);
+    } while (FindNextFileA(hFind, &findData) != 0);
+    FindClose(hFind);
+
+    size_t count = derFiles.size();
+    if (count == 0) {
+        return 0;
+    }
+
+    *certs = (UA_ByteString*)UA_malloc(sizeof(UA_ByteString) * count);
+    for (size_t i = 0; i < count; ++i) {
+        char fullpath[512];
+        snprintf(fullpath, sizeof(fullpath), "%s\\%s", dirPath, derFiles[i].c_str());
+        (*certs)[i] = loadFile(fullpath);
+    }
+
+    return count;
+}
+#else
+/* Load all .der files from a directory */
+static size_t
+loadCertsFromDirectory(const char *dirPath, UA_ByteString **certs) {
+    DIR *dir = opendir(dirPath);
+    if(!dir) return 0;
+
+    struct dirent *entry;
+    std::vector<std::string> derFiles;
+    while((entry = readdir(dir)) != NULL) {
+        if(strstr(entry->d_name, ".der"))
+            derFiles.push_back(entry->d_name);
+    }
+    
+    size_t count = derFiles.size();
+    if(count > 0) {
+        *certs = (UA_ByteString*)UA_malloc(sizeof(UA_ByteString) * count);
+        for(size_t i = 0; i < count; i++) {
+            char fullpath[512];
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", dirPath, derFiles[i].c_str());
+            (*certs)[i] = loadFile(fullpath);
+        }
+    }
+    
+    closedir(dir);
+    return count;
+}
+#endif
+
 // Your custom logger callback
 static void
 myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg,
@@ -201,7 +284,53 @@ myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg
 static UA_Logger myLogger = {myLog, nullptr, nullptr};
 
 
+std::future<std::string> getBearerTokenNow(std::string applicationEndURLHost, std::string applicationEndURLPort, std::string authUsername, std::string authPassword, bool blocking = true) {
+    const int retryDelay = 10; // seconds
+    int attempt = 1;
 
+    auto fut = std::async(std::launch::async, [&]() {  // <-- capture by reference
+        std::string token;
+        bool tokenSuccess = false;
+
+        while (!tokenSuccess) {
+            try {
+                auto futureToken = std::async(std::launch::async, [&]() {
+                    return ::getBearerToken(applicationEndURLHost, applicationEndURLPort, authUsername, authPassword);
+                });
+
+                json tokenResponse = futureToken.get();
+
+                if (tokenResponse.contains("access_token")) {
+                    token = tokenResponse["access_token"].get<std::string>();
+                    tokenSuccess = true;
+                    std::cout << "Bearer token fetched successfully!" << std::endl;
+                    return token;
+                } else {
+                    std::cout << "Invalid token response - retrying in " 
+                            << retryDelay << " seconds..." << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cout << "Token fetch failed: " << e.what() << std::endl;
+            }
+
+            if (!tokenSuccess) {
+                std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
+                attempt++;   // ✅ now valid, because attempt is captured by reference
+            }
+        }
+
+        return token;
+    });
+
+    if (blocking) {
+        // Consume future immediately and return a ready future
+        std::promise<std::string> p;
+        p.set_value(fut.get());
+        return p.get_future();
+    }
+
+    return fut; // async: caller decides when to wait
+}
 
 
 // Extracted main logic so it can be reused by console and service
@@ -212,8 +341,15 @@ runClient(bool isService, int argc, char *argv[]) {
 
     std::ifstream file("appsettings.json");
     if (!file.is_open()) {
+        std::string cwdStr;
+#ifdef _WIN32
         char cwd[MAX_PATH]; GetCurrentDirectoryA(MAX_PATH, cwd);
-        log(std::string("Could not open appsettings.json. CWD=") + cwd, LogLevel::ERRORS);
+        cwdStr = cwd;
+#else
+        char cwd[PATH_MAX];
+        if(getcwd(cwd, sizeof(cwd))) cwdStr = cwd; else cwdStr = "";
+#endif
+        log(std::string("Could not open appsettings.json. CWD=") + cwdStr, LogLevel::ERRORS);
         return 1;
     }
 
@@ -245,7 +381,7 @@ runClient(bool isService, int argc, char *argv[]) {
         int retryBatchSize = config["Payload"]["OfflineQueueOptions"]["RetryBatchSize"].get<int>();
 
 
-
+        #ifdef _WIN32
     HANDLE hMutex = CreateMutexA(NULL, TRUE, "Global\\AnexeeMutex");
 
     if(hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -255,24 +391,30 @@ runClient(bool isService, int argc, char *argv[]) {
         }
         return 1;  // Exit immediately
     }
+    #else
+    int lockFd = open("/tmp/anexee-opcua-client.lock", O_CREAT | O_RDWR, 0666);
+    if(lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+        log("Another instance is already running (lock file)", LogLevel::ERRORS);
+        if(lockFd >= 0) close(lockFd);
+        return 1;
+    }
+#endif
 
 
     // Ask user if they want to start (only in console/GUI mode)
+    #ifdef _WIN32
     int result = IDYES;
     if(!isService) {
         result = MessageBoxA(NULL, "Do you want to start the client?", "Confirmation",
                              MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
     }
-
-
     if(result == IDYES && !isService) {
         MessageBoxA(NULL, "Client Started", "Info", MB_OK);
     }
-
-
     if(result == IDNO) {
         return 0;  // Exit if user chooses No
     }
+#endif
 
     // Global logging control - only enable file logging with --debug
     g_logging_enabled = false; // Default: no file logging
@@ -293,6 +435,7 @@ runClient(bool isService, int argc, char *argv[]) {
     }
     
     if(g_debug && !isService) {
+        #ifdef _WIN32
         // Allocate a console at runtime
         if(AllocConsole()) {
             FILE *fp;
@@ -301,55 +444,52 @@ runClient(bool isService, int argc, char *argv[]) {
             freopen_s(&fp, "CONIN$", "r", stdin);
             std::cout << "[DEBUG] Console attached" << std::endl;
         }
+        #endif
     }
 
 
     // Retry logic for API calls with constant 10-second intervals
-    string BearerToken = "";
+    string BearerToken = getBearerTokenNow(applicationEndURLHost, std::to_string(applicationEndURLPort), authUsername, authPassword, true).get();
+    log("Bearer token obtained successfully", LogLevel::INFO);
+    
     vector<ServerInfoO> serverList;
-    
-    log("Attempting to fetch configuration from API...", LogLevel::INFO);
-    
-    // Retry getBearerToken with constant 10-second intervals (infinite retries)
-    const int retryDelay = 10; // seconds
-    bool tokenSuccess = false;
-    int attempt = 1;
-    
-    while (!tokenSuccess) {
-        try {
-            log("Attempt " + std::to_string(attempt) + " - Fetching bearer token...", LogLevel::INFO);
-            
-            auto futureToken = std::async(std::launch::async, getBearerToken, applicationEndURLHost, std::to_string(applicationEndURLPort), authUsername, authPassword);
-            json token = futureToken.get();
-            
-            // Extract access_token
-            if(token.contains("access_token")) {
-                BearerToken = token["access_token"].get<std::string>();
-                tokenSuccess = true;
-                log("Bearer token fetched successfully!", LogLevel::INFO);
-            } else {
-                log("Invalid token response - retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::ERRORS);
-            }
-        } catch (const std::exception& e) {
-            log("Token fetch failed: " + std::string(e.what()), LogLevel::ERRORS);
-        }
         
-        if (!tokenSuccess) {
-            log("Retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::INFO);
-            std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
-            attempt++;
-        }
-    }
-    
     // Retry ParseServerHierarchy with constant 10-second intervals (infinite retries)
+    const int retryDelay = 10; // seconds
     bool hierarchySuccess = false;
-    attempt = 1;
+    int attempt = 1;
     
     while (!hierarchySuccess) {
         try {
             log("Attempt " + std::to_string(attempt) + " - Fetching server hierarchy...", LogLevel::INFO);
+
+
+            std::string target = "/api/GetOpcUaHierarchy";
+            // JSON body
+            std::string json_body = R"(
+            {
+           
+                "orgId": 0,
+                "roleId": "",
+                "userId": 0,
+                "moduleId": 0,
+                "userType": "",
+                "requestDateTime": "2024-12-26T08:16:05.629Z",
+                "ipAddress": "",
+                "originName": "",
+                "filterModel": {
+                    
+                    "customValue": "all"
+                },
+        
+                "data": {
+                    "nodeId": "ND02"
+                }
+            }
+            )";
             
-            serverList = ParseServerHierarchy(applicationEndURLHost, std::to_string(applicationEndURLPort), BearerToken);
+            
+            serverList = ParseServerHierarchy(applicationEndURLHost, std::to_string(applicationEndURLPort), BearerToken, json_body, target);
             
             if (!serverList.empty()) {
                 hierarchySuccess = true;
@@ -400,16 +540,17 @@ runClient(bool isService, int argc, char *argv[]) {
         log("SqliteQueueService initialized.", LogLevel::INFO);
 
         // After: g_sqliteService = new SqliteQueueService("OfflineData.db", options);
-        g_sqliteService->SetApiUrl("http://your-api-host:port/path");   // required
-        g_sqliteService->SetApiAuth("api_user", "api_password");        // optional
+        g_sqliteService->SetApiUrl("http://164.52.221.177:5128/api/UploadBulkTagData");   // required
+        string BearerToken2 = getBearerTokenNow(applicationEndURLHost, std::to_string(applicationEndURLPort), authUsername, authPassword, true).get();
+        g_sqliteService->SetApiAuth(BearerToken2);  
 
         nlohmann::json apiMetadata;
-        apiMetadata["OrgId"] = 123;
-        apiMetadata["RoleId"] = "role_xyz";
-        apiMetadata["UserId"] = 456;
-        apiMetadata["ModuleId"] = 789;
+        apiMetadata["OrgId"] = 1;
+        apiMetadata["RoleId"] = "1";
+        apiMetadata["UserId"] = 1;
+        apiMetadata["ModuleId"] = 789;  
         apiMetadata["UserType"] = "system";
-        apiMetadata["IpAddress"] = "127.0.0.1";
+        apiMetadata["IpAddress"] = serverList[0].endpointUrl;
         apiMetadata["OriginName"] = "OPCUAClient";
         apiMetadata["EntityId"] = 42;
         g_sqliteService->SetApiMetadata(apiMetadata);
@@ -638,32 +779,61 @@ runClient(bool isService, int argc, char *argv[]) {
         // --- Start of Corrected Security Logic ---
     
         if(server.msgSecurityMode != "NONE" && !server.msgSecurityMode.empty()) {
+
+                        // ADD MUTEX LOCK HERE
+                        std::lock_guard<std::mutex> lock(cert_loading_mutex);
+
             // This server requires security. Load certificates and apply them.
             UA_ByteString client_cert = loadFile("client/own/certs/client_cert.der");
             UA_ByteString client_key = loadFile("client/own/certs/client_key.der");
-            UA_ByteString ca_cert = loadFile("ca/certs/ca.crt");
-            UA_ByteString revocation_cert = loadFile("server/trusted/crl/crl.crl");
+            
+            // Load trusted certificates from directory
+            UA_ByteString *trustList = NULL;
+            size_t trustListSize = loadCertsFromDirectory("client/trusted/certs", &trustList);
+            log("Loaded " + std::to_string(trustListSize) + " trusted certificate(s) for " + server.name, LogLevel::INFO);
+            
+            // Load issuer certificates from directory  
+            UA_ByteString *issuerList = NULL;
+            size_t issuerListSize = loadCertsFromDirectory("client/issuers/certs", &issuerList);
+            log("Loaded " + std::to_string(issuerListSize) + " issuer certificate(s) for " + server.name, LogLevel::INFO);
+            
+            // Load revocation list from directory
+            UA_ByteString *revocationList = NULL;
+            size_t revocationListSize = loadCertsFromDirectory("client/trusted/crl", &revocationList);
+            log("Loaded " + std::to_string(revocationListSize) + " revocation certificate(s) for " + server.name, LogLevel::INFO);
     
-            if (client_cert.length > 0 && client_key.length > 0 && ca_cert.length > 0) {
-                UA_STACKARRAY(UA_ByteString, trustList, 1);
-                trustList[0] = ca_cert;
-    
-                UA_STACKARRAY(UA_ByteString, revocationList, 1);
-                revocationList[0] = (revocation_cert.length > 0) ? revocation_cert : UA_BYTESTRING_NULL;
-    
+            if (client_cert.length > 0 && client_key.length > 0) {
                 UA_ClientConfig_setDefaultEncryption(
                     config, client_cert, client_key,
-                    trustList, 1,
-                    revocationList, (revocation_cert.length > 0) ? 1 : 0);
+                    trustList, trustListSize,
+                    revocationList, revocationListSize);
+                    
+                log("Encryption configured for secure connection to " + server.name, LogLevel::INFO);
             } else {
-                 log("Warning: Could not load certificate files for secure server " + server.name, LogLevel::ERRORS);
+                 log("Warning: Could not load client certificate or key for secure server " + server.name, LogLevel::ERRORS);
             }
     
             // Clean up byte strings after use
             UA_ByteString_clear(&client_cert);
             UA_ByteString_clear(&client_key);
-            UA_ByteString_clear(&ca_cert);
-            UA_ByteString_clear(&revocation_cert);
+            
+            if(trustList) {
+                for(size_t i = 0; i < trustListSize; i++)
+                    UA_ByteString_clear(&trustList[i]);
+                UA_free(trustList);
+            }
+            
+            if(issuerList) {
+                for(size_t i = 0; i < issuerListSize; i++)
+                    UA_ByteString_clear(&issuerList[i]);
+                UA_free(issuerList);
+            }
+            
+            if(revocationList) {
+                for(size_t i = 0; i < revocationListSize; i++)
+                    UA_ByteString_clear(&revocationList[i]);
+                UA_free(revocationList);
+            }
     
             // Set security mode and policy based on this server's config
             if(server.msgSecurityMode == "OPC_UA_SM_SG") {
@@ -673,19 +843,31 @@ runClient(bool isService, int argc, char *argv[]) {
             }
             
             // This part needs to be dynamic based on your securityPolicy from JSON
-            // For now, we'll keep your hardcoded value as an example
-            config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
+            const std::string &policy = server.securityPolicy;
+            if(policy == "UA_SP_BASIC256") {
+                config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
+            } else if(policy == "UA_SP_AES128") {
+                config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
+            } else if(policy == "UA_SP_AES256") {
+                config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss");
+            } else {
+                // Fallback to None
+                config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#None");
+            }
     
         } 
         // If msgSecurityMode is "NONE", we do nothing extra. The UA_ClientConfig_setDefault already handled it.
     
         // --- End of Corrected Security Logic ---
-            if(server.authType == "anonymous" || server.authType == "anonymus") {
+            if(server.authType == "AUTH_STG_ANYMS" || server.authType == "AUTH_STG_ANYMS") {
                 return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
-            } else if(server.authType == "user") {
+            } else if(server.authType == "AUTH_STG_AUTH") {
                 return UA_Client_connectUsername(ctx->client.get(),
                                                  server.endpointUrl.c_str(), "user1",
                                                  "password1");
+            }
+            else if(server.authType == "AUTH_STG_CERT") {
+                return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
             }
             return UA_STATUSCODE_BADIDENTITYTOKENINVALID;
         };
@@ -739,6 +921,9 @@ runClient(bool isService, int argc, char *argv[]) {
         context->startLoop();
         clientPool[context->endpoint] = context.get();
         clientContexts.push_back(std::move(context));
+
+                // ADD THIS: Give each thread time to initialize before starting the next
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     log("Client pool initialized. Press Ctrl+C to stop...");
@@ -885,10 +1070,17 @@ runClient(bool isService, int argc, char *argv[]) {
        delete g_mqttHandler;
     }
 
+    #ifdef _WIN32
     if(hMutex) {
         ReleaseMutex(hMutex);
         CloseHandle(hMutex);
     }
+#else
+    if(lockFd >= 0) {
+        flock(lockFd, LOCK_UN);
+        close(lockFd);
+    }
+#endif
 
     return EXIT_SUCCESS;
 }
@@ -898,6 +1090,7 @@ main(int argc, char *argv[]) {
     return runClient(false, argc, argv);
 }
 
+#ifdef _WIN32
 int WINAPI
 WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     SERVICE_TABLE_ENTRYA serviceTable[] = {
@@ -910,8 +1103,11 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
     // Not launched by SCM. Fall back to console/GUI mode.
     return main(__argc, __argv);
 }
+#endif
 
 // Service helper implementations
+// Service helper implementations (Windows only)
+#ifdef _WIN32
 static void
 ReportSvcStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint) {
     static DWORD checkPoint = 1;
@@ -963,7 +1159,26 @@ SetWorkingDirectoryToExe() {
     }
     SetCurrentDirectoryA(path);
 }
+#else
+static void
+SetWorkingDirectoryToExe() {
+    char exePath[PATH_MAX] = {0};
+    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if(len <= 0) return;
+    exePath[len] = '\0';
+    // Strip filename to directory
+    for(ssize_t i = len - 1; i >= 0; --i) {
+        if(exePath[i] == '/') {
+            exePath[i] = '\0';
+            break;
+        }
+    }
+    chdir(exePath);
+}
+#endif
 
+// The following service functions are Windows-only and must be guarded
+#ifdef _WIN32
 static void WINAPI
 ServiceCtrlHandler(DWORD controlCode) {
     switch(controlCode) {
@@ -1055,3 +1270,4 @@ ServiceMain(DWORD argc, LPTSTR *argv) {
 
     ReportSvcStatus(SERVICE_STOPPED, stopping ? NO_ERROR : NO_ERROR, 0);
 }
+#endif // _WIN32

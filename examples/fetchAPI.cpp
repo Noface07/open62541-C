@@ -23,6 +23,8 @@
 
 #include "structs.h"
 #include "Logger.h"
+#include "AlarmConfig.h"
+#include "OrgConfig.h"
 
 
 using json = nlohmann::ordered_json;
@@ -34,27 +36,53 @@ namespace am = async_mqtt;
 namespace beast = boost::beast;
 using tcp = boost::asio::ip::tcp;  
 
-as::io_context ioc;
+as::io_context http_ioc;
 unordered_map<int, pair<string, string>> Mapping;
 unordered_map<int, string> TopicMapping;
 
+
+// URL-encode helper
+static std::string
+url_encode(const std::string &value) {
+    std::ostringstream escaped;
+    escaped.fill('0');
+    escaped << std::hex;
+    for(auto c : value) {
+        // Unreserved characters (RFC 3986)
+        if(('0' <= c && c <= '9') || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') ||
+           c == '-' || c == '_' || c == '.' || c == '~') {
+            escaped << c;
+        } else {
+            escaped << '%' << std::setw(2) << std::uppercase << int((unsigned char)c);
+            escaped << std::nouppercase;  // reset flag
+        }
+    }
+    return escaped.str();
+}
+
+
+
+
 json getBearerToken(string host, string port , string username, string password) {
     try {
-        // std::string host = "164.52.221.177";
-        // std::string port = "5128";
-        std::string target = "/api/Login";
+        std::string target = "/api/SignIn";
         int version = 11;
 
         // JSON body built from provided credentials
-        json jbody;
-        jbody["Username"] = username;
-        jbody["password"] = password;
-        std::string json_body = jbody.dump();
+        //json jbody;
+        //jbody["Username"] = username;
+        //jbody["password"] = password;
+        //std::string json_body = jbody.dump();
+        // 
+        // Build form-encoded body (keys are lowercase per your screenshot)
+        std::string form_body =
+            "grant_type=" + url_encode("password") + "&username=" + url_encode(username) +
+            "&password=" + url_encode(password) + "&client_id=" + url_encode("roclient");
 
         // Set up I/O context and resolver
         // as::io_context ioc;
-        tcp::resolver resolver(ioc);
-        beast::tcp_stream stream(ioc);
+        tcp::resolver resolver(http_ioc);
+        beast::tcp_stream stream(http_ioc);
 
         // Resolve domain name
         auto const results = resolver.resolve(host, port);
@@ -66,8 +94,8 @@ json getBearerToken(string host, string port , string username, string password)
         beast::http::request<beast::http::string_body> req{beast::http::verb::post, target, version};
         req.set(beast::http::field::host, host);
         req.set(beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-        req.set(beast::http::field::content_type, "application/json");
-        req.body() = json_body;
+        req.set(beast::http::field::content_type, "application/x-www-form-urlencoded");
+        req.body() = form_body;
         req.prepare_payload();
 
         // Send request
@@ -96,40 +124,16 @@ json getBearerToken(string host, string port , string username, string password)
 
 
 
-json getHierarchy(string host , string port , string bearerToken) {
+json getHierarchy(string host , string port , string bearerToken , string json_body , string target) {
 
 try{
     // std::string host = host;
     // std::string port = port;
-    std::string target = "/api/GetOpcUaHierarchy";
     int version = 11;
 
-    // JSON body
-    std::string json_body = R"(
-    {
-   
-        "orgId": 0,
-        "roleId": "",
-        "userId": 0,
-        "moduleId": 0,
-        "userType": "",
-        "requestDateTime": "2024-12-26T08:16:05.629Z",
-        "ipAddress": "",
-        "originName": "",
-        "filterModel": {
-            
-            "customValue": "all"
-        },
-
-        "data": {
-            "nodeId": "ND02"
-        }
-    }
-    )";
-
     // Set up I/O context and connection
-    tcp::resolver resolver(ioc);
-    beast::tcp_stream stream(ioc);
+    tcp::resolver resolver(http_ioc);
+    beast::tcp_stream stream(http_ioc);
 
     // Resolve and connect
     auto const results = resolver.resolve(host, port);
@@ -173,11 +177,64 @@ try{
     
 }
 
-vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearerToken) {
+
+json
+GetAllOrganizationList(string host, string port, string bearerToken, string json_body,
+             string target) {
+
+    try {
+        int version = 11;
+
+        // Set up I/O context and connection
+        tcp::resolver resolver(http_ioc);
+        beast::tcp_stream stream(http_ioc);
+
+        // Resolve and connect
+        auto const results = resolver.resolve(host, port);
+        stream.connect(results);
+
+        // Build HTTP POST request
+        beast::http::request<beast::http::string_body> req{beast::http::verb::post,
+                                                           target, version};
+        req.set(beast::http::field::host, host);
+        req.set(beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+        req.set(beast::http::field::content_type, "application/json");
+
+        // Set Bearer Authorization header
+        req.set(beast::http::field::authorization, "Bearer " + bearerToken);
+
+        req.body() = json_body;
+        req.prepare_payload();
+
+        // Send request
+        beast::http::write(stream, req);
+
+        // Get response
+        beast::flat_buffer buffer;
+        beast::http::response<beast::http::string_body> res;
+        beast::http::read(stream, buffer, res);
+
+        // Output response
+
+        log(res.body().c_str(), LogLevel::DEBUG);
+        json result = json::parse(res.body());
+        // Shutdown connection
+        beast::error_code ec;
+        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+
+        return result;
+
+    } catch(const std::exception &e) {
+        log("GetAllOrganizationList Error: " + string(e.what()), LogLevel::ERRORS);
+        throw;  // Re-throw to allow retry logic to handle it
+    }
+}
+
+vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearerToken, string json_body, string target) {
 
     vector<ServerInfoO> servers;
     if(!bearerToken.empty()) {
-        auto futureResponse = std::async(std::launch::async, getHierarchy, host, port,bearerToken);
+        auto futureResponse = std::async(std::launch::async, getHierarchy, host, port,bearerToken, json_body, target);
         json response = futureResponse.get();
 
         if(response.contains("servers") && response["servers"].is_array()) {
@@ -251,6 +308,16 @@ vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearer
                                         mappedInfo.name = mappedTag["name"].get<string>();
                                         mappedInfo.namespaces =
                                             mappedTag["namespace"].get<string>();
+
+
+                                        mappedInfo.scaling = tagInfo.scaling;
+                                        mappedInfo.rawMin = tagInfo.rawMin;
+                                        mappedInfo.rawMax = tagInfo.rawMax;
+                                        mappedInfo.scaleMin = tagInfo.scaleMin;
+                                        mappedInfo.scaleMax = tagInfo.scaleMax;
+                                        mappedInfo.sourceDatatype = tagInfo.sourceDatatype;
+                                        mappedInfo.enableExpression = tagInfo.enableExpression;
+                                        mappedInfo.expression = tagInfo.expression;
                                         //mappedInfo.isSimulationProfile =
                                         //    mappedTag["isSimulationProfile"].get<bool>();
                                         //mappedInfo.isLogging =
@@ -290,72 +357,6 @@ vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearer
                     }
                     serverInfo.groups = groups;
                 }
-
-                // if(item.contains("tags") && item["tags"].is_array()) {
-                //     vector<TagInfo> serverTags;
-                //     for(const auto &tagItem : item["tags"]) {
-                //         TagInfo tagInfo;
-
-                //         tagInfo.scaling = tagItem["scaling"].get<bool>();
-                //         tagInfo.rawMin = tagItem["rawMin"].get<double>();
-                //         tagInfo.rawMax = tagItem["rawMax"].get<double>();
-                //         tagInfo.scaleMin = tagItem["scaleMin"].get<double>();
-                //         tagInfo.scaleMax = tagItem["scaleMax"].get<double>();
-                //         tagInfo.enableExpression =
-                //         tagItem["enableExpression"].get<bool>();
-                //         tagInfo.expression = tagItem["expression"].get<string>();
-
-                //         if(tagItem.contains("namespaceNodeID") && tagItem["namespaceNodeID"].is_string()) {
-                //             tagInfo.namespaceNodeID = tagItem["namespaceNodeID"].get<string>();
-                //         }
-                //         if(tagItem.contains("dataPointId") && tagItem["dataPointId"].is_number_integer()) {
-                //             tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
-                //         }
-                //         if(tagItem.contains("name") && tagItem["name"].is_string()) {
-                //         tagInfo.name = tagItem["name"].get<string>();
-                //         }
-                //         if(tagItem.contains("nodeId") && tagItem["nodeId"].is_string()) {
-                //             tagInfo.nodeId = tagItem["nodeId"].get<string>();
-                //         }
-                //         if(tagItem.contains("typeId") && tagItem["typeId"].is_string()) {
-                //             tagInfo.typeId = tagItem["typeId"].get<string>();
-                //         }
-                //         if(tagItem.contains("parentId") && tagItem["parentId"].is_string()) {
-                //             tagInfo.parentId = tagItem["parentId"].get<string>();
-                //         }
-
-                //         if(tagItem.contains("mappedInfospaceTags") &&
-                //            tagItem["mappedInfospaceTags"].is_array()) {
-                //             vector<MappedInfospaceTag> mappedTags;
-                //             for(const auto &mappedTag : tagItem["mappedInfospaceTags"]) {
-                //                 MappedInfospaceTag mappedInfo;
-                //                 mappedInfo.id = mappedTag["id"].get<int>();
-                //                 mappedInfo.tagId = mappedTag["tagId"].get<int>();                                
-                //                 mappedInfo.name = mappedTag["name"].get<string>();
-                //                 mappedInfo.namespaces =
-                //                     mappedTag["namespace"].get<string>();
-                //                 mappedInfo.isSimulationProfile =
-                //                     mappedTag["isSimulationProfile"].get<bool>();
-                //                 mappedInfo.isLogging = mappedTag["isLogging"].get<bool>();
-                //                 mappedInfo.isVirtual = mappedTag["isVirtual"].get<bool>();
-                                
-                //                 //name to namespace 
-                //                 // if(tagItem.contains("namespaceNodeID") && tagItem["namespaceNodeID"].is_string() && tagInfo.namespaceNodeID.has_value()) {
-                //                     pair<string, string> NodePair = {tagInfo.name.value(), serverInfo.endpointUrl};
-                //                     Mapping[mappedInfo.tagId] = NodePair;
-
-                //                 // }
-                //                 mappedTags.push_back(mappedInfo);
-                //             }
-                //             tagInfo.mappedInfospaceTags = mappedTags;
-                //         }
-
-                //         serverTags.push_back(tagInfo);
-                //     }
-                //     serverInfo.tags = serverTags;
-                // }
-
-
                 servers.push_back(serverInfo);
             }
         }
@@ -369,6 +370,268 @@ vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearer
 
     return servers;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToken, string json_body, string target) {
+    vector<AlarmConfig> alarms;
+    if(!bearerToken.empty()) {
+        try {
+        auto futureResponse = std::async(std::launch::async, getHierarchy, host, port,bearerToken, json_body, target);
+        json response = futureResponse.get();
+
+        // Check for 'data' field (actual API response format)
+        if(response.contains("data") && response["data"].is_array()) {
+            for(const auto &item : response["data"]) {
+                try {
+                AlarmConfig alarmConfig;
+                alarmConfig.id = item.contains("id") ? item["id"].get<int>() : 0;
+                alarmConfig.name = item.contains("name") ? item["name"].get<string>() : "";
+                alarmConfig.shortCode = item.contains("shortCode") ? item["shortCode"].get<string>() : "";
+                alarmConfig.description = item.contains("description") ? item["description"].get<string>() : "";
+                alarmConfig.priority = item.contains("priority") ? item["priority"].get<string>() : "";
+                alarmConfig.severityOffset = (item.contains("severityOffset") && !item["severityOffset"].is_null())
+                    ? item["severityOffset"].get<int>() : 0;
+                alarmConfig.category = (item.contains("category") && !item["category"].is_null())
+                    ? item["category"].get<string>() : "";
+                alarmConfig.subCategory = (item.contains("subCategory") && !item["subCategory"].is_null())
+                    ? item["subCategory"].get<string>() : "";
+                alarmConfig.alarmSourceType = item.contains("alarmSourceType") ? item["alarmSourceType"].get<string>() : "";
+                alarmConfig.areaDeviceName = item.contains("areaDeviceName") ? item["areaDeviceName"].get<string>() : "";
+                alarmConfig.message = item.contains("message") ? item["message"].get<string>() : "";
+                // alarmConfig.state = item["state"].get<string>();
+                alarmConfig.sopProcedure = item.contains("sopProcedure") ? item["sopProcedure"].get<string>() : "";
+                alarmConfig.annunciation = item.contains("annunciation") ? item["annunciation"].get<string>() : "";
+                alarmConfig.ackType = item.contains("ackType") ? item["ackType"].get<string>() : "";
+                
+                // API returns booleans, but struct stores as strings - check contains() first
+                if(item.contains("bedgeNotification")) {
+                    alarmConfig.bedgeNotification = item["bedgeNotification"].is_boolean() 
+                        ? (item["bedgeNotification"].get<bool>() ? "true" : "false")
+                        : item["bedgeNotification"].get<string>();
+                } else {
+                    alarmConfig.bedgeNotification = "false";
+                }
+                if(item.contains("smsNotification")) {
+                    alarmConfig.smsNotification = item["smsNotification"].is_boolean()
+                        ? (item["smsNotification"].get<bool>() ? "true" : "false")
+                        : item["smsNotification"].get<string>();
+                } else {
+                    alarmConfig.smsNotification = "false";
+                }
+                if(item.contains("emailNotification")) {
+                    alarmConfig.emailNotification = item["emailNotification"].is_boolean()
+                        ? (item["emailNotification"].get<bool>() ? "true" : "false")
+                        : item["emailNotification"].get<string>();
+                } else {
+                    alarmConfig.emailNotification = "false";
+                }
+                // alarmConfig.whatsapNotification = item["whatsapNotification"].get<string>();
+                alarmConfig.reset = item.contains("reset") ? item["reset"].get<string>() : "";
+                alarmConfig.escalationWF = item.contains("escalationWF") ? item["escalationWF"].get<string>() : "";
+                alarmConfig.suppression = item.contains("suppression") ? item["suppression"].get<string>() : "";
+                // alarmConfig.enableLogging = item["enableLogging"].get<string>();
+                alarmConfig.loggingFreq = item.contains("loggingFreq") ? item["loggingFreq"].get<string>() : "";
+                alarmConfig.purging = item.contains("purging") ? item["purging"].get<string>() : "";
+                alarmConfig.orgId = item.contains("orgId") ? item["orgId"].get<int>() : 0;
+                // alarmConfig.removeIds = item["removeIds"].get<string>();
+                
+                // API returns "alarmTriggers" as an OBJECT, not array
+                if(item.contains("alarmTriggers") && item["alarmTriggers"].is_object()) {
+                    vector<AlarmTrigger> alarmTriggers;
+                    const auto &triggerItem = item["alarmTriggers"];
+                    try {
+                        AlarmTrigger alarmTrigger;
+                        // Check contains() FIRST to avoid assertion failures
+                        alarmTrigger.id = (!triggerItem.contains("id") || triggerItem["id"].is_null()) 
+                            ? 0 : triggerItem["id"].get<int>();
+                        // alarmTrigger.alarmShortCode = triggerItem["alarmShortCode"].get<string>();
+                        alarmTrigger.applicableTagId = (!triggerItem.contains("applicableTagId") || triggerItem["applicableTagId"].is_null()) 
+                            ? "" : triggerItem["applicableTagId"].get<string>();
+                        alarmTrigger.applicableTagName = (!triggerItem.contains("applicableTagName") || triggerItem["applicableTagName"].is_null()) 
+                            ? "" : triggerItem["applicableTagName"].get<string>();
+                        alarmTrigger.tagType = (!triggerItem.contains("tagType") || triggerItem["tagType"].is_null()) 
+                            ? "" : triggerItem["tagType"].get<string>();
+                        
+                        // Handle potentially null double values - check contains() FIRST
+                        alarmTrigger.hiHi = (!triggerItem.contains("hiHi") || triggerItem["hiHi"].is_null()) 
+                            ? 0.0 : triggerItem["hiHi"].get<double>();
+                        alarmTrigger.hi = (!triggerItem.contains("hi") || triggerItem["hi"].is_null()) 
+                            ? 0.0 : triggerItem["hi"].get<double>();
+                        alarmTrigger.lo = (!triggerItem.contains("lo") || triggerItem["lo"].is_null()) 
+                            ? 0.0 : triggerItem["lo"].get<double>();
+                        alarmTrigger.loLo = (!triggerItem.contains("loLo") || triggerItem["loLo"].is_null()) 
+                            ? 0.0 : triggerItem["loLo"].get<double>();
+                        
+                        // Handle potentially null or missing string/int values - check contains() FIRST
+                        alarmTrigger.state = (!triggerItem.contains("state") || triggerItem["state"].is_null()) 
+                            ? "" : triggerItem["state"].get<string>();
+                        alarmTrigger.activationDelay = (!triggerItem.contains("activationDelay") || triggerItem["activationDelay"].is_null()) 
+                            ? 0 : triggerItem["activationDelay"].get<int>();
+                        alarmTrigger.hysteresisOrResetDelay = (!triggerItem.contains("hysteresisOrResetDelay") || triggerItem["hysteresisOrResetDelay"].is_null()) 
+                            ? 0 : triggerItem["hysteresisOrResetDelay"].get<int>();
+                        alarmTrigger.evaluatedOn = (!triggerItem.contains("evaluatedOn") || triggerItem["evaluatedOn"].is_null()) 
+                            ? "" : triggerItem["evaluatedOn"].get<string>();
+                        alarmTrigger.evaluationInterval = (!triggerItem.contains("evaluationInterval") || triggerItem["evaluationInterval"].is_null()) 
+                            ? "" : triggerItem["evaluationInterval"].get<string>();
+                        // alarmTrigger.activationType = triggerItem["activationType"].get<string>();
+                        // alarmTrigger.distance = triggerItem["distance"].get<double>();
+                        
+                        // Handle 'value' field - can be missing, null, empty string, or number
+                        if(triggerItem.contains("value") && !triggerItem["value"].is_null()) {
+                            if(triggerItem["value"].is_string()) {
+                                std::string valStr = triggerItem["value"].get<std::string>();
+                                if(valStr.empty()) {
+                                    alarmTrigger.value = 0.0;
+                                } else {
+                                    try {
+                                        alarmTrigger.value = std::stod(valStr);
+                                    } catch(...) {
+                                        alarmTrigger.value = 0.0;
+                                    }
+                                }
+                            } else if(triggerItem["value"].is_number()) {
+                                alarmTrigger.value = triggerItem["value"].get<double>();
+                            } else {
+                                alarmTrigger.value = 0.0;
+                            }
+                        } else {
+                            alarmTrigger.value = 0.0;
+                        }
+                        alarmTriggers.push_back(alarmTrigger);
+                    } catch(const std::exception &e) {
+                        log("Error parsing alarm trigger: " + std::string(e.what()), LogLevel::ERRORS);
+                    }
+                    alarmConfig.alarmTriggers = alarmTriggers;
+                }
+                
+                if(item.contains("alarmEmitter") && item["alarmEmitter"].is_array()) {
+                    vector<AlarmEmitter> alarmEmitters;
+                    for(const auto &emitterItem : item["alarmEmitter"]) {
+                        try {
+                        AlarmEmitter alarmEmitter;
+                        // Check contains() FIRST to avoid assertion failures
+                        alarmEmitter.id = (!emitterItem.contains("id") || emitterItem["id"].is_null()) 
+                            ? 0 : emitterItem["id"].get<int>();
+                        alarmEmitter.alarmShortcode = (!emitterItem.contains("alarmShortcode") || emitterItem["alarmShortcode"].is_null()) 
+                            ? "" : emitterItem["alarmShortcode"].get<string>();
+                        alarmEmitter.emitterNode = (!emitterItem.contains("emitterNode") || emitterItem["emitterNode"].is_null()) 
+                            ? 0 : emitterItem["emitterNode"].get<int>();
+                        alarmEmitter.emitterNodeName = (!emitterItem.contains("emitterNodeName") || emitterItem["emitterNodeName"].is_null()) 
+                            ? "" : emitterItem["emitterNodeName"].get<string>();
+                        alarmEmitter.orgId = (!emitterItem.contains("orgId") || emitterItem["orgId"].is_null()) 
+                            ? 0 : emitterItem["orgId"].get<int>();
+                        // alarmEmitter.createdBy = emitterItem["createdBy"].get<string>();
+                        // alarmEmitter.createdOn = emitterItem["createdOn"].get<string>();
+                        // alarmEmitter.updatedBy = emitterItem["updatedBy"].get<string>();
+                        // alarmEmitter.updatedOn = emitterItem["updatedOn"].get<string>();
+                        // alarmEmitter.isDeleted = emitterItem["isDeleted"].get<string>();
+                        // alarmEmitter.deletedBy = emitterItem["deletedBy"].get<string>();
+                        // alarmEmitter.deletedOn = emitterItem["deletedOn"].get<string>();
+                        alarmEmitters.push_back(alarmEmitter);
+                        } catch(const std::exception &e) {
+                            log("Error parsing alarm emitter: " + std::string(e.what()), LogLevel::ERRORS);
+                            // Skip this emitter and continue with the next
+                            continue;
+                        }
+                    }
+                    alarmConfig.alarmEmitters = alarmEmitters;
+                } else {
+                    log("Alarm '" + alarmConfig.name + "' has no emitters", LogLevel::ERRORS);
+                }
+                alarms.push_back(alarmConfig);
+                } catch(const std::exception &e) {
+                    log("Error parsing alarm config item: " + std::string(e.what()), LogLevel::ERRORS);
+                    // Skip this alarm and continue with the next
+                    continue;
+                }
+            }
+        } 
+        // else if(response.contains("alarmConfigs") && response["alarmConfigs"].is_array()) {
+        //     // Fallback for old API format
+        //     log("Found 'alarmConfigs' field (old format) with " + std::to_string(response["alarmConfigs"].size()) + " alarm(s)", LogLevel::INFO);
+        // } 
+        else {
+            log("ERROR: No 'data' or 'alarmConfigs' field found in API response!", LogLevel::ERRORS);
+            log("Response keys: " + response.dump(), LogLevel::DEBUG);
+        }
+        } catch(const std::exception &e) {
+            log("Error in ParseAlarmConfig: " + std::string(e.what()), LogLevel::ERRORS);
+            // Return empty vector on error rather than crashing
+        }
+    }
+    return alarms;
+}
+
+
+
+
+
+vector<OrgConfig>
+ParseOrgConfig(string host, string port, string bearerToken, string json_body,
+    string target) {
+    vector<OrgConfig> orgConfig;
+
+    if(!bearerToken.empty()) {
+        try {
+            auto futureResponse = std::async(std::launch::async, GetAllOrganizationList,
+                                             host, port,
+                                             bearerToken, json_body, target);
+            json response = futureResponse.get();
+
+            // Check for 'data' field (actual API response format)
+            if(response.contains("data") && response["data"].is_array()) {
+                for(const auto &item : response["data"]) {
+                    try {
+                        OrgConfig orgs;
+                        orgs.id = item.contains("id") ? item["id"].get<int>() : 0;
+                        orgs.name = item.contains("name") ? item["name"].get<string>() : "";
+                        orgs.shortCode = item.contains("shortCode") ? item["shortCode"].get<string>() : "";
+                        orgs.emailPrimary = item.contains("emailPrimary") ? item["emailPrimary"].get<string>() : "";
+                        orgs.emailSecondary = item.contains("emailSecondary") ? item["emailSecondary"].get<string>() : "";
+                        orgs.contactNoPrimary = item.contains("contactNoPrimary") ? item["contactNoPrimary"].get<string>() : "";
+                        orgs.contactNoSecondary = item.contains("contactNoSecondary") ? item["contactNoSecondary"].get<string>() : "";
+                        orgs.remark = item.contains("remark") ? item["remark"].get<string>() : "";
+                        orgs.displayName = item.contains("displayName") ? item["displayName"].get<string>() : "";
+                        orgs.organisationType = item.contains("organisationType") ? item["organisationType"].get<string>() : "";
+                        orgs.tenancyType = item.contains("tenancyType") ? item["tenancyType"].get<string>() : "";
+                        orgs.profileId = item.contains("profileId") ? item["profileId"].get<int>() : 0;
+                        orgs.orgId = item.contains("orgId") ? item["orgId"].get<int>() : 0;
+                        orgs.isCopyProfile = item.contains("isCopyProfile") ? item["isCopyProfile"].get<bool>() : false;
+
+                       
+                        orgConfig.push_back(orgs);
+                    } catch(const std::exception &e) {
+                        log("Error parsing org config item: " + std::string(e.what()),
+                            LogLevel::ERRORS);
+                        // Skip this alarm and continue with the next
+                        continue;
+                    }
+                }
+            }
+            else {
+                log("ERROR: No 'data' or 'orgs' field found in API response!",
+                    LogLevel::ERRORS);
+                log("Response keys: " + response.dump(), LogLevel::DEBUG);
+            }
+        } catch(const std::exception &e) {
+            log("Error in ParseAlarmConfig: " + std::string(e.what()), LogLevel::ERRORS);
+            // Return empty vector on error rather than crashing
+        }
+    }
+    return orgConfig;
+}
+
 
 
 std::pair<int, std::string> extractNsAndValue(const std::string& input) {

@@ -1,4 +1,5 @@
 #include "SqliteQueueService.h"
+#include "Logger.h"
 #include <iostream>
 #include <chrono>
 #include <iomanip>
@@ -62,9 +63,8 @@ void SqliteQueueService::SetApiUrl(const std::string& url) {
     apiUrl_ = url;
 }
 
-void SqliteQueueService::SetApiAuth(const std::string& user, const std::string& pass) {
-    apiUser_ = user;
-    apiPass_ = pass;
+void SqliteQueueService::SetApiAuth(const std::string& bearerToken) {
+    apiBearerToken_ = bearerToken;
 }
 
 void SqliteQueueService::SetApiMetadata(const nlohmann::json& metadata) {
@@ -491,14 +491,16 @@ void SqliteQueueService::PublishLatestValuesToMqtt(const std::function<void(cons
 bool SqliteQueueService::SendToApi(const std::string& jsonPayload) {
     try {
         std::cout << "[SQLite] SendToApi called with payload size: " << jsonPayload.size() << " bytes" << std::endl;
+        log("[SQLite] SendToApi called with payload size: " + std::to_string(jsonPayload.size()) + " bytes", LogLevel::INFO);
         
         if(apiUrl_.empty()) {
             std::cerr << "[SQLite] API URL not set" << std::endl;
+            log("[SQLite] API URL not set", LogLevel::ERRORS);
             return false;
         }
         
         std::cout << "[SQLite] Sending API request to: " << apiUrl_ << std::endl;
-        
+        log("[SQLite] Sending API request to: " + apiUrl_, LogLevel::INFO);
         // parse apiUrl_ as http://host:port/path
         std::string scheme, host, port, target;
         if(apiUrl_.rfind("http://",0)==0) {
@@ -508,16 +510,19 @@ bool SqliteQueueService::SendToApi(const std::string& jsonPayload) {
             std::string hostPort = (slash==std::string::npos)?rest:rest.substr(0,slash);
             target = (slash==std::string::npos)?"/":rest.substr(slash);
             size_t colon=hostPort.find(':');
-            if(colon!=std::string::npos) {host=hostPort.substr(0,colon); port=hostPort.substr(colon+1);} else {host=hostPort; port="80";}
+            if(colon!=std::string::npos) {host=hostPort.substr(0,colon); port=hostPort.substr(colon+1);} else {host=hostPort; port="5128";}
         } else if(apiUrl_.rfind("https://",0)==0) {
             std::cerr << "[SQLite] HTTPS not supported in this implementation" << std::endl;
+            log("[SQLite] HTTPS not supported in this implementation", LogLevel::ERRORS);
             return false;
         } else {
             std::cerr << "[SQLite] Only http scheme supported in this example" << std::endl;
+            log("[SQLite] Only http scheme supported in this example", LogLevel::ERRORS);
             return false;
         }
         
         std::cout << "[SQLite] Parsed URL - Host: " << host << ", Port: " << port << ", Target: " << target << std::endl;
+        log("[SQLite] Parsed URL - Host: " + host + ", Port: " + port + ", Target: " + target, LogLevel::INFO);
         namespace beast=boost::beast;
         namespace http=beast::http;
         namespace net=boost::asio;
@@ -529,16 +534,14 @@ bool SqliteQueueService::SendToApi(const std::string& jsonPayload) {
         http::request<http::string_body> req{http::verb::post, target, 11};
         req.set(http::field::host, host);
         req.set(http::field::content_type, "application/json");
-        if(!apiUser_.empty()) {
-            std::string auth=apiUser_+":"+apiPass_;
-            std::string encoded = Base64Encode(auth);
-            req.set(http::field::authorization, "Basic "+encoded);
-        }
+        req.set(beast::http::field::authorization, "Bearer " + apiBearerToken_);
         req.body() = jsonPayload;
         req.prepare_payload();
         
         std::cout << "[SQLite] Request prepared with " << jsonPayload.size() << " bytes payload" << std::endl;
+        log("[SQLite] Request prepared with " + std::to_string(jsonPayload.size()) + " bytes payload", LogLevel::INFO);
         std::cout << "[SQLite] Sending HTTP request..." << std::endl;
+        log("[SQLite] Sending HTTP request...", LogLevel::INFO);
         http::write(stream, req);
         beast::flat_buffer buffer;
         http::response<http::string_body> res;
@@ -547,17 +550,21 @@ bool SqliteQueueService::SendToApi(const std::string& jsonPayload) {
         
         int statusCode = res.result_int();
         std::cout << "[SQLite] API response status: " << statusCode << std::endl;
-        
+        log("[SQLite] API response status: " + std::to_string(statusCode), LogLevel::INFO);
         if (statusCode >= 200 && statusCode < 300) {
             std::cout << "[SQLite] API call successful" << std::endl;
+            log("[SQLite] API call successful", LogLevel::INFO);
             return true;
         } else {
             std::cerr << "[SQLite] API call failed with status: " << statusCode << std::endl;
+            log("[SQLite] API call failed with status: " + std::to_string(statusCode), LogLevel::ERRORS);
             std::cerr << "[SQLite] Response body: " << res.body() << std::endl;
+            log("[SQLite] Response body: " + res.body(), LogLevel::ERRORS);
             return false;
         }
     } catch(std::exception const& e) {
         std::cerr << "[SQLite] SendToApi exception: " << e.what() << std::endl;
+        log("[SQLite] SendToApi exception: " + std::string(e.what()), LogLevel::ERRORS);
         return false;
     }
 }
