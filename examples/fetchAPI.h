@@ -9,6 +9,8 @@
 #include <nlohmann/json.hpp>
 #include "structs.h" // Assumed to contain ServerInfoO and other related structs
 #include "AlarmConfig.h" // Contains AlarmConfig, AlarmTrigger, AlarmEmitter structs
+#include "OrgConfig.h"
+#include "UserProfile.h"
 
 // Forward declare a dedicated io_context for HTTP/beast operations
 namespace as = boost::asio;
@@ -58,6 +60,12 @@ json getHierarchy(std::string host, std::string port, std::string bearerToken, s
 std::vector<ServerInfoO> ParseServerHierarchy(std::string host, std::string port, std::string bearerToken , std::string json_body, std::string target);
 
 std::vector<AlarmConfig> ParseAlarmConfig(std::string host, std::string port, std::string bearerToken, std::string json_body, std::string target);
+
+std::vector<OrgConfig> ParseOrgConfig(std::string host, std::string port, std::string bearerToken, std::string json_body, std::string target);
+
+UserProfile ParseUserProfile(std::string host, std::string port, std::string bearerToken, 
+                            std::string json_body, std::string target);
+
 /**
  * @brief A utility function to extract the namespace index and identifier from an OPC UA node string.
  *

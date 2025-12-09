@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <nlohmann/json.hpp> // Added for json type in function declaration
 
 /**
@@ -38,6 +39,18 @@ struct MonitoredNodeAlarmInfo {
     bool callbackSetup = false; // Flag to track if method callback is already set up
 };
 
+/* Map trigger topic (applicableTagName) to list of alarm keys (emitter+alarmName) */
+struct TriggerToAlarmMapping {
+    std::string triggerTopic;           // MQTT topic from applicableTagName
+    std::string alarmKey;               // Key in g_alarmByKey (emitterNodeName + "-" + AlarmName)
+    int triggerId;   
+    int alarmId;
+    int alarmInstanceId;
+};
+
+extern std::unordered_map<std::string, std::vector<TriggerToAlarmMapping>> g_triggerToAlarmMap;
+extern std::mutex g_alarmMutex;
+
 /**
  * @brief A global map to store and access alarm information for each monitored process node.
  *
@@ -66,5 +79,34 @@ UA_StatusCode createAndLinkExclusiveLimitAlarm(UA_Server *server,
                                              UA_NodeId *outAlarmInstanceId);
 
 
-#endif // ALARM_HANDLER_H
+// --- Alarm Method Callbacks (Exposed for Multi-Tenancy) ---
 
+UA_StatusCode customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
+                                      void *sessionContext, const UA_NodeId *methodId,
+                                      void *methodContext, const UA_NodeId *objectId,
+                                      void *objectContext, size_t inputSize,
+                                      const UA_Variant *input, size_t outputSize,
+                                      UA_Variant *output);
+
+UA_StatusCode customConfirmCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
+                                  const UA_NodeId *methodId, void *methodContext,
+                                  const UA_NodeId *objectId, void *objectContext, size_t inputSize,
+                                  const UA_Variant *input, size_t outputSize, UA_Variant *output);
+
+UA_StatusCode customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
+                                     void *sessionContext, const UA_NodeId *methodId,
+                                     void *methodContext, const UA_NodeId *objectId,
+                                     void *objectContext, size_t inputSize, const UA_Variant *input,
+                                     size_t outputSize, UA_Variant *output);
+
+UA_StatusCode customEnableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
+                                 const UA_NodeId *methodId, void *methodContext,
+                                 const UA_NodeId *objectId, void *objectContext, size_t inputSize,
+                                 const UA_Variant *input, size_t outputSize, UA_Variant *output);
+
+UA_StatusCode customDisableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
+                                  const UA_NodeId *methodId, void *methodContext,
+                                  const UA_NodeId *objectId, void *objectContext, size_t inputSize,
+                                  const UA_Variant *input, size_t outputSize, UA_Variant *output);
+
+#endif // ALARM_HANDLER_H

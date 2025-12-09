@@ -41,6 +41,7 @@
 #include "AlarmConfig.h"
 #include "Logger.h"
 #include "fetchAPI.h"
+#include "SessionManager.h"
 #include <async_mqtt/all.hpp>
 #include <async_mqtt/asio_bind/predefined_layer/mqtts.hpp>
 #include <async_mqtt/asio_bind/predefined_layer/ws.hpp>
@@ -53,6 +54,11 @@
 #include <boost/beast/version.hpp>
 #include <nlohmann/json.hpp>
 #include "alarm_enums.h"
+#include "AccessControl.h"
+
+#ifdef _WIN32
+#include <direct.h>  // For _getcwd
+#endif
 
 using namespace std;
 namespace as = boost::asio;
@@ -69,17 +75,11 @@ static std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
 
 
 // ---------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------
 /* Map trigger topic (applicableTagName) to list of alarm keys (emitter+alarmName) */
-struct TriggerToAlarmMapping {
-    std::string triggerTopic;           // MQTT topic from applicableTagName
-    std::string alarmKey;               // Key in g_alarmByKey (emitterNodeName + "-" + AlarmName)
-    int triggerId;   
-    int alarmId;
-    int alarmInstanceId;
-};
+// TriggerToAlarmMapping struct moved to AandC.h
 
-
-static std::unordered_map<std::string, std::vector<TriggerToAlarmMapping>> g_triggerToAlarmMap;
+std::unordered_map<std::string, std::vector<TriggerToAlarmMapping>> g_triggerToAlarmMap;
 
 // ----------------------------------------------------------------------------------------------------------------
 
@@ -199,6 +199,280 @@ struct BranchState {
 
 // Map: alarmKey → (GUID → BranchState)
 static std::unordered_map<std::string, std::unordered_map<std::string, BranchState>> g_branchStates;
+
+// ============================================================================
+// MULTI-TENANCY: Global Session Manager
+// ============================================================================
+SessionManager g_sessionManager;
+
+// Store API credentials and org list globally for worker threads and auth
+static std::string g_bearerToken;
+static std::string g_apiHost;
+static std::string g_apiPort;
+static std::string g_authUsername;  // From appsettings.json Authorization section
+static std::string g_authPassword;  // From appsettings.json Authorization section
+static std::vector<OrgConfig> g_organizations;  // List of all organizations
+static UA_Server* g_server = nullptr;
+
+/**
+ * Extract organization ShortCode from endpoint URL
+ * Example: "opc.tcp://0.0.0.0:53531/PLANT01" -> "PLANT01"
+ */
+static std::string extractShortCodeFromEndpoint(const UA_String* endpointUrl) {
+    if(!endpointUrl || endpointUrl->length == 0) {
+        return "";
+    }
+    
+    std::string url((char*)endpointUrl->data, endpointUrl->length);
+    
+    // Find last slash to get path component
+    size_t lastSlash = url.find_last_of('/');
+    if(lastSlash != std::string::npos && lastSlash + 1 < url.length()) {
+        return url.substr(lastSlash + 1);
+    }
+    
+    return ""; // No path component found
+}
+
+/*
+ * Session Open Callback - DISABLED
+ * NOTE: UA_Server_getSessionParameter doesn't exist in open62541 v1.3
+ * Session management will be implemented via lazy initialization instead
+ */
+// ============================================================================
+// MULTI-TENANCY: Custom Access Control Session Activation
+// ============================================================================
+// This callback is invoked when a new session is activated (client connects).
+// We extract the user's credentials, authenticate via API, get their orgId,
+// and route them to the appropriate worker thread.
+// ============================================================================
+static UA_StatusCode 
+customActivateSession(UA_Server *server,
+                     UA_AccessControl *ac,
+                     const UA_EndpointDescription *endpointDescription,
+                     const UA_ByteString *secureChannelRemoteCertificate,
+                     const UA_NodeId *sessionId,
+                     const UA_ExtensionObject *userIdentityToken,
+                     void **sessionContext) {
+    
+    log("🔑 [ACCESS CONTROL] customActivateSession called!", LogLevel::INFO);
+    
+    // ========================================================================
+    // STEP 1: Extract Username and Password
+    // ========================================================================
+    std::string username;
+    std::string password;
+    bool isAnonymous = true;
+    
+    if(userIdentityToken && userIdentityToken->encoding == UA_EXTENSIONOBJECT_DECODED) {
+        if(userIdentityToken->content.decoded.type == &UA_TYPES[UA_TYPES_USERNAMEIDENTITYTOKEN]) {
+            UA_UserNameIdentityToken *token = 
+                (UA_UserNameIdentityToken*)userIdentityToken->content.decoded.data;
+            
+            if(token->userName.data && token->userName.length > 0) {
+                username = std::string((char*)token->userName.data, token->userName.length);
+                isAnonymous = false;
+            }
+            
+            if(token->password.data && token->password.length > 0) {
+                password = std::string((char*)token->password.data, token->password.length);
+            }
+        }
+    }
+    
+    // Handle anonymous login - use appsettings credentials
+    if(isAnonymous) {
+        log("  Anonymous login detected - using default credentials from appsettings", LogLevel::INFO);
+        username = g_authUsername;  // From appsettings.json
+        password = g_authPassword;  // From appsettings.json
+    } else {
+        log("  User: " + username, LogLevel::INFO);
+    }
+    
+    if(username.empty() || password.empty()) {
+        log("❌ Missing credentials", LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+    
+    // ========================================================================
+    // STEP 2: Get Bearer Token
+    // ========================================================================
+    json tokenResponse;
+    try {
+        tokenResponse = getBearerToken(g_apiHost, g_apiPort, username, password);
+    } catch(const std::exception &e) {
+        log("❌ Bearer token request failed: " + std::string(e.what()), LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+    
+    if(!tokenResponse.contains("access_token")) {
+        log("❌ No access_token in response", LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+    
+    std::string bearerToken = tokenResponse["access_token"].get<std::string>();
+    log("✓ Bearer token acquired", LogLevel::DEBUG);
+    
+    // ========================================================================
+    // STEP 3: Get User Profile to Extract OrgID
+    // ========================================================================
+    UserProfile profile;
+    try {
+        std::string json_body = "{}"; // Empty payload
+        profile = ParseUserProfile(g_apiHost, g_apiPort, 
+                                  bearerToken, json_body, "/api/GetUserProfile");
+    } catch(const std::exception &e) {
+        log("❌ User profile request failed: " + std::string(e.what()), LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+    
+    if(profile.currentOrgId.empty()) {
+        log("❌ No currentOrgId in user profile", LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+    
+    log("✓ User profile: " + profile.displayName + " (OrgID: " + profile.currentOrgId + 
+        ", Org: " + profile.currentOrgName + ")", LogLevel::INFO);
+    
+    // ========================================================================
+    // STEP 4: Find Matching Organization Config
+    // ========================================================================
+    OrgConfig* targetOrg = nullptr;
+    
+    for(auto &org : g_organizations) {
+        // currentOrgId is string, org.id is int - convert for comparison
+        if(std::to_string(org.id) == profile.currentOrgId) {
+            targetOrg = &org;
+            break;
+        }
+    }
+    
+    if(!targetOrg) {
+        log("❌ Organization not found for OrgID: " + profile.currentOrgId, LogLevel::ERRORS);
+        log("  Available orgs: " + std::to_string(g_organizations.size()), LogLevel::DEBUG);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+    
+    log("✓ Matched to organization: " + targetOrg->shortCode + 
+        " (ID: " + std::to_string(targetOrg->id) + ")", LogLevel::INFO);
+    
+    // ========================================================================
+    // STEP 5: Create or Join Worker Thread for This Org
+    // ========================================================================
+    bool registered = g_sessionManager.registerSession(
+        *sessionId,
+        targetOrg->shortCode,
+        server,
+        bearerToken,  // Use user's token, not server's admin token
+        g_apiHost,
+        g_apiPort
+    );
+    
+    if(!registered) {
+        log("❌ Failed to register session for org: " + targetOrg->shortCode, LogLevel::ERRORS);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    
+    log("✅ Session activated for user '" + username + "' → Org '" + targetOrg->shortCode + 
+        "' (Active sessions: " + std::to_string(g_sessionManager.getActiveSessionCount()) + ")",
+        LogLevel::INFO);
+    
+    // TODO: Store user profile for future RBAC implementation
+    // Can add to sessionContext: *sessionContext = new UserProfile(profile);
+    
+    return UA_STATUSCODE_GOOD;
+}
+
+// ============================================================================
+// MULTI-TENANCY: Custom Session Close Callback
+// ============================================================================
+//  Signature matches open62541 v1.4.11 accesscontrol.h line 55-56
+// ============================================================================
+static void
+customCloseSession(UA_Server *server,
+                  UA_AccessControl *ac,
+                  const UA_NodeId *sessionId,
+                  void *sessionContext) {
+    
+    log("🔓 Session closing...", LogLevel::INFO);
+    
+    // Unregister session and cleanup worker thread
+    g_sessionManager.unregisterSession(*sessionId);
+    
+    log("  ✓ Session closed (Active sessions: " + 
+        std::to_string(g_sessionManager.getActiveSessionCount()) + ")", LogLevel::INFO);
+}
+
+// ============================================================================
+// Original session callbacks (COMMENTED OUT - using Access Control instead)
+// ============================================================================
+/*
+static void sessionOpenCallback(UA_Server* server, UA_NodeId* sessionId,
+                               void* sessionContext) {
+    // Check max sessions limit
+    if(g_maxConcurrentSessions > 0 &&
+       g_sessionManager.getActiveSessionCount() >= g_maxConcurrentSessions) {
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                      "Max concurrent sessions (%zu) reached. Session rejected.",
+                      g_maxConcurrentSessions);
+        return;
+    }
+    
+    // Get endpoint URL from session
+    UA_String endpointUrl = UA_STRING_NULL;
+    UA_StatusCode rc = UA_Server_getSessionParameter(server, sessionId,
+                                                     UA_SESSIONPARAMETER_ENDPOINTURL,
+                                                     &endpointUrl);
+    
+    if(rc != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Failed to get endpoint URL from session");
+        return;
+    }
+    
+    std::string shortCode = extractShortCodeFromEndpoint(&endpointUrl);
+    UA_String_clear(&endpointUrl);
+    
+    if(!shortCode.empty() && g_sessionManager.isValidShortCode(shortCode)) {
+        bool registered = g_sessionManager.registerSession(*sessionId, shortCode,
+                                                           server, g_bearerToken,
+                                                           g_apiHost, g_apiPort);
+        if(registered) {
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                       "✓ Session opened for org '%s' (Active sessions: %zu)",
+                       shortCode.c_str(),
+                       g_sessionManager.getActiveSessionCount());
+        } else {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "✗ Failed to register session for org '%s'", shortCode.c_str());
+        }
+    } else {
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                      "Invalid or unknown ShortCode: '%s'\", shortCode.c_str());
+    }
+}
+
+static void sessionCloseCallback(UA_Server* server, UA_NodeId* sessionId,
+                                void* sessionContext) {
+    g_sessionManager.unregisterSession(*sessionId);
+    
+    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+               "✓ Session closed (Active sessions: %zu)",
+               g_sessionManager.getActiveSessionCount());
+}
+*/
+
+/**
+ * Session detection approach: Lazy initialization
+ * Instead of complex session lifecycle tracking, we'll detect and register sessions
+ * when they first interact with the server (via read/write/browse operations).
+ * This is simpler and works with open62541's limited session API.
+ * 
+ * Implementation TODO: Add session detection in read/write/browse callbacks
+ * to register sessions on-demand when clients access org-specific endpoints.
+ */
+// ============================================================================
+
 
 // Define user credentials
 static UA_UsernamePasswordLogin usernamePasswordLogin[2] = {
@@ -840,11 +1114,19 @@ formatNodeId(const UA_NodeId *nodeId) {
 }
 
 static std::string findAlarmKeyForCondition(const UA_NodeId *alarmNodeId) {
+    // 1. Check legacy global map
     for(const auto &kv : g_alarmByKey) {
         if(UA_NodeId_equal(&kv.second, alarmNodeId)) {
             return kv.first;
         }
     }
+    
+    // 2. Check if it's a String NodeId (Multi-tenant)
+    // The alarmKey IS the NodeId string
+    if(alarmNodeId->identifierType == UA_NODEIDTYPE_STRING) {
+        return std::string((char*)alarmNodeId->identifier.string.data, alarmNodeId->identifier.string.length);
+    }
+    
     return "";
 }
 
@@ -901,7 +1183,7 @@ toHex(const UA_ByteString *bs) {
 }
 
 /* Custom Acknowledge method callback */
-static UA_StatusCode
+UA_StatusCode
 customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
                           void *sessionContext, const UA_NodeId *methodId,
                           void *methodContext, const UA_NodeId *objectId,
@@ -1048,7 +1330,7 @@ customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
 }
 
 /* Custom Confirm method callback */
-static UA_StatusCode
+UA_StatusCode
 customConfirmCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
                       const UA_NodeId *methodId, void *methodContext,
                       const UA_NodeId *objectId, void *objectContext, size_t inputSize,
@@ -1157,7 +1439,7 @@ customConfirmCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
 }
 
 /* Custom Enable method callback to publish to MQTT */
-static UA_StatusCode
+UA_StatusCode
 customEnableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
                      const UA_NodeId *methodId, void *methodContext,
                      const UA_NodeId *objectId, void *objectContext, size_t inputSize,
@@ -1232,7 +1514,7 @@ customEnableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessio
 }
 
 /* Custom Disable method callback to publish to MQTT */
-static UA_StatusCode
+UA_StatusCode
 customDisableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
                       const UA_NodeId *methodId, void *methodContext,
                       const UA_NodeId *objectId, void *objectContext, size_t inputSize,
@@ -1307,7 +1589,7 @@ customDisableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
 }
 
 /* Custom AddComment method callback to publish to MQTT */
-static UA_StatusCode
+UA_StatusCode
 customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
                          void *sessionContext, const UA_NodeId *methodId,
                          void *methodContext, const UA_NodeId *objectId,
@@ -1340,6 +1622,7 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
     // 3. Find the specific branch by EventId
     auto branchStateMapIt = g_branchStates.find(alarmKey);
     if(branchStateMapIt != g_branchStates.end()) {
+        // Exact EventId match
         for(const auto &branchPair : branchStateMapIt->second) {
             if(branchPair.second.hasEventId(eventId)) {
                 guid = branchPair.first;
@@ -1348,20 +1631,17 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
                 break;
             }
         }
-    }
-
-    // Fallback: Check if BranchId property on node matches
-    if(guid.empty()) {
-        UA_Variant branchIdVar;
-        UA_Variant_init(&branchIdVar);
-        if(UA_Server_readObjectProperty(server, *objectId,
-                                        UA_QUALIFIEDNAME(0, (char *)"BranchId"),
-                                        &branchIdVar) == UA_STATUSCODE_GOOD) {
-            if(UA_Variant_hasScalarType(&branchIdVar, &UA_TYPES[UA_TYPES_NODEID])) {
-                UA_NodeId *bid = (UA_NodeId *)branchIdVar.data;
-                guid = findGUIDForBranchId(bid, alarmKey);
+        
+        // Fallback: Use most recent branch if exact match not found
+        // (Similar to Confirm callback pattern)
+        if(guid.empty()) {
+            UA_DateTime mostRecentTime = 0;
+            for(const auto &branchPair : branchStateMapIt->second) {
+                if(branchPair.second.receiveTime > mostRecentTime) {
+                    mostRecentTime = branchPair.second.receiveTime;
+                    guid = branchPair.first;
+                }
             }
-            UA_Variant_clear(&branchIdVar);
         }
     }
 
@@ -1378,8 +1658,9 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
 
     if(guid.empty()) {
         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                      "No branch found for EventId");
-        return UA_STATUSCODE_BADNODEIDINVALID;
+                      "No branch found for alarm '%s'",
+                      alarmKey.c_str());
+        return UA_STATUSCODE_BADNOTFOUND;
     }
 
     // 4. Publish Control Request to MQTT (Command & Control Pattern)
@@ -3020,32 +3301,44 @@ mqtt_subscribe_and_update(UA_Server *server, const std::vector<std::string> &top
 
 
 int
-main(int argc, char *argv[]) {
+main(int argc, char **argv) {
+    // Early console output before logging is initialized
+    std::cout << "==================================================" << std::endl;
+    std::cout << "OPC UA Server Starting..." << std::endl;
+    std::cout << "==================================================" << std::endl;
 
+    // Load configuration from appsettings.json
+    std::cout << "Loading configuration from appsettings.json..." << std::endl;
     std::ifstream file("appsettings.json");
-    if(!file.is_open()) {
+    if (!file.is_open()) {
+        std::string cwd;
         std::string cwdStr;
 #ifdef _WIN32
-        char cwd[MAX_PATH];
-        GetCurrentDirectoryA(MAX_PATH, cwd);
-        cwdStr = cwd;
+        char cwdBuf[1024];
+        if(_getcwd(cwdBuf, sizeof(cwdBuf)))
+            cwdStr = std::string(cwdBuf);
+        else
+            cwdStr = "";
 #else
-        char cwd[PATH_MAX];
-        if(getcwd(cwd, sizeof(cwd)))
-            cwdStr = cwd;
+        char cwdBuf[1024];
+        if(getcwd(cwdBuf, sizeof(cwdBuf)))
+            cwdStr = std::string(cwdBuf);
         else
             cwdStr = "";
 #endif
-        log(std::string("Could not open appsettings.json. CWD=") + cwdStr,
-            LogLevel::ERRORS);
+        std::cerr << "ERROR: Could not open appsettings.json. CWD=" << cwdStr << std::endl;
+        std::cerr << "Press Enter to exit..." << std::endl;
+        std::cin.get();
         return 1;
     }
+    std::cout << "✓ Configuration file loaded successfully" << std::endl;
 
     // Parse JSON
     nlohmann::json Settingsconfig;
     file >> Settingsconfig;
 
     // Extract values
+    std::cout << "Extracting configuration values..." << std::endl;
 
     // Extract AppSettings
     std::string applicationEndURL =
@@ -3078,16 +3371,51 @@ main(int argc, char *argv[]) {
     int retentionDays =
         Settingsconfig["Payload"]["OfflineQueueOptions"]["RetentionDays"].get<int>();
 
-    // Global logging control - only enable file logging with --debug
-    g_logging_enabled = false;  // Default: no file logging
+    std::cout << "✓ Configuration parsed successfully" << std::endl;
+    std::cout << "API Host: " << applicationEndURLHost << ":" << applicationEndURLPort << std::endl;
+
+    // Store auth credentials globally for authentication callback
+    g_authUsername = authUsername;
+    g_authPassword = authPassword;
+    g_apiHost = applicationEndURLHost;
+    g_apiPort = std::to_string(applicationEndURLPort);
+
+    // Acquire bearer token for API authentication
+    std::string BearerToken;
+    try {
+        std::cout << "Acquiring bearer token for API authentication..." << std::endl;
+        log("Acquiring bearer token for API authentication...", LogLevel::INFO);
+        json authResponse = getBearerToken(applicationEndURLHost, 
+                                           std::to_string(applicationEndURLPort),
+                                           authUsername, authPassword);
+        
+        if(authResponse.contains("access_token")) {
+            BearerToken = authResponse["access_token"].get<std::string>();
+            std::cout << "✓ Bearer token acquired successfully" << std::endl;
+            log("Bearer token acquired successfully", LogLevel::INFO);
+        } else {
+            std::cerr << "ERROR: Bearer token response missing 'access_token' field" << std::endl;
+            log("Bearer token response missing 'access_token' field", LogLevel::ERRORS);
+            log("Response: " + authResponse.dump(), LogLevel::DEBUG);
+            std::cerr << "Press Enter to exit..." << std::endl;
+            std::cin.get();
+            return EXIT_FAILURE;
+        }
+    } catch(const std::exception& e) {
+        std::cerr << "ERROR: Failed to acquire bearer token: " << e.what() << std::endl;
+        log("Failed to acquire bearer token: " + std::string(e.what()), LogLevel::ERRORS);
+        std::cerr << "Press Enter to exit..." << std::endl;
+        std::cin.get();
+        return EXIT_FAILURE;
+    }
+
+    // Global logging control - DISABLED BY DEFAULT
+    g_logging_enabled = true;   // Keep file logging enabled
+    g_debug = false;             // Disable console debug output by default
 
     if(argc > 1 && std::string(argv[1]) == "--debug") {
         g_debug = true;
-        g_logging_enabled = true;  // Enable file logging in debug mode
-        log("Debug mode enabled - file logging active", LogLevel::INFO);
-    } else {
-        g_debug = false;
-        log("Debug mode disabled - no file logging", LogLevel::DEBUG);
+        log("Debug mode enabled via --debug flag", LogLevel::INFO);
     }
 
     signal(SIGINT, stopHandler);
@@ -3161,26 +3489,89 @@ main(int argc, char *argv[]) {
     //     issuerList, issuerListSize,
     //     revocationList, revocationListSize);
 
+    std::string json_body = R"(
+    {
+        "orgId": 0,
+        "roleId": "",
+        "userId": 0,
+        "moduleId": 0,
+        "userType": "",
+        "requestDateTime": "2024-12-26T08:16:05.629Z",
+        "ipAddress": "",
+        "originName": "",
+        "filterModel": {
+        "pageSize": 10,
+        "totalRows": 0,
+        "currentPage": 1,
+        "searchText": "",
+        "filterRowsCount": 0,
+        "orderType": "A",
+        "orderBy": "id"
+        }
+    }
+    )";
+
+    std::string target = "/api/GetAllOrganizationList";
+
+    vector<OrgConfig> orgs;
+    try {
+        log("Fetching organization list from API...", LogLevel::INFO);
+        orgs = ParseOrgConfig(applicationEndURLHost, std::to_string(applicationEndURLPort), 
+                             BearerToken, json_body, target);
+        log("Successfully fetched " + std::to_string(orgs.size()) + " organizations", LogLevel::INFO);
+    } catch(const std::exception& e) {
+        log("Failed to fetch organization list: " + std::string(e.what()), LogLevel::ERRORS);
+        log("Server will start without multi-tenancy support", LogLevel::INFO);
+        // Continue with empty org list - server will run but without multi-tenant endpoints
+    }
+
+    // ========================================================================
+    // MULTI-TENANCY: Initialize Session Manager
+    // ========================================================================
+    if(!orgs.empty()) {
+        log("Initializing multi-tenancy session manager with " + 
+            std::to_string(orgs.size()) + " organizations", LogLevel::INFO);
+        
+        // Store organizations globally for authentication callback
+        g_organizations = orgs;
+        
+        g_sessionManager.initialize(orgs);
+        
+        // Set global variables for worker threads
+        g_server = server;
+        g_bearerToken = BearerToken;
+        // g_apiHost and g_apiPort already set earlier
+        
+        log("✓ Session manager initialized with " + std::to_string(orgs.size()) + 
+            " organizations", LogLevel::INFO);
+        log("ℹ️ Multi-tenancy: Organizations will load on-demand when accessed", LogLevel::INFO);
+        
+    } else {
+         log("No organizations available - multi-tenancy disabled", LogLevel::INFO);
+    }
+    // ========================================================================
+    
+    
+    // ========================================================================
+    // SERVER CONFIGURATION: Standard Endpoints (Authentication-Based Routing)
+    // ========================================================================
+    
     UA_StatusCode retval = UA_ServerConfig_setDefaultWithSecurityPolicies(
         config, 53531, &certificate, &privateKey, trustList, trustListSize, issuerList,
         issuerListSize, revocationList, revocationListSize);
 
-    if(retval == UA_STATUSCODE_GOOD) {
-        log("Security policies configured successfully", LogLevel::INFO);
-        log("Server will listen on port 53531", LogLevel::DEBUG);
-    } else {
+    if(retval != UA_STATUSCODE_GOOD) {
         log("Failed to configure security policies", LogLevel::ERRORS);
+        return EXIT_FAILURE;
     }
 
-    // if(retval != UA_STATUSCODE_GOOD) {
-    //     UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to set default
-    //     security policies"); goto cleanup;
-    // }
+    log("✓ Server configured with standard security policies", LogLevel::INFO);
+    log("  Authentication-based multi-tenancy enabled", LogLevel::INFO);
+    log("  " + std::to_string(orgs.size()) + " organizations available", LogLevel::INFO);
+    // ========================================================================
 
-    for(size_t i = 0; i < config->endpointsSize; i++) {
-        UA_String_clear(&config->endpoints[i].endpointUrl);
-        config->endpoints[i].endpointUrl = UA_STRING_ALLOC("opc.tcp://0.0.0.0:53531");
-    }
+
+
 
     log("Configured server endpoints", LogLevel::DEBUG);
 
@@ -3215,6 +3606,10 @@ main(int argc, char *argv[]) {
         config, true, NULL, 2, usernamePasswordLogin, myLoginCallback, NULL);
     log("Access control configured with login callback", LogLevel::DEBUG);
 
+    // Setup custom access control for multi-tenancy isolation
+    AccessControl_setup(config);
+    log("Multi-tenancy access control rules applied", LogLevel::INFO);
+
     for(size_t i = 0; i < config->endpointsSize; i++) {
         UA_EndpointDescription *ep = &config->endpoints[i];
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Server Endpoint %zu: %.*s", i,
@@ -3233,54 +3628,10 @@ main(int argc, char *argv[]) {
         }
     }
 
-    //    pqxx::connection c("dbname=postgres user=postgres password=payphone123@007");
-    //    pqxx::work txn(c);
-    //    pqxx::result r = txn.exec("SELECT topic FROM mqtt_topics");
-    //    for (auto row : r) {
-    //        topics.push_back(row[0].c_str());
-    //    }
 
-    // add a variable node to the adresspace
-    UA_VariableAttributes attr = UA_VariableAttributes_default;
-    UA_Int32 myInteger = 42;
-    UA_Variant_setScalarCopy(&attr.value, &myInteger, &UA_TYPES[UA_TYPES_INT32]);
-    attr.description = UA_LOCALIZEDTEXT_ALLOC("en-US", "the answer");
-    attr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "the answer");
-    attr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE |
-                       UA_ACCESSLEVELMASK_HISTORYREAD;
-    attr.historizing = true;
-    UA_NodeId myIntegerNodeId = UA_NODEID_STRING_ALLOC(1, "the.answer");
-    UA_QualifiedName myIntegerName = UA_QUALIFIEDNAME_ALLOC(1, "the answer");
-    UA_NodeId parentNodeId = UA_NS0ID(OBJECTSFOLDER);
-    UA_NodeId parentReferenceNodeId = UA_NS0ID(ORGANIZES);
-    UA_Server_addVariableNode(server, myIntegerNodeId, parentNodeId,
-                              parentReferenceNodeId, myIntegerName, UA_NODEID_NULL, attr,
-                              NULL, NULL);
 
-    // Add a second variable that changes periodically
-    UA_VariableAttributes attr2 = UA_VariableAttributes_default;
-    UA_Double myDouble = 123456;
-    UA_Variant_setScalarCopy(&attr2.value, &myDouble, &UA_TYPES[UA_TYPES_DOUBLE]);
-    attr2.description = UA_LOCALIZEDTEXT_ALLOC("en-US", "counter");
-    attr2.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "counter");
-    attr2.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE |
-                        UA_ACCESSLEVELMASK_HISTORYREAD;
-    attr2.historizing = true;
-
-    UA_NodeId myDoubleNodeId = UA_NODEID_STRING_ALLOC(1, "counter");
-    UA_QualifiedName myDoubleName = UA_QUALIFIEDNAME_ALLOC(1, "counter");
-    UA_Server_addVariableNode(server, myDoubleNodeId, parentNodeId, parentReferenceNodeId,
-                              myDoubleName, UA_NODEID_NULL, attr2, NULL, NULL);
-
-    string BearerToken = "";
-    json token = getBearerToken(
-        applicationEndURLHost, std::to_string(applicationEndURLPort), authUsername,
-        authPassword);  // Call synchronously, since no need for std::async here
-    // Extract access_token
-    if(token.contains("access_token")) {
-        BearerToken = token["access_token"].get<std::string>();
-    }
-
+    // NOTE: BearerToken already acquired earlier (line ~3191)
+    // Duplicate definition removed to avoid redefinition error
 
 
     // Add an ALARM FOLDER INSIDE SERVER THEN ALL NODES WITH HASEVENTSOURCE WILL BE ADDED
@@ -3302,6 +3653,24 @@ main(int argc, char *argv[]) {
     /* Use the Alarms object as the default Event Notifier origin */
     g_eventNotifierNode = areaNodeId;
 
+    // ========================================================================
+    // MULTI-TENANCY: Global topic/alarm fetching DISABLED
+    // ========================================================================
+    // NOTE: In the old single-tenant version, topics and alarms were fetched
+    // globally here with orgId=0. In the new multi-tenant architecture, each
+    // organization's worker thread (SessionWorker.cpp) fetches its own
+    // topics and alarms using the correct org-specific orgId.
+    //
+    // This global initialization code is now commented out to avoid:
+    // 1. Fetching with incorrect orgId=0
+    // 2. Creating global address space that conflicts with per-org namespaces
+    // 3. Duplicate API calls (happens in worker threads)
+    //
+    // All topic/alarm fetching now happens in sessionWorkerThread() with
+    // the correct orgId for each connected organization.
+    // ========================================================================
+
+#if 0  // LEGACY CODE DISABLED - Using #if 0 instead of /* */ for large block
     int count = 0;
     vector<string> topics;
     if(!BearerToken.empty()) {
@@ -3309,7 +3678,7 @@ main(int argc, char *argv[]) {
         std::string json_body = R"(
             {
         
-                "orgId": 0,
+                "orgId": 0,  // ❌ WRONG: This was hardcoded to 0
                 "roleId": "",
                 "userId": 0,
                 "moduleId": 0,
@@ -3765,7 +4134,8 @@ main(int argc, char *argv[]) {
                             // Initialize alarm state using STEALTH MODE to avoid ghost events at creation
                             
                             // 1. Enable the condition (STEALTH MODE)
-                            UA_Boolean enabled = UA_TRUE;
+                            
+                            UA_Boolean enabled = (item.enable == "STS_TRUE") ? UA_TRUE : UA_FALSE;
                             setStealthValueByPath(server, alarmId, {"EnabledState", "Id"}, &enabled, &UA_TYPES[UA_TYPES_BOOLEAN]);
                             
                             // 2. Initialize ActiveState to INACTIVE (STEALTH MODE)
@@ -4051,7 +4421,13 @@ main(int argc, char *argv[]) {
         }
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                    "========================================");
-    }
+    }  // END if(!BearerToken.empty())
+#endif  // END LEGACY CODE BLOCK
+    
+    // ========================================================================
+    // END OF COMMENTED OUT LEGACY CODE
+    // All topic/alarm initialization is now handled per-session in worker threads
+    // ========================================================================
 
     std::thread mqtt_thread([&]() { ioc.run(); });
     mqtt_thread.detach();
@@ -4066,6 +4442,28 @@ main(int argc, char *argv[]) {
 
     UA_Server_run_startup(server);
     log("Server startup completed successfully", LogLevel::INFO);
+    
+    // ========================================================================
+    // CRITICAL: Register access control callbacks AFTER server startup
+    // ========================================================================
+    // UA_Server_run_startup resets the access control configuration, so we
+    // must set our callbacks AFTER startup completes but BEFORE accepting
+    // connections. This ensures multi-tenancy session detection works.
+    // ========================================================================
+    log("⚙️ Configuring multi-tenancy session detection...", LogLevel::INFO);
+    
+    UA_ServerConfig *runningConfig = UA_Server_getConfig(server);
+    
+    if(runningConfig && runningConfig->accessControl.activateSession) {
+        log("  Replacing existing activateSession callback", LogLevel::DEBUG);
+    }
+    
+    runningConfig->accessControl.activateSession = customActivateSession;
+    runningConfig->accessControl.closeSession = customCloseSession;
+    
+    log("✅ Multi-tenancy session callbacks active - worker threads will be created on-demand", LogLevel::INFO);
+    // ========================================================================
+    
     log("Server is ready to accept connections", LogLevel::INFO);
     // Register server with LDS now that it's running
 
@@ -4157,10 +4555,20 @@ main(int argc, char *argv[]) {
 
     log("Server is now running and listening for connections", LogLevel::INFO);
 
-    while(running) {
-        UA_Server_run_iterate(server, true);
+    try {
+        while(running) {
+            UA_Server_run_iterate(server, true);
+            // log("Main loop iteration...", LogLevel::DEBUG); // Too verbose
+        }
+    } catch (const std::exception& e) {
+        log("🔥 CRITICAL: Unhandled exception in main loop: " + std::string(e.what()), LogLevel::ERRORS);
+        std::cerr << "CRITICAL: Unhandled exception: " << e.what() << std::endl;
+    } catch (...) {
+        log("🔥 CRITICAL: Unknown exception in main loop", LogLevel::ERRORS);
+        std::cerr << "CRITICAL: Unknown exception in main loop" << std::endl;
     }
-
+    
+    log("Server loop exited - running flag is now false", LogLevel::INFO);
     log("Server shutdown initiated", LogLevel::INFO);
     //    // Unregister from LDS before shutdown
     //    memset(&cc, 0, sizeof(UA_ClientConfig));
@@ -4199,15 +4607,17 @@ main(int argc, char *argv[]) {
 
     log("Cleaning up server resources", LogLevel::DEBUG);
 
-    UA_VariableAttributes_clear(&attr);
-    UA_VariableAttributes_clear(&attr2);
+    // NOTE: Example node cleanup disabled - these don't exist in multi-tenant version
+    // UA_VariableAttributes_clear(&attr);
+    // UA_VariableAttributes_clear(&attr2);
     // UA_VariableAttributes_clear(&attr3);
-    UA_NodeId_clear(&myIntegerNodeId);
-    UA_NodeId_clear(&myDoubleNodeId);
+    // UA_NodeId_clear(&myIntegerNodeId);
+    // UA_NodeId_clear(&myDoubleNodeId);
+    // UA_NodeId_clear(&myImageNodeId);
     // UA_NodeId_clear(&minNodeId);
-    UA_QualifiedName_clear(&myIntegerName);
-    UA_QualifiedName_clear(&myDoubleName);
-    // UA_QualifiedName_clear(&minName);
+    // UA_QualifiedName_clear(&myIntegerName);
+    // UA_QualifiedName_clear(&myDoubleName);
+    // UA_QualifiedName_clear(&myImageName);
 
     // Clean up security policies
     for(size_t i = 0; i < config->securityPoliciesSize; i++) {
@@ -4236,13 +4646,8 @@ main(int argc, char *argv[]) {
     log("Deleting server instance", LogLevel::DEBUG);
     UA_Server_delete(server);
 
-    if(retval == UA_STATUSCODE_GOOD) {
-        log("Server shutdown completed successfully", LogLevel::INFO);
-        return EXIT_SUCCESS;
-    } else {
-        log("Server shutdown completed with errors", LogLevel::ERRORS);
-        return EXIT_FAILURE;
-    }
+    log("Server shutdown completed successfully", LogLevel::INFO);
+    return EXIT_SUCCESS;
 }
 
 // Build an OPC UA Server that dynamically updates its address space using data received

@@ -68,6 +68,7 @@ struct AlarmConfig{
     string loggingFreq;
     string purging;
     int orgId;
+    string enable;
     // string removeIds;
     optional<vector<AlarmTrigger>> alarmTriggers;
     optional<vector<AlarmEmitter>> alarmEmitters;
