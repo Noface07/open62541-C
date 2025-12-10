@@ -132,11 +132,12 @@ static UA_NodeId getOrCreateFolder(UA_Server* server,
         UA_NODEID_NUMERIC(0, UA_NS0ID_FOLDERTYPE),
         objAttr, NULL, NULL);
     
-    if(rc == UA_STATUSCODE_GOOD || rc == UA_STATUSCODE_BADNODEIDEXISTS) {
-        folderMap[path] = folderId;
-        nodeMap[path] = folderId; // Add to nodeMap so alarms can find it!
-        return folderId;
-    }
+        UA_ObjectAttributes_clear(&objAttr);
+        if(rc == UA_STATUSCODE_GOOD || rc == UA_STATUSCODE_BADNODEIDEXISTS) {
+            folderMap[path] = folderId;
+            nodeMap[path] = folderId; // Add to nodeMap so alarms can find it!
+            return folderId;
+        }
     
     // If creation failed, return parent
     return parent;
@@ -253,6 +254,7 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
             log("✓ Created root folder '" + ctx->shortCode + "' in namespace " + 
                 std::to_string(ctx->namespaceIndex), LogLevel::INFO);
         }
+        UA_ObjectAttributes_clear(&rootObjAttr);
         
         std::map<std::string, UA_NodeId> folderMap;
         // std::map<std::string, UA_NodeId> nodeMap; // Removed local map, using ctx->nodeMap
@@ -311,6 +313,7 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                 callback.onWrite = writeCallback;
                 UA_Server_setVariableNode_valueCallback(server, nodeId, callback);
             }
+            UA_VariableAttributes_clear(&attr);
             
             if(rc == UA_STATUSCODE_GOOD || rc == UA_STATUSCODE_BADNODEIDEXISTS) {
                 ctx->nodeMap[ns] = nodeId;
