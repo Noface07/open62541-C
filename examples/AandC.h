@@ -50,6 +50,7 @@ struct TriggerToAlarmMapping {
 
 extern std::unordered_map<std::string, std::vector<TriggerToAlarmMapping>> g_triggerToAlarmMap;
 extern std::mutex g_alarmMutex;
+extern void GlobalMQTT_Subscribe(const std::string &topic);
 
 /**
  * @brief A global map to store and access alarm information for each monitored process node.

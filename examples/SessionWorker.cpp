@@ -11,6 +11,8 @@
 
 using json = nlohmann::ordered_json;
 
+extern std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
+
 // ============================================================================
 // Helper Functions for Alarm Creation
 // ============================================================================
@@ -111,7 +113,7 @@ static UA_NodeId getOrCreateFolder(UA_Server* server,
     // Create new folder
     UA_ObjectAttributes objAttr = UA_ObjectAttributes_default;
     objAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", displayName.c_str());
-    objAttr.eventNotifier = 0x01; // SubscribeToEvents (Important for Alarms!)
+    // objAttr.eventNotifier = 0x01; // SubscribeToEvents removed as per user request (only on emitters now)
     
     UA_NodeId folderId = UA_NODEID_STRING_ALLOC(namespaceIndex, path.c_str());
     
@@ -397,10 +399,26 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
             if(!alarm.alarmEmitters.has_value()) continue;
             
             for(const auto& emitter : alarm.alarmEmitters.value()) {
+                // Sanitize emitter name (remove trailing slash)
+                std::string searchKey = emitter.emitterNodeName;
+                if(!searchKey.empty() && searchKey.back() == '/') {
+                    searchKey.pop_back();
+                }
+
                 // Find emitter node in org's nodeMap
-                auto it = ctx->nodeMap.find(emitter.emitterNodeName);
+                auto it = ctx->nodeMap.find(searchKey);
                 if(it == ctx->nodeMap.end()) {
                     log("⚠️ No node found for emitter: " + emitter.emitterNodeName, LogLevel::ERRORS);
+                    
+                    // DEBUG: Dump first 10 keys in map to see what IS there
+                    int limit = 0;
+                    log("--- Dumping Available NodeMap keys (First 10) ---", LogLevel::INFO);
+                    for(const auto& pair : ctx->nodeMap) {
+                        log("Key: '" + pair.first + "'", LogLevel::INFO);
+                        if(++limit >= 10) break;
+                    }
+                    log("--- End Dump ---", LogLevel::INFO);
+                    
                     continue;
                 }
                 
@@ -410,6 +428,16 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                 // Deterministic NodeId (String) for Multi-Tenancy
                 UA_NodeId requestedNodeId = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, alarmKey.c_str());
                 
+                // Set EventNotifier on emitter BEFORE creating condition
+                // This ensures the A&C subsystem registers this node as a valid ConditionSource
+                UA_Byte eventNotifier = 0x01; 
+                UA_StatusCode evtRc = UA_Server_writeEventNotifier(server, sourceNode, eventNotifier);
+                if(evtRc != UA_STATUSCODE_GOOD) {
+                    log("❌ Failed to set EventNotifier on source node " + emitter.emitterNodeName + ": " + UA_StatusCode_name(evtRc), LogLevel::ERRORS);
+                } else {
+                    log("✓ EventNotifier set on source node " + emitter.emitterNodeName, LogLevel::INFO);
+                }
+
                 // Create condition in org's namespace
                 UA_NodeId alarmId = UA_NODEID_NULL;
                 UA_StatusCode sc = UA_Server_createCondition(
@@ -448,14 +476,6 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                     UA_LocalizedText initialMsg = UA_LOCALIZEDTEXT((char*)"en-US", (char*)"Alarm initialized (inactive)");
                     setStealthValueChecked(server, alarmId, "Message", &initialMsg, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
                     
-                    // Set EventNotifier on emitter
-                    UA_Byte eventNotifier = 0x01; 
-                    UA_StatusCode evtRc = UA_Server_writeEventNotifier(server, sourceNode, eventNotifier);
-                    if(evtRc != UA_STATUSCODE_GOOD) {
-                        log("❌ Failed to set EventNotifier on source node " + emitter.emitterNodeName + ": " + UA_StatusCode_name(evtRc), LogLevel::ERRORS);
-                    } else {
-                        log("✓ EventNotifier set on source node " + emitter.emitterNodeName, LogLevel::INFO);
-                    }
 
                     // Verify NodeClass of created alarm
                     UA_NodeClass nodeClass;
@@ -480,22 +500,39 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                     if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customDisableCallback);
                     
                     // Populate g_triggerToAlarmMap (Thread Safe)
-                    if(alarm.alarmTriggers.has_value()) {
-                        std::lock_guard<std::mutex> lock(g_alarmMutex);
-                        for(const auto& trigger : alarm.alarmTriggers.value()) {
-                             TriggerToAlarmMapping mapping;
-                             mapping.triggerTopic = trigger.applicableTagName;
-                             mapping.alarmKey = alarmKey;
-                             mapping.triggerId = trigger.id;
-                             mapping.alarmId = alarm.id;
-                             mapping.alarmInstanceId = 0;
-                             
-                             g_triggerToAlarmMap[mapping.triggerTopic].push_back(mapping);
-                        }
+                    // Populate g_triggerToAlarmMap using Emitter Topic (User Requirement)
+                    std::string topic = searchKey; // Use sanitised emitter name
+                    
+                    if(!topic.empty()) {
+                         // Note: GlobalMQTT_Subscribe will automaticaly subscribe to topic + ".event"
+                         // via logic in perform_subscriptions (server.cpp)
+                         log("DEBUG: Subscribing to Emitter Topic: " + topic, LogLevel::INFO);
+                         GlobalMQTT_Subscribe(topic);
+                         
+                         if(alarm.alarmTriggers.has_value()) {
+                             std::lock_guard<std::mutex> lock(g_alarmMutex);
+                             for(const auto& trigger : alarm.alarmTriggers.value()) {
+                                  TriggerToAlarmMapping mapping;
+                                  mapping.triggerTopic = topic;
+                                  mapping.alarmKey = alarmKey;
+                                  mapping.triggerId = trigger.id;
+                                  mapping.alarmId = alarm.id;
+                                  mapping.alarmInstanceId = 0;
+                                  
+                                  g_triggerToAlarmMap[topic].push_back(mapping);
+                             }
+                             // Populate global lookup map
+                             // Allocate a fresh NodeId to ensure validity (avoid dangling pointers from createCondition outputs)
+                             UA_NodeId safeAlarmId = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, alarmKey.c_str());
+                             g_alarmByKey[alarmKey] = safeAlarmId;
+                         }
+                    } else {
+                         log("WARNING: Emitter (ID: " + std::to_string(emitter.id) + 
+                             ") has EMPTY emitterNodeName! MQTT subscription skipped.", LogLevel::ERRORS);
                     }
 
                     // Store in map
-                    ctx->alarmMap[alarmKey] = alarmId;
+                    ctx->alarmMap[alarmKey] = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, alarmKey.c_str());
                     alarmsCreated++;
                 } else {
                     log("❌ Failed to create alarm '" + alarm.name + "': " + UA_StatusCode_name(sc), LogLevel::ERRORS);

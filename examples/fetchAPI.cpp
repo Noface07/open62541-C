@@ -108,7 +108,7 @@ json getBearerToken(string host, string port , string username, string password)
         beast::http::read(stream, buffer, res);
 
         json result = json::parse(res.body());
-        log(res.body().c_str(),LogLevel::DEBUG);
+        // log(res.body().c_str(),LogLevel::DEBUG);
 
         // Gracefully close the connection
         beast::error_code ec;
@@ -163,7 +163,7 @@ try{
     
     // Output response
 
-    log(res.body().c_str(),LogLevel::DEBUG);
+    // log(res.body().c_str(),LogLevel::DEBUG);
     json result = json::parse(res.body());
     // Shutdown connection
     beast::error_code ec;
@@ -217,7 +217,7 @@ GetAllOrganizationList(string host, string port, string bearerToken, string json
 
         // Output response
 
-        log(res.body().c_str(), LogLevel::DEBUG);
+        // log(res.body().c_str(), LogLevel::DEBUG);
         json result = json::parse(res.body());
         // Shutdown connection
         beast::error_code ec;
@@ -270,7 +270,7 @@ GetUserProfile(string host, string port, string bearerToken, string json_body,
 
         // Output response
 
-        log(res.body().c_str(), LogLevel::DEBUG);
+        // log(res.body().c_str(), LogLevel::DEBUG);
         json result = json::parse(res.body());
         // Shutdown connection
         beast::error_code ec;
@@ -395,6 +395,8 @@ vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearer
                                         pair<string, string> NodePair = {
                                             opcUaNamespace, serverInfo.endpointUrl};
                                         Mapping[mappedInfo.tagId] = NodePair;
+                                        // Store MQTT topic mapping for alarm fallback
+                                        TopicMapping[mappedInfo.tagId] = mappedInfo.namespaces;
 
                                         // }
                                         mappedTags.push_back(mappedInfo);
@@ -619,7 +621,7 @@ vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToke
         // } 
         else {
             log("ERROR: No 'data' or 'alarmConfigs' field found in API response!", LogLevel::ERRORS);
-            log("Response keys: " + response.dump(), LogLevel::DEBUG);
+            // log("Response keys: " + response.dump(), LogLevel::DEBUG);
         }
         } catch(const std::exception &e) {
             log("Error in ParseAlarmConfig: " + std::string(e.what()), LogLevel::ERRORS);
@@ -678,7 +680,7 @@ ParseOrgConfig(string host, string port, string bearerToken, string json_body,
             else {
                 log("ERROR: No 'data' or 'orgs' field found in API response!",
                     LogLevel::ERRORS);
-                log("Response keys: " + response.dump(), LogLevel::DEBUG);
+                // log("Response keys: " + response.dump(), LogLevel::DEBUG);
             }
         } catch(const std::exception &e) {
             log("Error in ParseAlarmConfig: " + std::string(e.what()), LogLevel::ERRORS);
@@ -746,7 +748,7 @@ UserProfile ParseUserProfile(string host, string port, string bearerToken,
             else {
                 log("ERROR: No 'data' field found in user profile response or data is empty!",
                     LogLevel::ERRORS);
-                log("Response: " + response.dump(), LogLevel::DEBUG);
+                // log("Response: " + response.dump(), LogLevel::DEBUG);
             }
         } catch(const std::exception &e) {
             log("Error in ParseUserProfile: " + std::string(e.what()), LogLevel::ERRORS);

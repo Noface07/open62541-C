@@ -22,7 +22,6 @@ static bool checkAccess(UA_Server *server, const UA_NodeId *sessionId, const UA_
     }
 
     // 3. Get Namespace URI of the node
-    size_t uriSize;
     UA_String uri;
     UA_StatusCode rc = UA_Server_getNamespaceByIndex(server, nodeId->namespaceIndex, &uri);
     if(rc != UA_STATUSCODE_GOOD) {
@@ -32,7 +31,7 @@ static bool checkAccess(UA_Server *server, const UA_NodeId *sessionId, const UA_
     std::string nsUri((char*)uri.data, uri.length);
 
     // LOGGING
-    // log("CheckAccess: Node NS=" + std::to_string(nodeId->namespaceIndex) + " URI=" + nsUri + " UserOrg=" + ctx->shortCode, LogLevel::DEBUG);
+
 
     // 4. Check if Namespace belongs to the User's Org
     // User's namespace URI: "anexee:{ShortCode}"
@@ -46,7 +45,7 @@ static bool checkAccess(UA_Server *server, const UA_NodeId *sessionId, const UA_
     // 5. Deny access to other Orgs' namespaces
     // If the namespace starts with "anexee:", it belongs to a tenant.
     if(nsUri.rfind("anexee:", 0) == 0) {
-        // log("Access Denied to " + nsUri + " for user " + ctx->shortCode, LogLevel::INFO);
+
         return false; // Access denied: Belongs to another Org
     }
 
