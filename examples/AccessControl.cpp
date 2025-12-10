@@ -45,7 +45,7 @@ static bool checkAccess(UA_Server *server, const UA_NodeId *sessionId, const UA_
     // 5. Deny access to other Orgs' namespaces
     // If the namespace starts with "anexee:", it belongs to a tenant.
     if(nsUri.rfind("anexee:", 0) == 0) {
-
+        log("⛔ Access Denied: User '" + ctx->shortCode + "' cannot access Node in '" + nsUri + "'", LogLevel::INFO);
         return false; // Access denied: Belongs to another Org
     }
 
@@ -97,6 +97,7 @@ allowBrowseNode(UA_Server *server, UA_AccessControl *ac,
     return UA_FALSE;
 }
 
+
 UA_StatusCode
 AccessControl_setup(UA_ServerConfig *config) {
     // Start with default access control (handles login, etc.)
@@ -108,7 +109,7 @@ AccessControl_setup(UA_ServerConfig *config) {
     config->accessControl.getUserAccessLevel = getUserAccessLevel;
     config->accessControl.getUserExecutable = getUserExecutable;
     config->accessControl.allowBrowseNode = allowBrowseNode;
-    
+
     // Note: We keep the default getUserRole, allowUserStep, etc.
     
     return UA_STATUSCODE_GOOD;

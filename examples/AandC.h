@@ -64,6 +64,24 @@ extern void GlobalMQTT_Subscribe(const std::string &topic);
 extern std::map<UA_NodeId, MonitoredNodeAlarmInfo, UA_NodeId_less_than> monitoredAlarms;
 
 /**
+ * @brief Information about an MQTT Topic (tag) for Generic Telemetry
+ */
+struct TopicInfo {
+    int tagId;
+    std::string name;
+    std::string tagType;
+    double rangeMin;
+    double rangeMax;
+    // int source;
+    // int infoId;
+    // int quality;
+    // int updateType;
+};
+
+extern std::unordered_map<std::string, TopicInfo> topicMap;
+extern std::mutex g_topicMap_mutex;
+
+/**
  * @brief Creates an instance of ExclusiveLimitAlarmType and links it to a process node.
  *
  * @param server The UA_Server instance.

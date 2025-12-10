@@ -12,6 +12,14 @@
 using json = nlohmann::ordered_json;
 
 extern std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
+extern void GlobalMQTT_Subscribe(const std::string &topic);
+extern std::map<std::string, UA_NodeId> nodeMap;
+extern std::mutex g_nodeMap_mutex;
+
+// External callback from server.cpp
+extern void writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
+              const UA_NodeId *nodeId, void *nodeContext, const UA_NumericRange *range,
+              const UA_DataValue *data);
 
 // ============================================================================
 // Helper Functions for Alarm Creation
@@ -295,9 +303,38 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                 UA_QUALIFIEDNAME_ALLOC(ctx->namespaceIndex, parts.back().c_str()),
                 UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
                 attr, NULL, NULL);
+
+            if(rc == UA_STATUSCODE_GOOD) {
+                // Attach Write Callback for MQTT Publishing
+                UA_ValueCallback callback;
+                callback.onRead = NULL;
+                callback.onWrite = writeCallback;
+                UA_Server_setVariableNode_valueCallback(server, nodeId, callback);
+            }
             
             if(rc == UA_STATUSCODE_GOOD || rc == UA_STATUSCODE_BADNODEIDEXISTS) {
                 ctx->nodeMap[ns] = nodeId;
+                {
+                    std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
+                    nodeMap[ns] = nodeId;
+                }
+                
+                // Populate Global TopicMap for Generic Telemetry (Write Callback)
+                {
+                    std::lock_guard<std::mutex> lock(g_topicMap_mutex);
+                    TopicInfo info;
+                    info.tagId = tagId;
+                    if(item.contains("name")) info.name = item["name"].get<std::string>();
+                    if(item.contains("tagType")) info.tagType = item["tagType"].get<std::string>();
+                    if(item.contains("rangeMin")) info.rangeMin = item["rangeMin"].get<double>();
+                    else info.rangeMin = 0.0;
+                    if(item.contains("rangeMax")) info.rangeMax = item["rangeMax"].get<double>();
+                    else info.rangeMax = 0.0;
+                    
+                    topicMap[ns] = info;
+                }
+                // 📡 Dynamic Subscribe
+                GlobalMQTT_Subscribe(ns);
                 nodesCreated++;
                 
                 // Add EURange property if available
@@ -504,11 +541,6 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                     std::string topic = searchKey; // Use sanitised emitter name
                     
                     if(!topic.empty()) {
-                         // Note: GlobalMQTT_Subscribe will automaticaly subscribe to topic + ".event"
-                         // via logic in perform_subscriptions (server.cpp)
-                         log("DEBUG: Subscribing to Emitter Topic: " + topic, LogLevel::INFO);
-                         GlobalMQTT_Subscribe(topic);
-                         
                          if(alarm.alarmTriggers.has_value()) {
                              std::lock_guard<std::mutex> lock(g_alarmMutex);
                              for(const auto& trigger : alarm.alarmTriggers.value()) {
@@ -526,6 +558,11 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                              UA_NodeId safeAlarmId = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, alarmKey.c_str());
                              g_alarmByKey[alarmKey] = safeAlarmId;
                          }
+
+                         // Note: GlobalMQTT_Subscribe will automaticaly subscribe to topic + ".event"
+                         // via logic in perform_subscriptions (server.cpp) IF the topic is in the map.
+                         log("DEBUG: Subscribing to Emitter Topic (Alarm Prepared): " + topic, LogLevel::INFO);
+                         GlobalMQTT_Subscribe(topic);
                     } else {
                          log("WARNING: Emitter (ID: " + std::to_string(emitter.id) + 
                              ") has EMPTY emitterNodeName! MQTT subscription skipped.", LogLevel::ERRORS);

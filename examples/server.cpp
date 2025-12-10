@@ -89,6 +89,13 @@ std::vector<std::string> g_subscription_queue;
 std::set<std::string> g_subscribed_topics;
 std::unique_ptr<boost::asio::steady_timer> g_sub_timer;
 
+// Global NodeMap (Topic -> NodeId) for Generic Telemetry
+// Global NodeMap (Topic -> NodeId) for Generic Telemetry
+std::map<std::string, UA_NodeId> nodeMap;
+std::mutex g_nodeMap_mutex;
+std::mutex g_topicMap_mutex;
+std::recursive_mutex g_server_mutex; // Protects UA_Server API access
+
 
 // ----------------------------------------------------------------------------------------------------------------
 
@@ -660,18 +667,7 @@ loadCertsFromDirectory(const char *dirPath, UA_ByteString **certs) {
 }
 #endif
 
-map<string, UA_NodeId> nodeMap;
-struct TopicInfo {
-    int tagId;
-    string name;
-    string tagType;
-    double rangeMin;
-    double rangeMax;
-    // int source;
-    // int infoId;
-    // int quality;
-    // int updateType;
-};
+// TopicInfo struct moved to AandC.h to be shared with SessionWorker
 
 unordered_map<string, TopicInfo> topicMap;
 
@@ -977,7 +973,7 @@ findNodeByPath(UA_Server *server, UA_NodeId startNode, const std::vector<const c
  * * Dependencies:
  * - findNodeByPath (Helper function defined previously)
  */
-static void
+static UA_StatusCode
 setStealthValueByPath(UA_Server *server, UA_NodeId startNode, 
                       std::vector<const char*> path, 
                       void *newValue, const UA_DataType *type) {
@@ -989,18 +985,22 @@ setStealthValueByPath(UA_Server *server, UA_NodeId startNode,
     if(UA_NodeId_isNull(&targetNode)) {
         // Target not found. Silently return to avoid spamming logs 
         // during startup or partial configurations.
-        return;
+        return UA_STATUSCODE_BADNOTFOUND;
     }
 
     // 2. Read current value from the server
     UA_Variant current;
     UA_Variant_init(&current);
-    UA_StatusCode readStatus = UA_Server_readValue(server, targetNode, &current);
+    UA_StatusCode readStatus = UA_STATUSCODE_BAD;
+    {
+         std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+         readStatus = UA_Server_readValue(server, targetNode, &current);
+    }
 
     // If read fails (e.g. bad permissions), we can't compare, so we abort.
     if(readStatus != UA_STATUSCODE_GOOD) {
         UA_NodeId_clear(&targetNode);
-        return;
+        return readStatus;
     }
 
     // 3. Compare (Unified Logic for all common types)
@@ -1060,8 +1060,11 @@ setStealthValueByPath(UA_Server *server, UA_NodeId startNode,
         }
     }
 
-    // 4. Write ONLY if different
+// 4. Write ONLY if different
     if(!isSame) {
+        // Lock Server Access
+        std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+        
         UA_Variant v;
         UA_Variant_init(&v);
         // Create a variant pointing to the new data
@@ -1084,19 +1087,20 @@ setStealthValueByPath(UA_Server *server, UA_NodeId startNode,
     // 5. Cleanup
     UA_Variant_clear(&current);  // Free memory from the Read operation
     UA_NodeId_clear(&targetNode); // Free memory from the Find operation
+    return UA_STATUSCODE_GOOD;
 }
 
 
 
 // Wrapper for direct children (Convenience function)
-static void
+static UA_StatusCode
 setStealthValueChecked(UA_Server *server, UA_NodeId parentId, 
                        const char *propertyName, 
                        void *newValue, const UA_DataType *type) {
     
     // Just call the master function with a path of size 1
     std::vector<const char*> path = {propertyName};
-    setStealthValueByPath(server, parentId, path, newValue, type);
+    return setStealthValueByPath(server, parentId, path, newValue, type);
 }
 
 // --------------------------------------------------------------------------------------------
@@ -2143,24 +2147,26 @@ static std::string findGUIDForBranchId(const UA_NodeId *branchId, const std::str
 
 
 // Write callback for OPC UA node value changes
-static void
+// Write callback for OPC UA node value changes
+// Write callback for OPC UA node value changes
+void
 writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
               const UA_NodeId *nodeId, void *nodeContext, const UA_NumericRange *range,
               const UA_DataValue *data) {
-    // if (is_internal_write) return;  // 🔒 Prevent feedback loop
+    if (is_internal_write) return;  // 🔒 Prevent feedback loop
 
     // Find the topic for this node
     std::string topic;
-
-    //if(is_internal_write)
-    //    goto Alarms;
-
-    for(const auto &pair : nodeMap) {
-        if(UA_NodeId_equal(&pair.second, nodeId)) {
-            topic = pair.first;
-            break;
+    {
+        std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
+        for(const auto &pair : nodeMap) {
+            if(UA_NodeId_equal(&pair.second, nodeId)) {
+                topic = pair.first;
+                break;
+            }
         }
     }
+    
     if(topic.empty())
         return;  // Not a topic node
 
@@ -2186,12 +2192,51 @@ writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
             return;
         }
 
-        // Add metadata to the same dataPoint
-        dataPoint["TagId"] = topicMap[topic].tagId;
-        dataPoint["TagType"] = topicMap[topic].tagType;
-        dataPoint["DatapointId"] = topicMap[topic].tagId;
+        {
+            std::lock_guard<std::mutex> lock(g_topicMap_mutex);
+            if(topicMap.find(topic) != topicMap.end()) {
+                // Add metadata to the same dataPoint
+                dataPoint["TagId"] = topicMap[topic].tagId;
+                dataPoint["TagType"] = topicMap[topic].tagType;
+                dataPoint["DatapointId"] = topicMap[topic].tagId;
+            } else {
+                dataPoint["TagId"] = 0;
+                dataPoint["TagType"] = "Unknown";
+            }
+        }
 
-        dataPoint["TimeStamp"] = UA_DateTime_now();
+        // Generate ISO 8601 Timestamp with 100ns precision (High Resolution)
+        {
+            auto now = std::chrono::system_clock::now();
+            std::time_t t = std::chrono::system_clock::to_time_t(now);
+            std::tm tm_buf;
+            #if defined(_WIN32)
+                localtime_s(&tm_buf, &t);
+            #else
+                localtime_r(&tm_buf, &t);
+            #endif
+            
+            // Calculate fractional seconds (100ns precision)
+            auto duration = now.time_since_epoch();
+            auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
+            auto fractional = duration - seconds;
+            long long fractional_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(fractional).count();
+
+            char tsBuf[64];
+            std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+            
+            // Append fractional (7 digits) and Offset (+05:30)
+            char finalBuf[128];
+            // fractional_ns is nanoseconds (9 digits), we want 100ns (7 digits)
+            snprintf(finalBuf, sizeof(finalBuf), "%s.%07lld+05:30", tsBuf, fractional_ns / 100);
+            
+            dataPoint["TimeStamp"] = std::string(finalBuf);
+        }
+
+        dataPoint["Source"] = (int)AlarmSource::OPC;       // 1 (OPC)
+        dataPoint["Quality"] = (int)AlarmQuality::Good;    // 1 (Good)
+        dataPoint["UpdateType"] = (int)UpdateType::Telemetry; // 1 (Telemetry)
+        dataPoint["InfoId"] = 1001; // Hardcoded
 
         payload["Data"] = json::array({dataPoint});
 
@@ -2353,9 +2398,11 @@ getOrCreateAlarmBranch(UA_Server *server, const UA_NodeId &conditionId,
     // Insert into map
     branchMap[guid] = branchInfo;
 
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "✓ Created virtual branch for GUID '%s' (NodeId: ns=%u;s=%s)",
-                guid.c_str(), masterBranchId.namespaceIndex, nodeIdStr.c_str());
+    branchMap[guid] = branchInfo;
+
+    // UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+    //             "✓ Created virtual branch for GUID '%s' (NodeId: ns=%u;s=%s)",
+    //             guid.c_str(), masterBranchId.namespaceIndex, nodeIdStr.c_str());
 
     // 4. Return a DEEP COPY to the caller
     // Caller is responsible for clearing outBranchId, but it won't affect our Map
@@ -2545,20 +2592,22 @@ static void performDisable(UA_Server *server,
 // Forward declarations
 void process_queue_signal();
 
-void queue_subscription(const std::string& topic) {
+void queue_subscription(const std::string &topic) {
+    if(topic.empty()) return;
+    
     std::lock_guard<std::mutex> lock(g_sub_mutex);
     
-    log("DEBUG: queue_subscription called for '" + topic + "'", LogLevel::INFO);
+    // log("DEBUG: queue_subscription called for '" + topic + "'", LogLevel::INFO);
 
     // Check if already subscribed to avoid unnecessary queueing
     if(g_subscribed_topics.find(topic) != g_subscribed_topics.end()) {
-        log("DEBUG: Already subscribed to '" + topic + "'", LogLevel::INFO);
+        // log("DEBUG: Already subscribed to '" + topic + "'", LogLevel::INFO);
         return;
     }
     
     // Check if already in queue to avoid duplicates
     if(std::find(g_subscription_queue.begin(), g_subscription_queue.end(), topic) != g_subscription_queue.end()) {
-        log("DEBUG: Already queued '" + topic + "'", LogLevel::INFO);
+        // log("DEBUG: Already queued '" + topic + "'", LogLevel::INFO);
         return;
     }
     
@@ -2566,13 +2615,13 @@ void queue_subscription(const std::string& topic) {
     
     // Trigger processing by signalling the main loop
     process_queue_signal();
-    log("DEBUG: Added to queue and signalled main loop", LogLevel::INFO);
+    // log("DEBUG: Added to queue and signalled main loop", LogLevel::INFO);
 }
 
 // Helper to subscribe to a single topic dynamically
 void GlobalMQTT_Subscribe(const std::string &topic) {
     bool connected = g_mqtt_connected.load();
-    log("DEBUG: GlobalMQTT_Subscribe('" + topic + "') - Connected: " + std::to_string(connected), LogLevel::INFO);
+    // log("DEBUG: GlobalMQTT_Subscribe('" + topic + "') - Connected: " + std::to_string(connected), LogLevel::INFO);
     
     if(!connected) {
         return;
@@ -2590,16 +2639,16 @@ void process_queue_signal() {
     as::post(ioc, [](){
         if(g_sub_timer) {
             std::size_t n = g_sub_timer->cancel();
-            log("DEBUG: [IO_THREAD] Cancelling timer for signal. Cancelled: " + std::to_string(n), LogLevel::INFO);
+            // log("DEBUG: [IO_THREAD] Cancelling timer for signal. Cancelled: " + std::to_string(n), LogLevel::INFO);
         } else {
-            log("DEBUG: [IO_THREAD] g_sub_timer is NULL!", LogLevel::ERRORS);
+            // log("DEBUG: [IO_THREAD] g_sub_timer is NULL!", LogLevel::ERRORS);
         }
     });
 }
 
 // Subscribe logic moves inside the loop controller
 as::awaitable<void> perform_subscriptions() {
-    log("DEBUG: perform_subscriptions called", LogLevel::INFO);
+    // log("DEBUG: perform_subscriptions called", LogLevel::INFO);
     std::vector<std::string> batch;
     {
         std::lock_guard<std::mutex> lock(g_sub_mutex);
@@ -2617,10 +2666,17 @@ as::awaitable<void> perform_subscriptions() {
     }
 
     std::vector<am::topic_subopts> sub_entry;
-    for(const auto& topic : batch) {
-        // sub_entry.push_back({topic, am::qos::at_most_once}); // DISABLED per user request (only .event needed)
-        sub_entry.push_back({topic + ".event", am::qos::at_most_once});
-        log("DEBUG: Preparing subscription for '" + topic + ".event'", LogLevel::INFO);
+    {
+        std::lock_guard<std::mutex> alarmLock(g_alarmMutex);
+        for(const auto& topic : batch) {
+            sub_entry.push_back({topic, am::qos::at_most_once}); // Generic / Base Telemetry
+
+            // Only subscribe to .event if this topic is a registered Alarm Trigger
+            if(g_triggerToAlarmMap.find(topic) != g_triggerToAlarmMap.end()) {
+                sub_entry.push_back({topic + ".event", am::qos::at_most_once});
+                log("DEBUG: Preparing ALARM subscription for '" + topic + ".event'", LogLevel::INFO);
+            }
+        }
     }
 // ... (rest of function implicit) ...
 
@@ -2646,7 +2702,7 @@ void start_mqtt_client(UA_Server *server) {
     as::co_spawn(
         ioc,
         [server]() -> as::awaitable<void> {
-            std:: cout << "DEBUG: MQTT Client Coroutine Started!" << std::endl;
+            log("DEBUG: MQTT Client Coroutine Started!", LogLevel::INFO);
             // Reconnection loop
             while(running) {
                 try {
@@ -2654,7 +2710,7 @@ void start_mqtt_client(UA_Server *server) {
                     // [Connection Logic Redacted/Preserved]
                     // ... (Assume connection logic is unchanged above) ...
                     
-                    std::cout << "DEBUG: Connecting to MQTT..." << std::endl;
+
                     log("Attempting to connect to MQTT broker...", LogLevel::INFO);
                     co_await amcl.async_underlying_handshake("216.48.184.131", "15579", as::use_awaitable);
                     auto connack_opt = co_await amcl.async_start(
@@ -2663,19 +2719,28 @@ void start_mqtt_client(UA_Server *server) {
                     
                     if(!connack_opt) throw std::runtime_error("Failed to start MQTT session");
                     
-                    std::cout << "DEBUG: MQTT CONNECTED!" << std::endl;
+
                     log("Successfully connected.", LogLevel::INFO);
                     g_mqtt_connected.store(true);
-                    
-                    // Clear and queue
+                                        // Clear and queue
                     {
                         std::lock_guard<std::mutex> alarmLock(g_alarmMutex);
                         std::lock_guard<std::mutex> lock(g_sub_mutex);
                         g_subscribed_topics.clear(); 
                         
                         if(!g_triggerToAlarmMap.empty()) {
-                            log("DEBUG: Re-queueing " + std::to_string(g_triggerToAlarmMap.size()) + " topics from global map", LogLevel::INFO);
+                            log("DEBUG: Re-queueing " + std::to_string(g_triggerToAlarmMap.size()) + " alarm topics", LogLevel::INFO);
                             for(const auto &pair : g_triggerToAlarmMap) g_subscription_queue.push_back(pair.first);
+                        }
+                        
+                        {
+                            std::lock_guard<std::mutex> nodeLock(g_nodeMap_mutex);
+                            if(!nodeMap.empty()) {
+                                log("DEBUG: Re-queueing " + std::to_string(nodeMap.size()) + " generic topics", LogLevel::INFO);
+                                for(const auto &pair : nodeMap) {
+                                    g_subscription_queue.push_back(pair.first);
+                                }
+                            }
                         }
                     }
                     
@@ -2707,10 +2772,28 @@ void start_mqtt_client(UA_Server *server) {
                                         log("DEBUG: Detected .event topic, base='" + baseTopic + "'", LogLevel::INFO);
                                     }
 
-                                    auto triggerIt = g_triggerToAlarmMap.find(baseTopic);
-                                    if(triggerIt != g_triggerToAlarmMap.end()) {
+                                    // Thread-Safe Lookup: Copy mappings to local vector under lock
+                                    std::vector<TriggerToAlarmMapping> mappings;
+                                    {
                                         std::lock_guard<std::mutex> lock(g_alarmMutex);
-                                        log("✓ Topic '" + topic + "' FOUND in trigger map with " + std::to_string(triggerIt->second.size()) + " alarm mappings", LogLevel::INFO);
+                                        auto triggerIt = g_triggerToAlarmMap.find(baseTopic);
+                                        if(triggerIt != g_triggerToAlarmMap.end()) {
+                                            mappings = triggerIt->second;
+                                        }
+                                    }
+
+                                    bool isAlarmEvent = false;
+                                    if(!mappings.empty()) {
+                                        try {
+                                            auto check = json::parse(payload);
+                                            if(check.contains("Event")) isAlarmEvent = true;
+                                        } catch(...) {}
+                                    }
+
+                                    if(isAlarmEvent) {
+                                        std::lock_guard<std::mutex> lock(g_alarmMutex);
+                                        is_internal_write = true; // 🔒 Suppress callback loop
+                                        log("✓ Topic '" + topic + "' Processing Alarm Event.", LogLevel::INFO);
                                         // This is a trigger topic, process the alarm payload
                                         try {
                                             auto alarmPayload = json::parse(payload);
@@ -2776,21 +2859,24 @@ void start_mqtt_client(UA_Server *server) {
                                                 // Extract Retain
                                                 bool retain = alarm.value("Retain", false);
                                                 
-                                                log("DEBUG: Data Extracted. Active=" + std::to_string(active) + ", Checking " + std::to_string(triggerIt->second.size()) + " mappings...", LogLevel::INFO);
+                                                log("DEBUG: Data Extracted. Active=" + std::to_string(active) + ", Checking " + std::to_string(mappings.size()) + " mappings...", LogLevel::INFO);
                                                     
                                                 // Iterate through all alarms mapped to this trigger
-                                                for(const auto &mapping : triggerIt->second) {
-                                                    // Filter by AETypeID
-                                                    if(mapping.alarmId != AETypeID) {
-                                                        log("DEBUG: SKIP Mapping ID=" + std::to_string(mapping.alarmId) + " != Payload ID=" + std::to_string(AETypeID), LogLevel::INFO);
-                                                        continue;
-                                                    }
+                                                {
+                                                    std::lock_guard<std::mutex> lock(g_alarmMutex); // 🔒 CRITICAL: Protect g_alarmByKey and g_alarmBranches
                                                     
-                                                    auto alarmIt = g_alarmByKey.find(mapping.alarmKey);
-                                                    if(alarmIt == g_alarmByKey.end()) {
-                                                        log("DEBUG: SKIP Mapping - AlarmKey not found in g_alarmByKey: " + mapping.alarmKey, LogLevel::INFO);
-                                                        continue;
-                                                    }
+                                                    for(const auto &mapping : mappings) {
+                                                        // Filter by AETypeID
+                                                        if(mapping.alarmId != AETypeID) {
+                                                            // log("DEBUG: SKIP Mapping ID=" + std::to_string(mapping.alarmId) + " != Payload ID=" + std::to_string(AETypeID), LogLevel::INFO);
+                                                            continue;
+                                                        }
+                                                        
+                                                        auto alarmIt = g_alarmByKey.find(mapping.alarmKey);
+                                                        if(alarmIt == g_alarmByKey.end()) {
+                                                            log("DEBUG: SKIP Mapping - AlarmKey not found in g_alarmByKey: " + mapping.alarmKey, LogLevel::INFO);
+                                                            continue;
+                                                        }
                                                     
                                                     log("DEBUG: MATCH Mapping OK. Processing AlarmKey=" + mapping.alarmKey, LogLevel::INFO);
                                                     
@@ -2981,7 +3067,10 @@ void start_mqtt_client(UA_Server *server) {
                                                         UA_Boolean valConf = aggConfirmed ? UA_TRUE : UA_FALSE;
                                                         setStealthValueByPath(server, alarmId, {"ConfirmedState", "Id"}, &valConf, &UA_TYPES[UA_TYPES_BOOLEAN]);
                                                         
-                                                        setStealthValueChecked(server, alarmId, "Severity", &aggSeverity, &UA_TYPES[UA_TYPES_UINT16]);
+                                                        UA_StatusCode scSeverity = setStealthValueChecked(server, alarmId, "Severity", &aggSeverity, &UA_TYPES[UA_TYPES_UINT16]);
+                                                        if(scSeverity != UA_STATUSCODE_GOOD) {
+                                                            log("ERROR: Get Condition LastSeverity failed. StatusCode " + std::string(UA_StatusCode_name(scSeverity)), LogLevel::ERRORS);
+                                                        }
                                                         
                                                         UA_Boolean retVal = aggRetain ? UA_TRUE : UA_FALSE;
                                                         setStealthValueChecked(server, alarmId, "Retain", &retVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
@@ -3044,8 +3133,87 @@ void start_mqtt_client(UA_Server *server) {
                                                     }
                                                     */
                                                 }
+                                                }
+                                                // 🔒 END CRITICAL: Unlock g_alarmMutex
                                             }
                                         } catch(const std::exception& e) { log("JSON/Processing Error: " + std::string(e.what()), LogLevel::ERRORS); }
+                                        is_internal_write = false; // 🔓 Reset callback loop
+                                    }
+
+                                    if(!isAlarmEvent) {
+                                        /* Regular data update path (Generic Telemetry) */
+                                        // Check if topic exists in nodeMap
+                                        std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
+                                        if(nodeMap.find(topic) != nodeMap.end()) {
+                                            UA_NodeId nodeId = nodeMap[topic];
+                                            try {
+                                                auto j = json::parse(payload);
+                                                
+                                                    // 1. Check for Complex "Data" Array Payload
+                                                if(j.contains("Data") && j["Data"].is_array() && !j["Data"].empty()) {
+                                                    const auto& dataItem = j["Data"][0];
+                                                    UA_Variant var;
+                                                    UA_Variant_init(&var);
+                                                    
+                                                    if(dataItem.contains("Value")) {
+                                                        if(dataItem["Value"].is_number()) {
+                                                            double value = dataItem["Value"].get<double>();
+                                                            UA_Variant_setScalarCopy(&var, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                                            
+                                                            {
+                                                                std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+                                                                is_internal_write = true;
+                                                                UA_Server_writeValue(server, nodeId, var);
+                                                                is_internal_write = false;
+                                                            }
+                                                            UA_Variant_clear(&var);
+                                                        } else if(dataItem["Value"].is_boolean()) {
+                                                            UA_Boolean value = dataItem["Value"].get<bool>();
+                                                            UA_Variant_setScalarCopy(&var, &value, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                                                            
+                                                            {
+                                                                std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+                                                                is_internal_write = true;
+                                                                UA_Server_writeValue(server, nodeId, var);
+                                                                is_internal_write = false;
+                                                            }
+                                                            UA_Variant_clear(&var);
+                                                        } else if(dataItem["Value"].is_string()) {
+                                                            std::string strValue = dataItem["Value"].get<std::string>();
+                                                            UA_String value = UA_STRING_ALLOC(strValue.c_str());
+                                                            UA_Variant_setScalarCopy(&var, &value, &UA_TYPES[UA_TYPES_STRING]);
+                                                            
+                                                            {
+                                                                std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+                                                                is_internal_write = true;
+                                                                UA_Server_writeValue(server, nodeId, var);
+                                                                is_internal_write = false;
+                                                            }
+                                                            UA_String_clear(&value); // Clear string content
+                                                            UA_Variant_clear(&var);  // Clear variant container
+                                                        }
+                                                    }
+                                                // 2. Fallback: Check for Simple "Value" Payload (Legacy support)
+                                                } else if(j.contains("Value")) {
+                                                     if(j["Value"].is_number()) {
+                                                         double value = j["Value"].get<double>();
+                                                         UA_Variant var;
+                                                         UA_Variant_init(&var);
+                                                         UA_Variant_setScalarCopy(&var, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                                         
+                                                         {
+                                                             std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+                                                             is_internal_write = true; 
+                                                             UA_Server_writeValue(server, nodeId, var);
+                                                             is_internal_write = false;
+                                                         }
+                                                         UA_Variant_clear(&var);
+                                                     }
+                                                }
+                                            } catch(const std::exception &e) {
+                                                log("JSON parse error: " + std::string(e.what()), LogLevel::ERRORS);
+                                            }
+                                        }
                                     }
                                 },
                                 [](auto const&) {}
@@ -3112,12 +3280,12 @@ void start_mqtt_client(UA_Server *server) {
 int
 main(int argc, char **argv) {
     // Early console output before logging is initialized
-    std::cout << "==================================================" << std::endl;
-    std::cout << "OPC UA Server Starting..." << std::endl;
-    std::cout << "==================================================" << std::endl;
+    log("==================================================", LogLevel::INFO);
+    log("OPC UA Server Starting...", LogLevel::INFO);
+    log("==================================================", LogLevel::INFO);
 
     // Load configuration from appsettings.json
-    std::cout << "Loading configuration from appsettings.json..." << std::endl;
+    log("Loading configuration from appsettings.json...", LogLevel::INFO);
     std::ifstream file("appsettings.json");
     if (!file.is_open()) {
         std::string cwd;
@@ -3213,7 +3381,7 @@ main(int argc, char **argv) {
     } catch(const std::exception& e) {
         std::cerr << "ERROR: Failed to acquire bearer token: " << e.what() << std::endl;
         log("Failed to acquire bearer token: " + std::string(e.what()), LogLevel::ERRORS);
-        std::cerr << "Press Enter to exit..." << std::endl;
+        log("Press Enter to exit...", LogLevel::ERRORS);
         std::cin.get();
         return EXIT_FAILURE;
     }
@@ -4272,6 +4440,9 @@ main(int argc, char **argv) {
     
     runningConfig->accessControl.activateSession = customActivateSession;
     runningConfig->accessControl.closeSession = customCloseSession;
+    
+    // Setup fine-grained access control (browsing, read, write rights)
+    AccessControl_setup(runningConfig);
     
     log("✅ Multi-tenancy session callbacks active - worker threads will be created on-demand", LogLevel::INFO);
     // ========================================================================

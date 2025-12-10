@@ -166,6 +166,13 @@ inline void ensure_log_stream_open() {
     }
 }
 
+inline std::mutex &consoleMutexRef() {
+    static std::mutex m;
+    return m;
+}
+
+// ... (existing code)
+
 inline void log(const std::string &msg, LogLevel level = LogLevel::INFO) {
     // Timestamp - using safer approach for Windows
     auto now = std::chrono::system_clock::now();
@@ -207,18 +214,19 @@ inline void log(const std::string &msg, LogLevel level = LogLevel::INFO) {
 
     // Console output only when debug mode is enabled
     if (g_debug) {
+        std::lock_guard<std::mutex> lock(consoleMutexRef());
         switch(level) {
             case LogLevel::INFO:
                 std::cout << "[INFO] " << msg << std::endl;
-                std::cout << std::endl;
+                std::cout.flush(); // Ensure flush within lock
                 break;
             case LogLevel::DEBUG:
                 std::cout << "[DEBUG] " << msg << std::endl;
-                std::cout << std::endl;
+                std::cout.flush(); // Ensure flush within lock
                 break;
             case LogLevel::ERRORS:
                 std::cerr << "[ERROR] " << msg << std::endl;
-                std::cout << std::endl;
+                std::cerr.flush(); // Ensure flush within lock
                 break;
         }
     }
