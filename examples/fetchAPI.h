@@ -7,10 +7,11 @@
 #include <unordered_map>
 #include <boost/asio/io_context.hpp>
 #include <nlohmann/json.hpp>
-#include "structs.h" // Assumed to contain ServerInfoO and other related structs
-#include "AlarmConfig.h" // Contains AlarmConfig, AlarmTrigger, AlarmEmitter structs
+#include "structs.h" 
+#include "AlarmConfig.h" 
 #include "OrgConfig.h"
 #include "UserProfile.h"
+#include "ServerConfig.h"
 
 // Forward declare a dedicated io_context for HTTP/beast operations
 namespace as = boost::asio;
@@ -66,6 +67,8 @@ std::vector<OrgConfig> ParseOrgConfig(std::string host, std::string port, std::s
 UserProfile ParseUserProfile(std::string host, std::string port, std::string bearerToken, 
                             std::string json_body, std::string target);
 
+ServerConfig ParseServerConfig(std::string host, std::string port, std::string bearerToken, std::string json_body, std::string target);
+
 /**
  * @brief A utility function to extract the namespace index and identifier from an OPC UA node string.
  *
@@ -73,5 +76,7 @@ UserProfile ParseUserProfile(std::string host, std::string port, std::string bea
  * @return A std::pair containing the namespace index (int) and the identifier (std::string).
  */
 std::pair<int, std::string> extractNsAndValue(const std::string& input);
+
+
 
 #endif // API_HANDLER_H

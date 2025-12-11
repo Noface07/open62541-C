@@ -26,6 +26,7 @@
 #include "AlarmConfig.h"
 #include "OrgConfig.h"
 #include "UserProfile.h"
+#include "ServerConfig.h"
 
 
 using json = nlohmann::ordered_json;
@@ -758,6 +759,88 @@ UserProfile ParseUserProfile(string host, string port, string bearerToken,
     return profile;
 }
 
+// Assumes `json` is nlohmann::json and types ServerConfig, orgMappings, log, LogLevel exist.
+
+ServerConfig ParseServerConfig(const std::string &host,
+                               const std::string &port,
+                               const std::string &bearerToken,
+                               const std::string &json_body,
+                               const std::string &target)
+{
+    ServerConfig serverConfig;
+    // Defaults
+    serverConfig.id = 0;
+    serverConfig.dataPointId = 0;
+    serverConfig.port = 0;
+
+    if (bearerToken.empty()) {
+        log("ParseServerConfig: empty bearerToken; returning defaults", LogLevel::INFO);
+        return serverConfig;
+    }
+
+    try {
+        auto futureResponse = std::async(std::launch::async,
+                                         getHierarchy,
+                                         host, port, bearerToken, json_body, target);
+        json response = futureResponse.get();
+
+        if (!response.contains("data") || !response["data"].is_array() || response["data"].empty()) {
+            log("ERROR: No 'data' field found in server config response or data is empty!", LogLevel::ERRORS);
+            return serverConfig;
+        }
+
+        const auto &item = response["data"].at(0); // first config
+
+        try {
+            // Use value() which returns default if key missing or not convertible
+            serverConfig.id = item.value("id", 0);
+            serverConfig.name = item.value("name", std::string{});
+            serverConfig.ip = item.value("ip", std::string{});
+            serverConfig.port = item.value("port", 0);
+            serverConfig.nodeId = item.value("nodeId", std::string{});
+
+            // Handle orgMappings whether it's an object (single) or array (multiple)
+            if (item.contains("orgMappings")) {
+                const auto &om = item["orgMappings"];
+
+                if (om.is_array()) {
+                    for (const auto &entry : om) {
+                        try {
+                            orgMappings mapping;
+                            mapping.id = entry.value("id", 0);
+                            mapping.hierarchyId = entry.value("hierarchyId", 0);
+                            mapping.mapOrgId = entry.value("mapOrgId", 0);
+                            mapping.orgShortCode = entry.value("orgShortCode", std::string{});
+                            serverConfig.orgMappings.push_back(std::move(mapping));
+                        } catch (const std::exception &e) {
+                            log(std::string("Error parsing orgMappings array entry: ") + e.what(), LogLevel::ERRORS);
+                        }
+                    }
+                } else if (om.is_object()) {
+                    try {
+                        orgMappings mapping;
+                        mapping.id = om.value("id", 0);
+                        mapping.hierarchyId = om.value("hierarchyId", 0);
+                        mapping.mapOrgId = om.value("mapOrgId", 0);
+                        mapping.orgShortCode = om.value("orgShortCode", std::string{});
+                        serverConfig.orgMappings.push_back(std::move(mapping));
+                    } catch (const std::exception &e) {
+                        log(std::string("Error parsing orgMappings object: ") + e.what(), LogLevel::ERRORS);
+                    }
+                } else {
+                    log("orgMappings present but not array/object; ignoring", LogLevel::WARN);
+                }
+            }
+        } catch (const std::exception &e) {
+            log(std::string("Error parsing server config item: ") + e.what(), LogLevel::ERRORS);
+        }
+
+    } catch (const std::exception &e) {
+        log(std::string("Error in ParseServerConfig: ") + e.what(), LogLevel::ERRORS);
+    }
+
+    return serverConfig;
+}
 
 
 std::pair<int, std::string> extractNsAndValue(const std::string& input) {
