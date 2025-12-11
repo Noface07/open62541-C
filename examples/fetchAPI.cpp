@@ -761,21 +761,70 @@ UserProfile ParseUserProfile(string host, string port, string bearerToken,
 
 // Assumes `json` is nlohmann::json and types ServerConfig, orgMappings, log, LogLevel exist.
 
-ServerConfig ParseServerConfig(const std::string &host,
-                               const std::string &port,
-                               const std::string &bearerToken,
-                               const std::string &json_body,
-                               const std::string &target)
-{
+ServerConfig ServerConfigFromJSON(const json& item) {
     ServerConfig serverConfig;
     // Defaults
     serverConfig.id = 0;
     serverConfig.dataPointId = 0;
     serverConfig.port = 0;
 
+    try {
+        // Use value() which returns default if key missing or not convertible
+        serverConfig.id = item.value("id", 0);
+        serverConfig.name = item.value("name", std::string{});
+        serverConfig.ip = item.value("ip", std::string{});
+        serverConfig.port = item.value("port", 0);
+        serverConfig.nodeId = item.value("nodeId", std::string{});
+
+        // Handle orgMappings whether it's an object (single) or array (multiple)
+        if (item.contains("orgMappings")) {
+            const auto &om = item["orgMappings"];
+
+            if (om.is_array()) {
+                for (const auto &entry : om) {
+                    try {
+                        orgMappings mapping;
+                        mapping.id = entry.value("id", 0);
+                        mapping.hierarchyId = entry.value("hierarchyId", 0);
+                        mapping.mapOrgId = entry.value("mapOrgId", 0);
+                        mapping.orgShortCode = entry.value("orgShortCode", std::string{});
+                        serverConfig.orgMappings.push_back(std::move(mapping));
+                    } catch (const std::exception &e) {
+                        log(std::string("Error parsing orgMappings array entry: ") + e.what(), LogLevel::ERRORS);
+                    }
+                }
+            } else if (om.is_object()) {
+                try {
+                    orgMappings mapping;
+                    mapping.id = om.value("id", 0);
+                    mapping.hierarchyId = om.value("hierarchyId", 0);
+                    mapping.mapOrgId = om.value("mapOrgId", 0);
+                    mapping.orgShortCode = om.value("orgShortCode", std::string{});
+                    serverConfig.orgMappings.push_back(std::move(mapping));
+                } catch (const std::exception &e) {
+                    log(std::string("Error parsing orgMappings object: ") + e.what(), LogLevel::ERRORS);
+                }
+            } else {
+                log("orgMappings present but not array/object; ignoring", LogLevel::INFO);
+            }
+        }
+    } catch (const std::exception &e) {
+        log(std::string("Error in SevrverConfigFromJSON: ") + e.what(), LogLevel::ERRORS);
+    }
+    return serverConfig;
+}
+
+std::vector<ServerConfig> ParseServerConfig(const std::string &host,
+                               const std::string &port,
+                               const std::string &bearerToken,
+                               const std::string &json_body,
+                               const std::string &target)
+{
+    std::vector<ServerConfig> serverConfigs;
+
     if (bearerToken.empty()) {
-        log("ParseServerConfig: empty bearerToken; returning defaults", LogLevel::INFO);
-        return serverConfig;
+        log("ParseServerConfig: empty bearerToken; returning empty list", LogLevel::INFO);
+        return serverConfigs;
     }
 
     try {
@@ -786,60 +835,18 @@ ServerConfig ParseServerConfig(const std::string &host,
 
         if (!response.contains("data") || !response["data"].is_array() || response["data"].empty()) {
             log("ERROR: No 'data' field found in server config response or data is empty!", LogLevel::ERRORS);
-            return serverConfig;
+            return serverConfigs;
         }
 
-        const auto &item = response["data"].at(0); // first config
-
-        try {
-            // Use value() which returns default if key missing or not convertible
-            serverConfig.id = item.value("id", 0);
-            serverConfig.name = item.value("name", std::string{});
-            serverConfig.ip = item.value("ip", std::string{});
-            serverConfig.port = item.value("port", 0);
-            serverConfig.nodeId = item.value("nodeId", std::string{});
-
-            // Handle orgMappings whether it's an object (single) or array (multiple)
-            if (item.contains("orgMappings")) {
-                const auto &om = item["orgMappings"];
-
-                if (om.is_array()) {
-                    for (const auto &entry : om) {
-                        try {
-                            orgMappings mapping;
-                            mapping.id = entry.value("id", 0);
-                            mapping.hierarchyId = entry.value("hierarchyId", 0);
-                            mapping.mapOrgId = entry.value("mapOrgId", 0);
-                            mapping.orgShortCode = entry.value("orgShortCode", std::string{});
-                            serverConfig.orgMappings.push_back(std::move(mapping));
-                        } catch (const std::exception &e) {
-                            log(std::string("Error parsing orgMappings array entry: ") + e.what(), LogLevel::ERRORS);
-                        }
-                    }
-                } else if (om.is_object()) {
-                    try {
-                        orgMappings mapping;
-                        mapping.id = om.value("id", 0);
-                        mapping.hierarchyId = om.value("hierarchyId", 0);
-                        mapping.mapOrgId = om.value("mapOrgId", 0);
-                        mapping.orgShortCode = om.value("orgShortCode", std::string{});
-                        serverConfig.orgMappings.push_back(std::move(mapping));
-                    } catch (const std::exception &e) {
-                        log(std::string("Error parsing orgMappings object: ") + e.what(), LogLevel::ERRORS);
-                    }
-                } else {
-                    log("orgMappings present but not array/object; ignoring", LogLevel::WARN);
-                }
-            }
-        } catch (const std::exception &e) {
-            log(std::string("Error parsing server config item: ") + e.what(), LogLevel::ERRORS);
+        for (const auto &item : response["data"]) {
+           serverConfigs.push_back(ServerConfigFromJSON(item));
         }
 
     } catch (const std::exception &e) {
         log(std::string("Error in ParseServerConfig: ") + e.what(), LogLevel::ERRORS);
     }
 
-    return serverConfig;
+    return serverConfigs;
 }
 
 

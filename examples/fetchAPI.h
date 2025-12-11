@@ -67,7 +67,7 @@ std::vector<OrgConfig> ParseOrgConfig(std::string host, std::string port, std::s
 UserProfile ParseUserProfile(std::string host, std::string port, std::string bearerToken, 
                             std::string json_body, std::string target);
 
-ServerConfig ParseServerConfig(std::string host, std::string port, std::string bearerToken, std::string json_body, std::string target);
+std::vector<ServerConfig> ParseServerConfig(const std::string &host, const std::string &port, const std::string &bearerToken, const std::string &json_body, const std::string &target);
 
 /**
  * @brief A utility function to extract the namespace index and identifier from an OPC UA node string.
@@ -78,5 +78,7 @@ ServerConfig ParseServerConfig(std::string host, std::string port, std::string b
 std::pair<int, std::string> extractNsAndValue(const std::string& input);
 
 
+
+ServerConfig ServerConfigFromJSON(const json& item);
 
 #endif // API_HANDLER_H

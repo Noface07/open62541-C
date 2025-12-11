@@ -57,6 +57,98 @@
 #include <nlohmann/json.hpp>
 #include "alarm_enums.h"
 #include "AccessControl.h"
+#include <windows.h>
+#include "ServerConfig.h"
+
+// Helper to spawn a child server instance with configuration passed via Stdin
+void SpawnChildServer(const std::string& executablePath, const ServerConfig& config, const std::string& bearerToken) {
+    // 1. Serialize Config to JSON
+    json j;
+    j["bearerToken"] = bearerToken; // Pass token to child
+    
+    j["config"]["id"] = config.id;
+    j["config"]["name"] = config.name;
+    j["config"]["ip"] = config.ip;
+    j["config"]["port"] = config.port;
+    j["config"]["nodeId"] = config.nodeId;
+    
+    // Serialize orgMappings
+    j["config"]["orgMappings"] = json::array();
+    for(const auto& org : config.orgMappings) {
+        j["config"]["orgMappings"].push_back({
+            {"id", org.id},
+            {"hierarchyId", org.hierarchyId},
+            {"mapOrgId", org.mapOrgId},
+            {"orgShortCode", org.orgShortCode}
+        });
+    }
+
+    std::string jsonStr = j.dump();
+
+    // 2. Create Pipe for Stdin
+    HANDLE hReadPipe, hWritePipe;
+    SECURITY_ATTRIBUTES saAttr;
+    saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+    saAttr.bInheritHandle = TRUE;
+    saAttr.lpSecurityDescriptor = NULL;
+
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &saAttr, 0)) {
+        log("SpawnChild: CreatePipe failed", LogLevel::ERRORS);
+        return;
+    }
+
+    // Ensure write handle is NOT inherited
+    if (!SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, 0)) {
+        log("SpawnChild: SetHandleInformation failed", LogLevel::ERRORS);
+        return;
+    }
+
+    // 3. Setup Process Info
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdInput = hReadPipe; // Redirect Stdin
+    si.dwFlags |= STARTF_USESTDHANDLES;
+
+    ZeroMemory(&pi, sizeof(pi));
+
+    // Command Line: using original executable path + --child
+    std::string cmdLine = "\"" + executablePath + "\" --child";
+    
+    // 4. Create Process
+    if (!CreateProcessA(NULL, 
+                        const_cast<char*>(cmdLine.c_str()), 
+                        NULL, 
+                        NULL, 
+                        TRUE, // Inherit handles
+                        CREATE_NEW_CONSOLE, // Separate console for child? Or 0 to share?
+                        NULL, 
+                        NULL, 
+                        &si, 
+                        &pi)) 
+    {
+        log("SpawnChild: CreateProcess failed (" + std::to_string(GetLastError()) + ")", LogLevel::ERRORS);
+        return;
+    }
+
+    // 5. Write Data to Pipe
+    DWORD dwWritten;
+    if (!WriteFile(hWritePipe, jsonStr.c_str(), jsonStr.size(), &dwWritten, NULL)) {
+        log("SpawnChild: Write to bad pipe", LogLevel::ERRORS);
+    }
+
+    // 6. Close Pipes and Handles
+    CloseHandle(hWritePipe); // Sending EOF to child
+    CloseHandle(hReadPipe);
+    
+    log("✓ Spawned Child Instance for '" + config.name + "' (PID: " + std::to_string(pi.dwProcessId) + ")", LogLevel::INFO);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+}
 
 #ifdef _WIN32
 #include <direct.h>  // For _getcwd
@@ -356,8 +448,8 @@ customActivateSession(UA_Server *server,
     OrgConfig* targetOrg = nullptr;
     
     for(auto &org : g_organizations) {
-        // currentOrgId is string, org.id is int - convert for comparison
-        if(std::to_string(org.id) == profile.currentOrgId) {
+        // Fix: Compare profile.currentOrgId with org.orgId (the business ID), NOT org.id (the mapping primary key)
+        if(std::to_string(org.orgId) == profile.currentOrgId) {
             targetOrg = &org;
             break;
         }
@@ -3468,38 +3560,149 @@ main(int argc, char **argv) {
 
     std::string json_body = R"(
     {
-        "orgId": 0,
-        "roleId": "",
-        "userId": 0,
-        "moduleId": 0,
-        "userType": "",
-        "requestDateTime": "2024-12-26T08:16:05.629Z",
-        "ipAddress": "",
-        "originName": "",
-        "filterModel": {
-        "pageSize": 10,
-        "totalRows": 0,
-        "currentPage": 1,
-        "searchText": "",
-        "filterRowsCount": 0,
-        "orderType": "A",
-        "orderBy": "id"
-        }
+        "data": { "nodeId": "ND01" } 
     }
     )";
+    std::string target = "/api/GetOpcUaServersWithOrgMappings";
 
-    std::string target = "/api/GetAllOrganizationList";
+    ServerConfig current_config;
+    std::string bearerToken;
 
+    // Check for Child Mode
+    bool isChild = (argc > 1 && strcmp(argv[1], "--child") == 0);
+
+    if (isChild) {
+        log("👶 Starting in CHILD mode", LogLevel::INFO);
+        
+        // Read "Bootstrap Bundle" from Stdin
+        std::string inputJSON;
+        // Read until EOF
+        for (std::string line; std::getline(std::cin, line);) {
+            inputJSON += line;
+        }
+
+        try {
+             json j = json::parse(inputJSON);
+             if(j.contains("bearerToken")) {
+                 bearerToken = j["bearerToken"].get<std::string>();
+                 // g_bearerToken = bearerToken; // If global exists?
+             }
+             if(j.contains("config")) {
+                 current_config = ServerConfigFromJSON(j["config"]);
+             } else {
+                 log("❌ Child received invalid JSON: missing 'config'", LogLevel::ERRORS);
+                 return EXIT_FAILURE;
+             }
+             log("✓ Child Configured: " + current_config.name + " (" + std::to_string(current_config.port) + ")", LogLevel::INFO);
+        } catch(const std::exception& e) {
+             log("❌ Child failed to parse stdin JSON: " + std::string(e.what()), LogLevel::ERRORS);
+             return EXIT_FAILURE;
+        }
+
+        // Child authenticates? It has the token. 
+        // We can skip the `getBearerToken` call below if we already have it.
+
+    } else {
+        log("👑 Starting in MANAGER mode", LogLevel::INFO);
+        
+        // Acquire bearer token (Legacy logic preserved for manager)
+        try {
+            log("Acquiring bearer token for API authentication...", LogLevel::INFO);
+            json authResponse = getBearerToken(applicationEndURLHost, 
+                                            std::to_string(applicationEndURLPort),
+                                            authUsername, authPassword);
+            
+            if(authResponse.contains("access_token")) {
+                bearerToken = authResponse["access_token"].get<std::string>();
+                log("✓ Bearer token acquired successfully", LogLevel::INFO);
+            } else {
+                log("Bearer token response missing 'access_token' field", LogLevel::ERRORS);
+                return EXIT_FAILURE;
+            }
+        } catch(const std::exception& e) {
+            log("Failed to acquire bearer token: " + std::string(e.what()), LogLevel::ERRORS);
+            return EXIT_FAILURE;
+        }
+
+        // Fetch Server Configs
+        std::vector<ServerConfig> configs;
+        try {
+            log("Fetching server configurations...", LogLevel::INFO);
+            configs = ParseServerConfig(applicationEndURLHost, std::to_string(applicationEndURLPort), 
+                                        bearerToken, json_body, target);
+            
+            if(configs.empty()) {
+                log("❌ No server configurations found in API response. Exiting.", LogLevel::ERRORS);
+                return EXIT_FAILURE;
+            }
+
+            // 1. Configure Manager (Instance 0)
+            current_config = configs[0];
+            log("✓ Manager Configured: " + current_config.name + " (" + std::to_string(current_config.port) + ")", LogLevel::INFO);
+            
+            // DEBUG: Log all configs
+            for(size_t i=0; i<configs.size(); i++) {
+                log("  Config[" + std::to_string(i) + "]: " + configs[i].name + " Port: " + std::to_string(configs[i].port), LogLevel::DEBUG);
+            }
+
+            // 2. Spawn Children (Instances 1..N)
+            for(size_t i = 1; i < configs.size(); i++) {
+                log("🚀 Spawning child instance details for: " + configs[i].name, LogLevel::INFO);
+                SpawnChildServer(argv[0], configs[i], bearerToken);
+            }
+
+        } catch(const std::exception& e) {
+            log("Failed to fetch server configs: " + std::string(e.what()), LogLevel::ERRORS);
+            return EXIT_FAILURE;
+        }
+    }
+
+    // Common Logic: Apply Configuration
+    // 0. Set Global Bearer Token
+    g_bearerToken = bearerToken;
+    log("✓ Global Bearer Token set", LogLevel::DEBUG);
+
+    // 1. Override Port
+    if(current_config.port > 0) {
+        log("Configuring server on port " + std::to_string(current_config.port), LogLevel::INFO);
+        // Explicit clearing removed due to API access restrictions.
+        // Relying on UA_ServerConfig_setMinimal to handle configuration override.
+        
+        log("Attempting to set server port to: " + std::to_string(current_config.port), LogLevel::INFO);
+        UA_StatusCode retval = UA_ServerConfig_setMinimal(config, current_config.port, &certificate);
+        if(retval != UA_STATUSCODE_GOOD) {
+             log("Failed to set server port configuration: " + std::string(UA_StatusCode_name(retval)), LogLevel::ERRORS);
+        } else {
+             log("✓ UA_ServerConfig_setMinimal succeeded for port " + std::to_string(current_config.port), LogLevel::INFO);
+             // Verify actual configuration (Logging only, no struct access)
+             log("Server configuration applied.", LogLevel::INFO);
+        }
+
+        
+        // Re-apply custom logger as setDefault resets it
+        config->logging = &myLogger;
+    }
+
+    // 2. Map Organizations
+    // Replace legacy ParseOrgConfig call
     vector<OrgConfig> orgs;
-    try {
-        log("Fetching organization list from API...", LogLevel::INFO);
-        orgs = ParseOrgConfig(applicationEndURLHost, std::to_string(applicationEndURLPort), 
-                             BearerToken, json_body, target);
-        log("Successfully fetched " + std::to_string(orgs.size()) + " organizations", LogLevel::INFO);
-    } catch(const std::exception& e) {
-        log("Failed to fetch organization list: " + std::string(e.what()), LogLevel::ERRORS);
-        log("Server will start without multi-tenancy support", LogLevel::INFO);
-        // Continue with empty org list - server will run but without multi-tenant endpoints
+    if(!current_config.orgMappings.empty()) {
+        log("Mapping " + std::to_string(current_config.orgMappings.size()) + " organizations from config...", LogLevel::INFO);
+        for(const auto& map : current_config.orgMappings) {
+            OrgConfig org;
+            org.id = map.id; // Critical for routing
+            org.shortCode = map.orgShortCode; // Critical for topics?
+            org.orgId = map.mapOrgId; // Maybe needed?
+            // Convert other fields if needed, or leave defaults
+            org.name = map.orgShortCode; // Fallback
+            orgs.push_back(org);
+        }
+        
+        // Populate global organizations list immediately
+        g_organizations = orgs;
+        
+    } else {
+        log("⚠️ No orgMappings found for this instance.", LogLevel::INFO);
     }
 
     // ========================================================================
@@ -3534,7 +3737,7 @@ main(int argc, char **argv) {
     // ========================================================================
     
     UA_StatusCode retval = UA_ServerConfig_setDefaultWithSecurityPolicies(
-        config, 53531, &certificate, &privateKey, trustList, trustListSize, issuerList,
+        config, current_config.port, &certificate, &privateKey, trustList, trustListSize, issuerList,
         issuerListSize, revocationList, revocationListSize);
 
     if(retval != UA_STATUSCODE_GOOD) {
@@ -4420,7 +4623,11 @@ main(int argc, char **argv) {
     log("Starting OPC UA Server...", LogLevel::INFO);
     log("Added repeated callback for counter updates", LogLevel::DEBUG);
 
-    UA_Server_run_startup(server);
+    UA_StatusCode startupRc = UA_Server_run_startup(server);
+    if(startupRc != UA_STATUSCODE_GOOD) {
+         log("❌ Server startup failed with code: " + std::string(UA_StatusCode_name(startupRc)), LogLevel::ERRORS);
+         return EXIT_FAILURE;
+    }
     log("Server startup completed successfully", LogLevel::INFO);
     
     // ========================================================================

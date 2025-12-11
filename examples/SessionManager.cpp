@@ -99,12 +99,12 @@ bool SessionManager::registerSession(const UA_NodeId& sessionId,
     auto ctx = std::make_unique<SessionContext>();
     ctx->sessionKey = sessionKey;
     ctx->shortCode = shortCode;
-    ctx->orgId = orgConfig->id;
+    ctx->orgId = orgConfig->orgId;
     ctx->namespaceUri = "anexee:" + orgConfig->shortCode;
     ctx->shouldStop.store(false);
     
     log("🧵 Creating dedicated worker thread for org '" + shortCode + "' (OrgID: " + 
-        std::to_string(orgConfig->id) + ")", LogLevel::INFO);
+        std::to_string(orgConfig->orgId) + ")", LogLevel::INFO);
     
     // Spawn dedicated worker thread
     ctx->workerThread = std::thread(sessionWorkerThread, ctx.get(), server,
@@ -118,7 +118,7 @@ bool SessionManager::registerSession(const UA_NodeId& sessionId,
     threadIdStream << sessions[sessionKey]->workerThread.get_id();
     
     log("✓ Session registered and worker thread started for org '" + shortCode + 
-        "' (OrgID: " + std::to_string(orgConfig->id) + 
+        "' (OrgID: " + std::to_string(orgConfig->orgId) + 
         ", Thread ID: " + threadIdStream.str() + ")", 
         LogLevel::INFO);
     
@@ -179,5 +179,8 @@ size_t SessionManager::getActiveSessionCount() const {
 // Validate shortCode
 bool SessionManager::isValidShortCode(const std::string& shortCode) const {
     std::lock_guard<std::mutex> lock(managerMutex);
-    return endpointMappings.find(shortCode) != endpointMappings.end();
+    for(const auto& org : organizations) {
+        if(org.shortCode == shortCode) return true;
+    }
+    return false;
 }
