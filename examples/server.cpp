@@ -43,6 +43,7 @@
 #include "Logger.h"
 #include "fetchAPI.h"
 #include "SessionManager.h"
+#include "Encryption.h"
 #include <async_mqtt/all.hpp>
 #include <async_mqtt/asio_bind/predefined_layer/mqtts.hpp>
 #include <async_mqtt/asio_bind/predefined_layer/ws.hpp>
@@ -388,11 +389,12 @@ customActivateSession(UA_Server *server,
         }
     }
     
-    // Handle anonymous login - use appsettings credentials
+    // Handle anonymous login - DISABLED
     if(isAnonymous) {
-        log("  Anonymous login detected - using default credentials from appsettings", LogLevel::INFO);
-        username = g_authUsername;  // From appsettings.json
-        password = g_authPassword;  // From appsettings.json
+        log("❌ Anonymous login detected and rejected", LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+        // username = g_authUsername;  // From appsettings.json
+        // password = g_authPassword;  // From appsettings.json
     } else {
         log("  User: " + username, LogLevel::INFO);
     }
@@ -401,13 +403,20 @@ customActivateSession(UA_Server *server,
         log("❌ Missing credentials", LogLevel::ERRORS);
         return UA_STATUSCODE_BADUSERACCESSDENIED;
     }
+
+    // Encrypt password for API authentication (ONLY for user credentials, not appsettings)
+    std::string finalPassword = password;
+    if(!isAnonymous) {
+        finalPassword = GetEncryptedString("", password, 0);
+        log("DEBUG: Encrypted Password for user '" + username + "': " + finalPassword, LogLevel::INFO);
+    }
     
     // ========================================================================
     // STEP 2: Get Bearer Token
     // ========================================================================
     json tokenResponse;
     try {
-        tokenResponse = getBearerToken(g_apiHost, g_apiPort, username, password);
+        tokenResponse = getBearerToken(g_apiHost, g_apiPort, username, finalPassword);
     } catch(const std::exception &e) {
         log("❌ Bearer token request failed: " + std::string(e.what()), LogLevel::ERRORS);
         return UA_STATUSCODE_BADUSERACCESSDENIED;
@@ -3449,33 +3458,41 @@ main(int argc, char **argv) {
     g_apiHost = applicationEndURLHost;
     g_apiPort = std::to_string(applicationEndURLPort);
 
-    // Acquire bearer token for API authentication
+    // Acquire bearer token for API authentication with Retry Logic
     std::string BearerToken;
-    try {
+    int retryDelay = 5;
+    
+    while(true) {
         std::cout << "Acquiring bearer token for API authentication..." << std::endl;
         log("Acquiring bearer token for API authentication...", LogLevel::INFO);
-        json authResponse = getBearerToken(applicationEndURLHost, 
-                                           std::to_string(applicationEndURLPort),
-                                           authUsername, authPassword);
         
-        if(authResponse.contains("access_token")) {
-            BearerToken = authResponse["access_token"].get<std::string>();
-            std::cout << "✓ Bearer token acquired successfully" << std::endl;
-            log("Bearer token acquired successfully", LogLevel::INFO);
-        } else {
-            std::cerr << "ERROR: Bearer token response missing 'access_token' field" << std::endl;
-            log("Bearer token response missing 'access_token' field", LogLevel::ERRORS);
-            // log("Response: " + authResponse.dump(), LogLevel::DEBUG);
-            std::cerr << "Press Enter to exit..." << std::endl;
-            std::cin.get();
-            return EXIT_FAILURE;
+        try {
+            json authResponse = getBearerToken(applicationEndURLHost, 
+                                               std::to_string(applicationEndURLPort),
+                                               authUsername, authPassword);
+            
+            if(authResponse.contains("access_token")) {
+                BearerToken = authResponse["access_token"].get<std::string>();
+                g_bearerToken = BearerToken; // Ensure global is set
+                std::cout << "✓ Bearer token acquired successfully" << std::endl;
+                log("Bearer token acquired successfully", LogLevel::INFO);
+                break; // Success
+            } else {
+                std::cerr << "ERROR: Bearer token response missing 'access_token' field" << std::endl;
+                log("Bearer token response missing 'access_token' field", LogLevel::ERRORS);
+            }
+        } catch(const std::exception& e) {
+            std::cerr << "ERROR: Failed to acquire bearer token: " << e.what() << std::endl;
+            log("Failed to acquire bearer token: " + std::string(e.what()), LogLevel::ERRORS);
         }
-    } catch(const std::exception& e) {
-        std::cerr << "ERROR: Failed to acquire bearer token: " << e.what() << std::endl;
-        log("Failed to acquire bearer token: " + std::string(e.what()), LogLevel::ERRORS);
-        log("Press Enter to exit...", LogLevel::ERRORS);
-        std::cin.get();
-        return EXIT_FAILURE;
+        
+        std::cout << "⚠️ Retrying in " << retryDelay << " seconds..." << std::endl;
+        log("⚠️ Retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::INFO);
+        std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
+        
+        if(retryDelay < 15) {
+            retryDelay += 5;
+        }
     }
 
     // Global logging control - DISABLED BY DEFAULT
@@ -3606,25 +3623,9 @@ main(int argc, char **argv) {
         log("👑 Starting in MANAGER mode", LogLevel::INFO);
         
         // Acquire bearer token (Legacy logic preserved for manager)
-        try {
-            log("Acquiring bearer token for API authentication...", LogLevel::INFO);
-            json authResponse = getBearerToken(applicationEndURLHost, 
-                                            std::to_string(applicationEndURLPort),
-                                            authUsername, authPassword);
-            
-            if(authResponse.contains("access_token")) {
-                bearerToken = authResponse["access_token"].get<std::string>();
-                log("✓ Bearer token acquired successfully", LogLevel::INFO);
-            } else {
-                log("Bearer token response missing 'access_token' field", LogLevel::ERRORS);
-                return EXIT_FAILURE;
-            }
-        } catch(const std::exception& e) {
-            log("Failed to acquire bearer token: " + std::string(e.what()), LogLevel::ERRORS);
-            return EXIT_FAILURE;
-        }
+        // Token already acquired in startup
+        bearerToken = g_bearerToken;
 
-        // Fetch Server Configs
         std::vector<ServerConfig> configs;
         try {
             log("Fetching server configurations...", LogLevel::INFO);

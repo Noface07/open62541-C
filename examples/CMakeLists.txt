@@ -160,6 +160,7 @@ set(CLIENT_LIB_SOURCES
     MQTThandler.cpp
     SqliteQueueService.cpp
     fetchAPI.cpp
+    Encryption.cpp
     Monitoring.cpp
 )
 
