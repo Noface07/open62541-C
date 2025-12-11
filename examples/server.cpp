@@ -2964,7 +2964,7 @@ void start_mqtt_client(UA_Server *server) {
                                                     
                                                 // Iterate through all alarms mapped to this trigger
                                                 {
-                                                    std::lock_guard<std::mutex> lock(g_alarmMutex); // 🔒 CRITICAL: Protect g_alarmByKey and g_alarmBranches
+                                                    // std::lock_guard<std::mutex> lock(g_alarmMutex); // REMOVED: Already locked in outer scope
                                                     
                                                     for(const auto &mapping : mappings) {
                                                         // Filter by AETypeID
@@ -3212,8 +3212,8 @@ void start_mqtt_client(UA_Server *server) {
                                                                      UA_ByteString *newEvtId = (UA_ByteString*)evtVar.data;
                                                                      
                                                                      if(!aeInstanceId.empty() && aeInstanceId != "null" && aeInstanceId != "0") {
-                                                                          std::lock_guard<std::mutex> lock(g_alarmMutex);
-                                                                          auto &branchStateMap = g_branchStates[mapping.alarmKey];
+                                                                           // std::lock_guard<std::mutex> lock(g_alarmMutex); // REMOVED: Already locked in outer scope
+                                                                           auto &branchStateMap = g_branchStates[mapping.alarmKey];
                                                                           if(branchStateMap.find(aeInstanceId) != branchStateMap.end()) {
                                                                                branchStateMap[aeInstanceId].addEventId(newEvtId);
                                                                                // log("DEBUG: Captured Implicit EventId: " + toHex(newEvtId), LogLevel::INFO);
