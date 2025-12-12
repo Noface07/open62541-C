@@ -470,35 +470,35 @@ vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToke
                 alarmConfig.sopProcedure = item.contains("sopProcedure") ? item["sopProcedure"].get<string>() : "";
                 alarmConfig.annunciation = item.contains("annunciation") ? item["annunciation"].get<string>() : "";
                 alarmConfig.ackType = item.contains("ackType") ? item["ackType"].get<string>() : "";
-                alarmConfig.enable = item.contains("enable") ? item["enable"].get<string>() : "";
+                alarmConfig.enable = item.contains("enable") ? item["enable"].get<bool>() : false;
 
                 
                 // API returns booleans, but struct stores as strings - check contains() first
                 if(item.contains("bedgeNotification")) {
                     alarmConfig.bedgeNotification = item["bedgeNotification"].is_boolean() 
-                        ? (item["bedgeNotification"].get<bool>() ? "true" : "false")
-                        : item["bedgeNotification"].get<string>();
+                        ? item["bedgeNotification"].get<bool>()
+                        : (item["bedgeNotification"].get<string>() == "true");
                 } else {
-                    alarmConfig.bedgeNotification = "false";
+                    alarmConfig.bedgeNotification = false;
                 }
                 if(item.contains("smsNotification")) {
                     alarmConfig.smsNotification = item["smsNotification"].is_boolean()
-                        ? (item["smsNotification"].get<bool>() ? "true" : "false")
-                        : item["smsNotification"].get<string>();
+                        ? item["smsNotification"].get<bool>()
+                        : (item["smsNotification"].get<string>() == "true");
                 } else {
-                    alarmConfig.smsNotification = "false";
+                    alarmConfig.smsNotification = false;
                 }
                 if(item.contains("emailNotification")) {
                     alarmConfig.emailNotification = item["emailNotification"].is_boolean()
-                        ? (item["emailNotification"].get<bool>() ? "true" : "false")
-                        : item["emailNotification"].get<string>();
+                        ? item["emailNotification"].get<bool>()
+                        : (item["emailNotification"].get<string>() == "true");
                 } else {
-                    alarmConfig.emailNotification = "false";
+                    alarmConfig.emailNotification = false;
                 }
                 // alarmConfig.whatsapNotification = item["whatsapNotification"].get<string>();
                 alarmConfig.reset = item.contains("reset") ? item["reset"].get<string>() : "";
-                alarmConfig.escalationWF = item.contains("escalationWF") ? item["escalationWF"].get<string>() : "";
-                alarmConfig.suppression = item.contains("suppression") ? item["suppression"].get<string>() : "";
+                alarmConfig.escalationWF = item.contains("escalationWF") ? item["escalationWF"].get<bool>() : false;
+                alarmConfig.suppression = item.contains("suppression") ? item["suppression"].get<bool>() : false;
                 // alarmConfig.enableLogging = item["enableLogging"].get<string>();
                 alarmConfig.loggingFreq = item.contains("loggingFreq") ? item["loggingFreq"].get<string>() : "";
                 alarmConfig.purging = item.contains("purging") ? item["purging"].get<string>() : "";
@@ -514,11 +514,10 @@ vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToke
                         // Check contains() FIRST to avoid assertion failures
                         alarmTrigger.id = (!triggerItem.contains("id") || triggerItem["id"].is_null()) 
                             ? 0 : triggerItem["id"].get<int>();
-                        // alarmTrigger.alarmShortCode = triggerItem["alarmShortCode"].get<string>();
-                        alarmTrigger.applicableTagId = (!triggerItem.contains("applicableTagId") || triggerItem["applicableTagId"].is_null()) 
-                            ? "" : triggerItem["applicableTagId"].get<string>();
-                        alarmTrigger.applicableTagName = (!triggerItem.contains("applicableTagName") || triggerItem["applicableTagName"].is_null()) 
-                            ? "" : triggerItem["applicableTagName"].get<string>();
+                        
+                        alarmTrigger.tagId = (!triggerItem.contains("tagId") || triggerItem["tagId"].is_null()) 
+                            ? 0 : triggerItem["tagId"].get<int>();
+                        
                         alarmTrigger.tagType = (!triggerItem.contains("tagType") || triggerItem["tagType"].is_null()) 
                             ? "" : triggerItem["tagType"].get<string>();
                         
@@ -537,36 +536,27 @@ vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToke
                             ? "" : triggerItem["state"].get<string>();
                         alarmTrigger.activationDelay = (!triggerItem.contains("activationDelay") || triggerItem["activationDelay"].is_null()) 
                             ? 0 : triggerItem["activationDelay"].get<int>();
-                        alarmTrigger.hysteresisOrResetDelay = (!triggerItem.contains("hysteresisOrResetDelay") || triggerItem["hysteresisOrResetDelay"].is_null()) 
-                            ? 0 : triggerItem["hysteresisOrResetDelay"].get<int>();
+                        
+                        alarmTrigger.resetDelayInCounter = (!triggerItem.contains("resetDelayInCounter") || triggerItem["resetDelayInCounter"].is_null()) 
+                            ? 0 : triggerItem["resetDelayInCounter"].get<int>();
+                            
                         alarmTrigger.evaluatedOn = (!triggerItem.contains("evaluatedOn") || triggerItem["evaluatedOn"].is_null()) 
                             ? "" : triggerItem["evaluatedOn"].get<string>();
                         alarmTrigger.evaluationInterval = (!triggerItem.contains("evaluationInterval") || triggerItem["evaluationInterval"].is_null()) 
                             ? "" : triggerItem["evaluationInterval"].get<string>();
-                        // alarmTrigger.activationType = triggerItem["activationType"].get<string>();
-                        // alarmTrigger.distance = triggerItem["distance"].get<double>();
                         
-                        // Handle 'value' field - can be missing, null, empty string, or number
-                        if(triggerItem.contains("value") && !triggerItem["value"].is_null()) {
-                            if(triggerItem["value"].is_string()) {
-                                std::string valStr = triggerItem["value"].get<std::string>();
-                                if(valStr.empty()) {
-                                    alarmTrigger.value = 0.0;
-                                } else {
-                                    try {
-                                        alarmTrigger.value = std::stod(valStr);
-                                    } catch(...) {
-                                        alarmTrigger.value = 0.0;
-                                    }
-                                }
-                            } else if(triggerItem["value"].is_number()) {
-                                alarmTrigger.value = triggerItem["value"].get<double>();
-                            } else {
-                                alarmTrigger.value = 0.0;
-                            }
-                        } else {
-                            alarmTrigger.value = 0.0;
-                        }
+                        alarmTrigger.triggerType = (!triggerItem.contains("triggerType") || triggerItem["triggerType"].is_null()) 
+                            ? "" : triggerItem["triggerType"].get<string>();
+
+                        alarmTrigger.nameSpace = (!triggerItem.contains("nameSpace") || triggerItem["nameSpace"].is_null()) 
+                            ? "" : triggerItem["nameSpace"].get<string>();
+
+                        alarmTrigger.topic = (!triggerItem.contains("topic") || triggerItem["topic"].is_null()) 
+                            ? "" : triggerItem["topic"].get<string>();
+
+                        alarmTrigger.infoId = (!triggerItem.contains("infoId") || triggerItem["infoId"].is_null()) 
+                            ? 0 : triggerItem["infoId"].get<int>();
+
                         alarmTriggers.push_back(alarmTrigger);
                     } catch(const std::exception &e) {
                         log("Error parsing alarm trigger: " + std::string(e.what()), LogLevel::ERRORS);
@@ -588,15 +578,10 @@ vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToke
                             ? 0 : emitterItem["emitterNode"].get<int>();
                         alarmEmitter.emitterNodeName = (!emitterItem.contains("emitterNodeName") || emitterItem["emitterNodeName"].is_null()) 
                             ? "" : emitterItem["emitterNodeName"].get<string>();
+                        alarmEmitter.alarmTagNameSpace = (!emitterItem.contains("alarmTagNameSpace") || emitterItem["alarmTagNameSpace"].is_null()) 
+                            ? "" : emitterItem["alarmTagNameSpace"].get<string>();
                         alarmEmitter.orgId = (!emitterItem.contains("orgId") || emitterItem["orgId"].is_null()) 
                             ? 0 : emitterItem["orgId"].get<int>();
-                        // alarmEmitter.createdBy = emitterItem["createdBy"].get<string>();
-                        // alarmEmitter.createdOn = emitterItem["createdOn"].get<string>();
-                        // alarmEmitter.updatedBy = emitterItem["updatedBy"].get<string>();
-                        // alarmEmitter.updatedOn = emitterItem["updatedOn"].get<string>();
-                        // alarmEmitter.isDeleted = emitterItem["isDeleted"].get<string>();
-                        // alarmEmitter.deletedBy = emitterItem["deletedBy"].get<string>();
-                        // alarmEmitter.deletedOn = emitterItem["deletedOn"].get<string>();
                         alarmEmitters.push_back(alarmEmitter);
                         } catch(const std::exception &e) {
                             log("Error parsing alarm emitter: " + std::string(e.what()), LogLevel::ERRORS);

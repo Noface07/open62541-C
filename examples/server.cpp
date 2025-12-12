@@ -60,9 +60,24 @@
 #include "AccessControl.h"
 #include <windows.h>
 #include "ServerConfig.h"
+#include "ServiceUtils.h"
+
+// Service Globals
+SERVICE_STATUS g_ServiceStatus;
+SERVICE_STATUS_HANDLE g_StatusHandle;
+
 
 // Helper to spawn a child server instance with configuration passed via Stdin
-void SpawnChildServer(const std::string& executablePath, const ServerConfig& config, const std::string& bearerToken) {
+// Helper to spawn a child server instance with configuration passed via Stdin
+void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config, const std::string& bearerToken, bool headless) {
+    // 0. Get Absolute Path of Self (Robust against CWD changes)
+    char selfPath[MAX_PATH];
+    if (GetModuleFileNameA(NULL, selfPath, MAX_PATH) == 0) {
+        log("SpawnChild: Failed to get self path", LogLevel::ERRORS);
+        return;
+    }
+    std::string executablePath = std::string(selfPath);
+
     // 1. Serialize Config to JSON
     json j;
     j["bearerToken"] = bearerToken; // Pass token to child
@@ -125,7 +140,7 @@ void SpawnChildServer(const std::string& executablePath, const ServerConfig& con
                         NULL, 
                         NULL, 
                         TRUE, // Inherit handles
-                        CREATE_NEW_CONSOLE, // Separate console for child? Or 0 to share?
+                        headless ? CREATE_NO_WINDOW : CREATE_NEW_CONSOLE, // Flags
                         NULL, 
                         NULL, 
                         &si, 
@@ -1440,7 +1455,7 @@ customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
         }
         
         // Publish request
-        std::string subTopic = triggerTopics[0] + ".event";
+        std::string subTopic = triggerTopics[0] + "/Event";
         publish_to_mqtt(subTopic, out.dump());
         
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -1549,7 +1564,7 @@ customConfirmCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
         }
         
         // Publish request
-        std::string subTopic = triggerTopics[0] + ".event";
+        std::string subTopic = triggerTopics[0] + "/Event";
         publish_to_mqtt(subTopic, out.dump());
         
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -1624,7 +1639,7 @@ customEnableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessio
         };
         
         // Publish request
-        std::string subTopic = triggerTopics[0] + ".event";
+        std::string subTopic = triggerTopics[0] + "/Event";
         publish_to_mqtt(subTopic, out.dump());
         
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -1699,7 +1714,7 @@ customDisableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
         };
         
         // Publish request
-        std::string subTopic = triggerTopics[0] + ".event";
+        std::string subTopic = triggerTopics[0] + "/Event";
         publish_to_mqtt(subTopic, out.dump());
         
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -1819,7 +1834,7 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
         };
         
         // Publish request
-        std::string subTopic = triggerTopics[0] + ".event";
+        std::string subTopic = triggerTopics[0] + "/Event";
         publish_to_mqtt(subTopic, out.dump());
         
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -2772,10 +2787,10 @@ as::awaitable<void> perform_subscriptions() {
         for(const auto& topic : batch) {
             sub_entry.push_back({topic, am::qos::at_most_once}); // Generic / Base Telemetry
 
-            // Only subscribe to .event if this topic is a registered Alarm Trigger
+            // Only subscribe to /Event if this topic is a registered Alarm Trigger
             if(g_triggerToAlarmMap.find(topic) != g_triggerToAlarmMap.end()) {
-                sub_entry.push_back({topic + ".event", am::qos::at_most_once});
-                log("DEBUG: Preparing ALARM subscription for '" + topic + ".event'", LogLevel::INFO);
+                sub_entry.push_back({topic + "/Event", am::qos::at_most_once});
+                log("DEBUG: Preparing ALARM subscription for '" + topic + "/Event'", LogLevel::INFO);
             }
         }
     }
@@ -2867,10 +2882,10 @@ void start_mqtt_client(UA_Server *server) {
                                     /* Check if this is a trigger topic for alarm conditions (.alarm.pub suffix) */
                                     std::string baseTopic = topic;
                                     
-                                    // Check if topic ends with .event and extract base topic
-                                    if(topic.size() > 6 && topic.rfind(".event") == topic.size() - 6) {
+                                    // Check if topic ends with /Event and extract base topic
+                                    if(topic.size() > 6 && topic.rfind("/Event") == topic.size() - 6) {
                                         baseTopic = topic.substr(0, topic.size() - 6);
-                                        log("DEBUG: Detected .event topic, base='" + baseTopic + "'", LogLevel::INFO);
+                                        log("DEBUG: Detected /Event topic, base='" + baseTopic + "'", LogLevel::INFO);
                                     }
 
                                     // Thread-Safe Lookup: Copy mappings to local vector under lock
@@ -3378,12 +3393,34 @@ void start_mqtt_client(UA_Server *server) {
 
 
 
-int
-main(int argc, char **argv) {
+// Migrated logic from main()
+int RunServer(int argc, char **argv) {
+    // Determine if running as service (via arguments or context)
+    bool isService = false;
+    for(int i=0; i<argc; i++) {
+        if(std::string(argv[i]) == "--service") {
+            isService = true;
+            break;
+        }
+    }
+
+    // Force logging configuration for service mode
+    // BEFORE any logging happens
+    if(isService) {
+        g_logging_enabled = true;
+        g_debug = false; 
+    }
+    
     // Early console output before logging is initialized
-    log("==================================================", LogLevel::INFO);
-    log("OPC UA Server Starting...", LogLevel::INFO);
-    log("==================================================", LogLevel::INFO);
+    if(!isService) {
+        log("==================================================", LogLevel::INFO);
+        log("OPC UA Server Starting...", LogLevel::INFO);
+        log("==================================================", LogLevel::INFO);
+    } else {
+        // Just log to file if service
+        // init_logging call comes later, but we can rely on default "server.log" or init call
+    }
+
 
     // Load configuration from appsettings.json
     log("Loading configuration from appsettings.json...", LogLevel::INFO);
@@ -3610,7 +3647,11 @@ main(int argc, char **argv) {
                  log("❌ Child received invalid JSON: missing 'config'", LogLevel::ERRORS);
                  return EXIT_FAILURE;
              }
+             
+             // Re-initialize logging for Child to avoid file lock contention with Manager
+             init_logging("logs/" + current_config.name, current_config.name, true);
              log("✓ Child Configured: " + current_config.name + " (" + std::to_string(current_config.port) + ")", LogLevel::INFO);
+             log("Baby Starting in CHILD mode (Log switched)", LogLevel::INFO);
         } catch(const std::exception& e) {
              log("❌ Child failed to parse stdin JSON: " + std::string(e.what()), LogLevel::ERRORS);
              return EXIT_FAILURE;
@@ -3649,7 +3690,7 @@ main(int argc, char **argv) {
             // 2. Spawn Children (Instances 1..N)
             for(size_t i = 1; i < configs.size(); i++) {
                 log("🚀 Spawning child instance details for: " + configs[i].name, LogLevel::INFO);
-                SpawnChildServer(argv[0], configs[i], bearerToken);
+                SpawnChildServer(argv[0], configs[i], bearerToken, isService);
             }
 
         } catch(const std::exception& e) {
@@ -4533,7 +4574,7 @@ main(int argc, char **argv) {
         for(const auto &triggerPair : g_triggerToAlarmMap) {
             const std::string &baseTriggerTopic = triggerPair.first;
             // Add .event suffix for trigger topics
-            std::string triggerTopic = baseTriggerTopic + ".event";
+            std::string triggerTopic = baseTriggerTopic + "/Event";
             
             UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                        "  Trigger topic: '%s' -> %zu alarm(s)",
@@ -4841,5 +4882,136 @@ main(int argc, char **argv) {
     return EXIT_SUCCESS;
 }
 
-// Build an OPC UA Server that dynamically updates its address space using data received
-// via MQTT, which in turn is sourced from a database.
+// ========================================================================
+// WINDOWS SERVICE IMPLEMENTATION
+// ========================================================================
+
+void WINAPI ServiceCtrlHandler(DWORD CtrlCode) {
+    switch (CtrlCode) {
+    case SERVICE_CONTROL_STOP:
+        if (g_ServiceStatus.dwCurrentState != SERVICE_RUNNING)
+            break;
+
+        g_ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
+        g_ServiceStatus.dwCheckPoint = 4;
+        g_ServiceStatus.dwWaitHint = 0;
+        SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+
+        // Signal Server to Stop
+        running = false;
+        // Optionally raise SIGINT if running logic relies on it?
+        // But running=false should be enough for the loop.
+        break;
+    default:
+        break;
+    }
+}
+
+void WINAPI ServiceMain(DWORD argc, LPSTR *argv) {
+    g_StatusHandle = RegisterServiceCtrlHandlerA(SERVICE_NAME, ServiceCtrlHandler);
+    if (!g_StatusHandle) {
+        return;
+    }
+
+    g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_ServiceStatus.dwCurrentState = SERVICE_START_PENDING;
+    g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+    g_ServiceStatus.dwWin32ExitCode = 0;
+    g_ServiceStatus.dwServiceSpecificExitCode = 0;
+    g_ServiceStatus.dwCheckPoint = 0;
+    g_ServiceStatus.dwWaitHint = 3000;
+    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+
+    // FIX: Services start in C:\Windows\System32. We must change CWD to executable directory
+    // so that relative paths for logs, certificates, and config files work correctly.
+    char modulePath[MAX_PATH];
+    if (GetModuleFileNameA(NULL, modulePath, MAX_PATH) > 0) {
+        std::string path(modulePath);
+        std::string dir = path.substr(0, path.find_last_of("\\/"));
+        if (!SetCurrentDirectoryA(dir.c_str())) {
+             // Log error but proceed? Or fail? 
+             // Without this, everything else will likely fail anyway.
+        }
+    }
+
+    // Initialize Logging for Service
+    init_logging("logs/service", "anexee_service", true);
+    log("Service Starting...", LogLevel::INFO);
+
+    // Report Running
+    g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
+    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+
+    // Prepare arguments for RunServer
+    // We can pass empty args or constructor args if needed
+    // But RunServer usually handles "console" args. 
+    // We should pass --service explicitly just in case RunServer checks it again
+    int s_argc = 2;
+    char* s_argv[] = { (char*)"server.exe", (char*)"--service", NULL };
+
+    // RUN THE SERVER
+    RunServer(s_argc, s_argv);
+
+    // After RunServer returns
+    log("Service Stopping...", LogLevel::INFO);
+    g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+}
+
+// ========================================================================
+// ENTRY POINT
+// ========================================================================
+
+int main(int argc, char **argv) {
+    // 1. Check for Service Management Flags
+    if (argc > 1) {
+        if (std::string(argv[1]) == "--install") {
+            if (InstallService(SERVICE_NAME, DISPLAY_NAME)) {
+                std::cout << "To start the service, run: sc start " << SERVICE_NAME << std::endl;
+                return 0;
+            } else {
+                return 1;
+            }
+        } 
+        else if (std::string(argv[1]) == "--uninstall") {
+             if (UninstallService(SERVICE_NAME)) {
+                 return 0;
+             } else {
+                 return 1;
+             }
+        }
+    }
+
+    // 2. Check if started as a Service (by SCM)
+    // SCM usually doesn't pass arguments to main(), but we check for our own flag just in case
+    // However, StartServiceCtrlDispatcher is what we SHOULD call if we suspect we are a service.
+    // But we can't just call it always because it blocks and fails if not service.
+    // Convention: Service binaries are just run without args or with specific args.
+    
+    // HEURISTIC: If --service is passed, we definitely try SCM dispatch
+    bool tryService = false;
+    for(int i=1; i<argc; i++) {
+        if(std::string(argv[i]) == "--service") tryService = true;
+    }
+
+    if(tryService) {
+        SERVICE_TABLE_ENTRYA ServiceTable[] = {
+            { (LPSTR)SERVICE_NAME, (LPSERVICE_MAIN_FUNCTIONA)ServiceMain },
+            { NULL, NULL }
+        };
+
+        if (StartServiceCtrlDispatcherA(ServiceTable)) {
+            return 0;
+        } else {
+            // Failed to start as service? Fallback or Error?
+            // If user ran --service from console, this error is expected (ERROR_FAILED_SERVICE_CONTROLLER_CONNECT)
+            std::cerr << "StartServiceCtrlDispatcher failed (Code: " << GetLastError() << ")." << std::endl;
+            std::cerr << "Run without --service to start in console mode." << std::endl;
+            return 1;
+        }
+    }
+
+    // 3. Normal Console / Child Mode
+    // If not --install/uninstall/service, run normally
+    return RunServer(argc, argv);
+}

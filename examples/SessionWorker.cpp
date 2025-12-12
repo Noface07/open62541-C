@@ -501,7 +501,7 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                 
                 if(sc == UA_STATUSCODE_GOOD) {
                     // Initialize alarm state (STEALTH MODE)
-                    UA_Boolean enabled = (alarm.enable == "STS_TRUE") ? UA_TRUE : UA_FALSE;
+                    UA_Boolean enabled = alarm.enable ? UA_TRUE : UA_FALSE;
                     setStealthValueByPath(server, alarmId, {"EnabledState", "Id"}, &enabled, &UA_TYPES[UA_TYPES_BOOLEAN]);
                     
                     UA_Boolean inactive = UA_FALSE;
@@ -562,7 +562,7 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                              g_alarmByKey[alarmKey] = safeAlarmId;
                          }
 
-                         // Note: GlobalMQTT_Subscribe will automaticaly subscribe to topic + ".event"
+
                          // via logic in perform_subscriptions (server.cpp) IF the topic is in the map.
                          log("DEBUG: Subscribing to Emitter Topic (Alarm Prepared): " + topic, LogLevel::INFO);
                          GlobalMQTT_Subscribe(topic);

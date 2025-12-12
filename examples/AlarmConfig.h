@@ -6,11 +6,11 @@
 
 using namespace std;
 
+
+
+            
 struct AlarmTrigger{
     int id;
-    // string alarmShortCode;
-    string applicableTagId;
-    string applicableTagName;
     string tagType;
     double hiHi;
     double hi;
@@ -18,12 +18,14 @@ struct AlarmTrigger{
     double loLo;
     string state;
     int activationDelay;
-    int hysteresisOrResetDelay;
+    int resetDelayInCounter;
     string evaluatedOn;
     string evaluationInterval;
-    // string activationType;s
-    // double distance;
-    double value;
+    string triggerType;
+    int tagId;
+    string nameSpace;
+    string topic;
+    int infoId;
 };
 
 struct AlarmEmitter{
@@ -31,6 +33,7 @@ struct AlarmEmitter{
     string alarmShortcode;
     int emitterNode;
     string emitterNodeName;
+    string alarmTagNameSpace;
     int orgId;
     // string createdBy;
     // string createdOn;
@@ -57,18 +60,18 @@ struct AlarmConfig{
     string sopProcedure;
     string annunciation;
     string ackType;
-    string bedgeNotification;
-    string smsNotification;
-    string emailNotification;
+    bool bedgeNotification;
+    bool smsNotification;
+    bool emailNotification;
     // string whatsapNotification;
     string reset;
-    string escalationWF;
-    string suppression;
+    bool escalationWF;
+    bool suppression;
     // string enableLogging;
     string loggingFreq;
     string purging;
     int orgId;
-    string enable;
+    bool enable;
     // string removeIds;
     optional<vector<AlarmTrigger>> alarmTriggers;
     optional<vector<AlarmEmitter>> alarmEmitters;

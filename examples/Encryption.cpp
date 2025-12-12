@@ -26,20 +26,6 @@ static std::string base64_encode(const std::vector<unsigned char>& data) {
     return res;
 }
 
-// Helper: Base64 String -> Hex String of ASCII values
-// Matches C# logic: data = Convert.ToBase64String(...) followed by ConvertStringToHex(data)
-// assuming ConvertStringToHex converts the chars of the string to hex.
-static std::string stringToHex(const std::string& input) {
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0');
-    // Using uppercase to match common C# behavior (ToString("X2"))
-    ss << std::uppercase; 
-    for (unsigned char c : input) {
-        ss << std::setw(2) << (int)c;
-    }
-    return ss.str();
-}
-
 std::string GetEncryptedString(std::string encryptionKey, std::string data, int encType) {
     if (encryptionKey.empty()) {
         encryptionKey = "BAKRNOCTECHONDATER"; 
@@ -68,9 +54,6 @@ std::string GetEncryptedString(std::string encryptionKey, std::string data, int 
     std::memcpy(key, derived, 32);
     std::memcpy(iv, derived + 32, 16);
 
-    log("DEBUG: Key (Hex): " + stringToHex(std::string((char*)key, 32)), LogLevel::INFO);
-    log("DEBUG: IV (Hex): " + stringToHex(std::string((char*)iv, 16)), LogLevel::INFO);
-
     // 3. AES Encryption (AES-256-CBC)
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     // Use AES-256-CBC because key size derived is 32 bytes (256 bits)
@@ -94,14 +77,6 @@ std::string GetEncryptedString(std::string encryptionKey, std::string data, int 
     // 4. Base64 encode the encrypted bytes
     std::string base64Str = base64_encode(encrypted);
     log("DEBUG: Base64 Encrypted: " + base64Str, LogLevel::INFO);
-
-    // 5. Hex conversion if encType == 0
-    if (encType == 0) {
-        // User requested Base64, not Hex
-        // std::string hexStr = stringToHex(base64Str);
-        // log("DEBUG: Final Hex Encrypted: " + hexStr, LogLevel::INFO);
-        // return hexStr;
-    }
     
     return base64Str;
 }
