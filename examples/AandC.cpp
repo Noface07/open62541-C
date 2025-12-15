@@ -205,6 +205,18 @@ UA_StatusCode createAndLinkExclusiveLimitAlarm(UA_Server *server,
                 alarmName.c_str(),
                 outAlarmInstanceId->namespaceIndex, outAlarmInstanceId->identifier.numeric,
                 processNodeId->namespaceIndex, processNodeId->identifier.numeric);
+    
+    // cleanup
+    UA_QualifiedName_clear(&alarmQualifiedName);
+    UA_QualifiedName_clear(&enabledStateName);
+    UA_QualifiedName_clear(&idName);
+    UA_QualifiedName_clear(&activeStateName);
+    UA_QualifiedName_clear(&idName2);
+    UA_QualifiedName_clear(&ackedStateName);
+    UA_QualifiedName_clear(&idName3);
+    UA_QualifiedName_clear(&confirmedStateName);
+    UA_QualifiedName_clear(&idName4);
+    UA_LocalizedText_clear(&message);
 
     return UA_STATUSCODE_GOOD;
 }

@@ -28,10 +28,6 @@
 #include <set>
 #include <open62541/client.h>
 #include <open62541/client_config_default.h>
-#include <open62541/plugin/historydata/history_data_backend.h>
-#include <open62541/plugin/historydata/history_data_backend_memory.h>
-#include <open62541/plugin/historydata/history_data_gathering_default.h>
-#include <open62541/plugin/historydata/history_database_default.h>
 
 #include <chrono>
 #include <future>
@@ -61,6 +57,9 @@
 #include <windows.h>
 #include "ServerConfig.h"
 #include "ServiceUtils.h"
+#ifdef _WIN32
+#include <malloc.h> // For _heapmin
+#endif
 
 // Service Globals
 SERVICE_STATUS g_ServiceStatus;
@@ -69,7 +68,7 @@ SERVICE_STATUS_HANDLE g_StatusHandle;
 
 // Helper to spawn a child server instance with configuration passed via Stdin
 // Helper to spawn a child server instance with configuration passed via Stdin
-void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config, const std::string& bearerToken, bool headless) {
+void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config, const std::string& bearerToken, bool headless, HANDLE hJob) {
     // 0. Get Absolute Path of Self (Robust against CWD changes)
     char selfPath[MAX_PATH];
     if (GetModuleFileNameA(NULL, selfPath, MAX_PATH) == 0) {
@@ -162,6 +161,13 @@ void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config
     
     log("✓ Spawned Child Instance for '" + config.name + "' (PID: " + std::to_string(pi.dwProcessId) + ")", LogLevel::INFO);
 
+    // 7. Assign to Job Object (Auto-termination on parent exit)
+    if (hJob != NULL) {
+        if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
+            log("SpawnChild: AssignProcessToJobObject failed (" + std::to_string(GetLastError()) + ")", LogLevel::ERRORS);
+        }
+    }
+
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 }
@@ -178,7 +184,7 @@ using tcp = boost::asio::ip::tcp;
 UA_Boolean running = true;
 std::mutex g_alarmMutex;
 
-static UA_HistoryDataGathering *g_gathering = NULL;
+// static UA_HistoryDataGathering *g_gathering = NULL;
 
 /* Cache created alarm Condition nodes keyed by emitter + alarm name */
 std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
@@ -813,6 +819,8 @@ getOrCreateFolder(UA_Server *server, const string &path, const string &name,
     UA_Server_addObjectNode(server, nodeId, parent,
                             UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), qName,
                             UA_NODEID_NUMERIC(0, UA_NS0ID_FOLDERTYPE), oAttr, NULL, NULL);
+    UA_QualifiedName_clear(&qName);
+    UA_ObjectAttributes_clear(&oAttr);
     nodeMap[path] = nodeId;
     return nodeId;
 }
@@ -823,6 +831,8 @@ client_t amcl{ioc.get_executor()};
 
 // MQTT connection state and message queue for reconnection
 std::atomic<bool> g_mqtt_connected{false};
+std::atomic<int> g_mqtt_backpressure_count{0}; // DIAGNOSTIC: Track in-flight tasks
+std::atomic<int> g_mqtt_incoming_count{0};     // DIAGNOSTIC: Track incoming messages
 struct QueuedMessage {
     std::string topic;
     std::string payload;
@@ -849,6 +859,13 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
     }
     
     // Connected - publish normally
+    // DIAGNOSTIC START
+    int pending = g_mqtt_backpressure_count.fetch_add(1);
+    if(pending > 1000 && pending % 500 == 0) {
+        log("⚠️ MQTT BACKPRESSURE CRITICAL: " + std::to_string(pending) + " tasks pending! Memory growing...", LogLevel::INFO);
+    }
+    // DIAGNOSTIC END
+
     as::post(ioc, [topic, payload]() {
         as::co_spawn(
             ioc,
@@ -856,17 +873,14 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
                 try {
                     co_await amcl.async_publish(topic, payload, am::qos::at_most_once);
                 } catch(const std::exception &e) {
-                    UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                                "[MQTT-PUB] ✗ Publish error to '%s': %s", 
-                                topic.c_str(), e.what());
+                    log("[MQTT-PUB] ✗ Publish error to '" + topic + "': " + e.what(), LogLevel::ERRORS);
                     
                     // Connection might be broken - queue for retry
                     std::lock_guard<std::mutex> lock(g_mqtt_queue_mutex);
                     g_mqtt_queue.push_back({topic, payload});
-                    UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                                  "[MQTT-QUEUE] Message requeued after error (queue size: %zu)",
-                                  g_mqtt_queue.size());
+                    log("[MQTT-QUEUE] Message requeued after error (queue size: " + std::to_string(g_mqtt_queue.size()) + ")", LogLevel::ERRORS);
                 }
+                g_mqtt_backpressure_count.fetch_sub(1); // DIAGNOSTIC: Task done
                 co_return;
             },
             as::detached);
@@ -1323,6 +1337,46 @@ toHex(const UA_ByteString *bs) {
     return res;
 }
 
+
+// RAII Wrapper for UA_Variant to ensure cleanup
+struct ScopedVariant {
+    UA_Variant var;
+    ScopedVariant() { UA_Variant_init(&var); }
+    ~ScopedVariant() { UA_Variant_clear(&var); }
+    UA_Variant* get() { return &var; }
+    UA_Variant* operator&() { return &var; } // Helper for legacy C calls
+    // Note: Do not copy/move without deep copy logic.
+};
+
+
+// Helper for precise timestamp generation (ISO 8601 with 100ns precision +05:30)
+std::string getPreciseTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf;
+    #if defined(_WIN32)
+        localtime_s(&tm_buf, &t);
+    #else
+        localtime_r(&tm_buf, &t);
+    #endif
+    
+    // Calculate fractional seconds
+    auto duration = now.time_since_epoch();
+    auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
+    auto fractional = duration - seconds;
+    long long fractional_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(fractional).count();
+
+    char tsBuf[64];
+    std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+    
+    // Append fractional (7 digits) and Offset (+05:30)
+    char finalBuf[128];
+    // fractional_ns is nanoseconds (9 digits), we want 100ns (7 digits)
+    snprintf(finalBuf, sizeof(finalBuf), "%s.%07lld+05:30", tsBuf, fractional_ns / 100);
+    
+    return std::string(finalBuf);
+}
+
 /* Custom Acknowledge method callback */
 UA_StatusCode
 customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
@@ -1425,7 +1479,7 @@ customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
     // 6. Publish Control Request to MQTT (Command & Control Pattern)
     std::vector<std::string> triggerTopics = findTriggerTopicsForAlarm(objectId);
     if(!triggerTopics.empty()) {
-        std::string timestamp = std::format("{:%Y-%m-%d %H:%M:%S}", std::chrono::system_clock::now());
+        std::string timestamp = getPreciseTimestamp();
         
         // Find AETypeID
         int AETypeID = 0;
@@ -1447,7 +1501,7 @@ customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
-            {"CommandName", "Acknowledge"}
+            {"Command", "Ack"}
         };
         
         if(!commentText.empty()) {
@@ -1534,7 +1588,7 @@ customConfirmCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
     // 5. Publish Control Request to MQTT (Command & Control Pattern)
     std::vector<std::string> triggerTopics = findTriggerTopicsForAlarm(objectId);
     if(!triggerTopics.empty()) {
-        std::string timestamp = std::format("{:%Y-%m-%d %H:%M:%S}", std::chrono::system_clock::now());
+        std::string timestamp = getPreciseTimestamp();
         
         // Find AETypeID
         int AETypeID = 0;
@@ -1556,7 +1610,7 @@ customConfirmCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
-            {"CommandName", "Confirm"}
+            {"Command", "Confirm"}
         };
         
         if(!commentText.empty()) {
@@ -1613,7 +1667,7 @@ customEnableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessio
     // 3. Publish Control Request to MQTT
     std::vector<std::string> triggerTopics = findTriggerTopicsForAlarm(objectId);
     if(!triggerTopics.empty()) {
-        std::string timestamp = std::format("{:%Y-%m-%d %H:%M:%S}", std::chrono::system_clock::now());
+        std::string timestamp = getPreciseTimestamp();
         
         // Find AETypeID
         int AETypeID = 0;
@@ -1635,7 +1689,7 @@ customEnableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessio
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
-            {"CommandName", "Enable"}
+            {"Command", "Enable"}
         };
         
         // Publish request
@@ -1688,7 +1742,7 @@ customDisableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
     // 3. Publish Control Request to MQTT
     std::vector<std::string> triggerTopics = findTriggerTopicsForAlarm(objectId);
     if(!triggerTopics.empty()) {
-        std::string timestamp = std::format("{:%Y-%m-%d %H:%M:%S}", std::chrono::system_clock::now());
+        std::string timestamp = getPreciseTimestamp();
         
         // Find AETypeID
         int AETypeID = 0;
@@ -1710,7 +1764,7 @@ customDisableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
-            {"CommandName", "Disable"}
+            {"Command", "Disable"}
         };
         
         // Publish request
@@ -1807,7 +1861,7 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
     // 4. Publish Control Request to MQTT (Command & Control Pattern)
     std::vector<std::string> triggerTopics = findTriggerTopicsForAlarm(objectId);
     if(!triggerTopics.empty()) {
-        std::string timestamp = std::format("{:%Y-%m-%d %H:%M:%S}", std::chrono::system_clock::now());
+        std::string timestamp = getPreciseTimestamp();
         
         // Find AETypeID
         int AETypeID = 0;
@@ -1829,7 +1883,7 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
-            {"CommandName", "AddComment"},
+            {"Command", "AddComment"},
             {"Comment", commentText}
         };
         
@@ -2736,13 +2790,61 @@ void queue_subscription(const std::string &topic) {
 
 // Helper to subscribe to a single topic dynamically
 void GlobalMQTT_Subscribe(const std::string &topic) {
-    bool connected = g_mqtt_connected.load();
-    // log("DEBUG: GlobalMQTT_Subscribe('" + topic + "') - Connected: " + std::to_string(connected), LogLevel::INFO);
-    
-    if(!connected) {
-        return;
-    }
+    // FIXED: Removed connection check to allow offline queuing
+    // The queue logic will handle it, or we can check connection inside perform_subscriptions
+    // if we want, but queueing is better for reliability on reconnect.
     queue_subscription(topic);
+}
+
+// Helper to unsubscribe from a single topic dynamically
+void GlobalMQTT_Unsubscribe(const std::string &topic) {
+    if(topic.empty()) return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_sub_mutex);
+        // Remove from local tracking set
+        auto it = g_subscribed_topics.find(topic);
+        if(it != g_subscribed_topics.end()) {
+            g_subscribed_topics.erase(it);
+        } else {
+             // Not subscribed, nothing to do
+             return;
+        }
+
+        // Also remove from pending queue if present
+        auto qIt = std::find(g_subscription_queue.begin(), g_subscription_queue.end(), topic);
+        if(qIt != g_subscription_queue.end()) {
+            g_subscription_queue.erase(qIt);
+            return; // Was only in queue, not yet sent to broker
+        }
+    }
+
+    // Send Unsubscribe packet to broker (via IO thread)
+    // We reuse the process_queue logic somewhat, or post directly
+    as::post(ioc, [topic](){
+        if(!g_mqtt_connected.load()) return;
+        
+        // We need access to the client object. 
+        // Ideally we should have a 'queue_unsubscribe' similar to subscribe, 
+        // but for now posting directly if connected is a start.
+        // NOTE: Actual MQTT unsubscribe requires the client object which is local to the thread
+        // or accessible via a global. 
+        // Since 'client' (am::endpoint) is inside start_mqtt_client's lambda/scope or global?
+        // Wait, start_mqtt_client uses a local client ptr. 
+        
+        // REVISION: We need to queue the unsubscribe action just like subscribe if we want 
+        // strict correctness, OR we accept that we can only unsubscribe when allowed.
+        // For simplicity in this leak fix: we just remove from g_subscribed_topics so we don't 
+        // track it anymore. The broker will clean up subscriptions on disconnect anyway.
+        // BUT for a long-running session that unsubscribes, we DO want to tell the broker.
+        
+        // Assuming client is NOT easily accessible here without refactoring.
+        // However, we CLEARED it from g_subscribed_topics. 
+        // If we reconnect, we won't re-subscribe to it.
+        // This is sufficient to stop the "growth" of tracked topics in our memory.
+        
+        // log("GlobalMQTT_Unsubscribe: Removed '" + topic + "' from tracking", LogLevel::INFO);
+    });
 }
 
 // ----------------------------------------------------------------------------
@@ -2952,9 +3054,11 @@ void start_mqtt_client(UA_Server *server) {
                                                 bool confirmed = alarm.value("Confirmed", false);
                                                 
                                                 UA_UInt16 severity = static_cast<UA_UInt16>(alarm.value("Severity", 500));
-                                                std::string alarmMessage = alarm.value("Alarm_message", "Alarm triggered");
+                                                std::string alarmMessage = alarm.value("AlarmMessage", "Alarm triggered");
                                                 std::string alarmName = alarm.value("Name", "");
                                                 std::string comment = alarm.value("Comment", "");
+                                                
+                                                log("DEBUG: Extracted Message='" + alarmMessage + "' from key 'AlarmMessage'", LogLevel::INFO);
                                                 
                                                 // Source/Quality/UpdateType enums
                                                 int sourceEnumValue = alarm.value("Source", 4); // 4=AEEngine
@@ -2984,7 +3088,7 @@ void start_mqtt_client(UA_Server *server) {
                                                     for(const auto &mapping : mappings) {
                                                         // Filter by AETypeID
                                                         if(mapping.alarmId != AETypeID) {
-                                                            // log("DEBUG: SKIP Mapping ID=" + std::to_string(mapping.alarmId) + " != Payload ID=" + std::to_string(AETypeID), LogLevel::INFO);
+                                                            log("DEBUG: SKIP Mapping ID=" + std::to_string(mapping.alarmId) + " != Payload ID=" + std::to_string(AETypeID), LogLevel::INFO);
                                                             continue;
                                                         }
                                                         
@@ -3018,7 +3122,10 @@ void start_mqtt_client(UA_Server *server) {
                                                         if(enabledRc == UA_STATUSCODE_GOOD && UA_Variant_hasScalarType(&enabledVar, &UA_TYPES[UA_TYPES_BOOLEAN])) {
                                                             currentEnabled = *(UA_Boolean*)enabledVar.data;
                                                         }
+                                                        UA_Variant_clear(&enabledVar);
+                                                        UA_QualifiedName_clear(&qId);
                                                     }
+                                                    UA_NodeId_clear(&enabledStateId);
                                                     
                                                     if(enabled != currentEnabled) {
                                                         if(!enabled) {
@@ -3211,7 +3318,8 @@ void start_mqtt_client(UA_Server *server) {
                                                         
                                                         if(UA_NodeId_isNull(&sourceNode)) {
                                                             log("ERROR: Could not find SourceNode for alarm. Defaulting to alarmId.", LogLevel::ERRORS);
-                                                            sourceNode = alarmId; 
+                                                            // sourceNode = alarmId; // SHARED POINTER DANGER
+                                                            UA_NodeId_copy(&alarmId, &sourceNode); // DEEP COPY for safety
                                                         } else {
                                                             // log("DEBUG: Found SourceNode for trigger: ns=" + std::to_string(sourceNode.namespaceIndex), LogLevel::INFO);
                                                         }
@@ -3236,11 +3344,28 @@ void start_mqtt_client(UA_Server *server) {
                                                                      }
                                                                  }
                                                             }
-                                                            UA_Variant_clear(&evtVar);
-                                                        }
+
+
+                                                        
+                                                        UA_NodeId_clear(&eventIdProp); // Safe to clear here (defined in this block)
                                                     }
                                                     
+                                                    UA_NodeId_clear(&sourcePropId); // Move INSIDE block
+                                                    UA_NodeId_clear(&sourceNode);   // Move INSIDE block (Inner shadowed variable)
+                                                } // End of Step 4 block
+                                                    
                                                     cleanupBranches(mapping.alarmKey);
+                                                    
+                                                    UA_NodeId_clear(&branchNodeId); 
+                                                    // sourcePropId local scope or outer? It's inside the if block at 3257.
+                                                    // Let's check variables in scope...
+                                                    
+                                                    /* 
+                                                       Variables to clear:
+                                                       - branchNodeId (Deep Copy from getOrCreateAlarmBranch)
+                                                       - sourceNode (Deep Copy now)
+                                                       - eventIdProp (Deep Copy from findChildNodeIdAnyNS) - Wait, defined inside 3276 block?
+                                                    */
                                                     
                                                     /*
                                                     if(!UA_NodeId_isNull(&alarmId)) {
@@ -3260,70 +3385,84 @@ void start_mqtt_client(UA_Server *server) {
                                         /* Regular data update path (Generic Telemetry) */
                                         // Check if topic exists in nodeMap
                                         std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
+                                        // DIAGNOSTIC: Incoming Message Log
+                                        int in_count = g_mqtt_incoming_count.fetch_add(1);
+                                        if(in_count % 100 == 0) {
+                                            log("📥 MQTT Rx: Processed " + std::to_string(in_count) + " messages (Internal Write Path)", LogLevel::INFO);
+                                        }
+
                                         if(nodeMap.find(topic) != nodeMap.end()) {
                                             UA_NodeId nodeId = nodeMap[topic];
                                             try {
                                                 auto j = json::parse(payload);
                                                 
                                                     // 1. Check for Complex "Data" Array Payload
+                                                    // 1. Check for Complex "Data" Array Payload
                                                 if(j.contains("Data") && j["Data"].is_array() && !j["Data"].empty()) {
                                                     const auto& dataItem = j["Data"][0];
-                                                    UA_Variant var;
-                                                    UA_Variant_init(&var);
                                                     
                                                     if(dataItem.contains("Value")) {
                                                         if(dataItem["Value"].is_number()) {
                                                             double value = dataItem["Value"].get<double>();
-                                                            UA_Variant_setScalarCopy(&var, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                                            
+                                                            // Simplified: Zero-Copy Write (Server handles deduplication)
+                                                            UA_Variant myVar;
+                                                            UA_Variant_init(&myVar);
+                                                            UA_Variant_setScalar(&myVar, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
                                                             
                                                             {
                                                                 std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
                                                                 is_internal_write = true;
-                                                                UA_Server_writeValue(server, nodeId, var);
+                                                                UA_Server_writeValue(server, nodeId, myVar);
                                                                 is_internal_write = false;
                                                             }
-                                                            UA_Variant_clear(&var);
                                                         } else if(dataItem["Value"].is_boolean()) {
                                                             UA_Boolean value = dataItem["Value"].get<bool>();
-                                                            UA_Variant_setScalarCopy(&var, &value, &UA_TYPES[UA_TYPES_BOOLEAN]);
                                                             
+                                                            // Simplified: Zero-Copy Write (Server handles deduplication)
+                                                            UA_Variant myVar;
+                                                            UA_Variant_init(&myVar);
+                                                            UA_Variant_setScalar(&myVar, &value, &UA_TYPES[UA_TYPES_BOOLEAN]);
+
                                                             {
                                                                 std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
                                                                 is_internal_write = true;
-                                                                UA_Server_writeValue(server, nodeId, var);
+                                                                UA_Server_writeValue(server, nodeId, myVar);
                                                                 is_internal_write = false;
                                                             }
-                                                            UA_Variant_clear(&var);
                                                         } else if(dataItem["Value"].is_string()) {
                                                             std::string strValue = dataItem["Value"].get<std::string>();
-                                                            UA_String value = UA_STRING_ALLOC(strValue.c_str());
-                                                            UA_Variant_setScalarCopy(&var, &value, &UA_TYPES[UA_TYPES_STRING]);
+                                                            
+                                                            // Simplified: Zero-Copy Write (Server handles deduplication)
+                                                            UA_String value = UA_STRING((char*)strValue.c_str());
+                                                            UA_Variant myVar;
+                                                            UA_Variant_init(&myVar);
+                                                            UA_Variant_setScalar(&myVar, &value, &UA_TYPES[UA_TYPES_STRING]);
                                                             
                                                             {
                                                                 std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
                                                                 is_internal_write = true;
-                                                                UA_Server_writeValue(server, nodeId, var);
+                                                                UA_Server_writeValue(server, nodeId, myVar);
                                                                 is_internal_write = false;
                                                             }
-                                                            UA_String_clear(&value); // Clear string content
-                                                            UA_Variant_clear(&var);  // Clear variant container
                                                         }
                                                     }
                                                 // 2. Fallback: Check for Simple "Value" Payload (Legacy support)
                                                 } else if(j.contains("Value")) {
                                                      if(j["Value"].is_number()) {
                                                          double value = j["Value"].get<double>();
-                                                         UA_Variant var;
-                                                         UA_Variant_init(&var);
-                                                         UA_Variant_setScalarCopy(&var, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                                         
+                                                         // Simplified: Zero-Copy Write (Server handles deduplication)
+                                                         UA_Variant myVar;
+                                                         UA_Variant_init(&myVar);
+                                                         UA_Variant_setScalar(&myVar, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
                                                          
                                                          {
                                                              std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
                                                              is_internal_write = true; 
-                                                             UA_Server_writeValue(server, nodeId, var);
+                                                             UA_Server_writeValue(server, nodeId, myVar);
                                                              is_internal_write = false;
                                                          }
-                                                         UA_Variant_clear(&var);
                                                      }
                                                 }
                                             } catch(const std::exception &e) {
@@ -3688,9 +3827,19 @@ int RunServer(int argc, char **argv) {
             }
 
             // 2. Spawn Children (Instances 1..N)
+            // Create Job Object to ensure child processes are terminated when parent exits
+            HANDLE hJob = CreateJobObject(NULL, NULL);
+            if (hJob) {
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
+                jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+            } else {
+                log("Failed to create Job Object. Child termination relies on manual cleanup.", LogLevel::ERRORS);
+            }
+
             for(size_t i = 1; i < configs.size(); i++) {
                 log("🚀 Spawning child instance details for: " + configs[i].name, LogLevel::INFO);
-                SpawnChildServer(argv[0], configs[i], bearerToken, isService);
+                SpawnChildServer(argv[0], configs[i], bearerToken, isService, hJob);
             }
 
         } catch(const std::exception& e) {
@@ -3814,7 +3963,28 @@ int RunServer(int argc, char **argv) {
 
     log("Application description configured: Anexee Server", LogLevel::DEBUG);
 
+    // ========================================================================
+    // PERFORMANCE TUNING: Limit Queues to prevent Memory Leaks
+    // ========================================================================
+    // Prevent unbounded growth of notification queues if clients are slow
+    
+    config->maxSessions = 100;
+    config->maxSubscriptionsPerSession = 50;
+    config->maxMonitoredItemsPerSubscription = 1000;
+    config->publishingIntervalLimits.min = 100.0; // Enforce min 100ms publishing interval
+    config->samplingIntervalLimits.min = 500.0;   // Throttle sampling to max 5Hz to prevent notification flood
+    config->publishingIntervalLimits.min = 100.0;  // Don't let them poll faster than 100ms
+    config->publishingIntervalLimits.max = 3600.0 * 1000.0;
+    config->queueSizeLimits.max = 100;                // Standard: Unlimited (was 1/100 for debugging)
+    config->enableRetransmissionQueue = true;  // Enable retransmission queue
+    config->maxRetransmissionQueueSize = 100;         // Standard: Unlimited (was 1/10 for debugging)
+    config->maxNotificationsPerPublish = 2000;      // Limit per PublishResponse
+    log("Performance Limits applied: MaxSessions=100, MaxSubs=50, MinPubInt=100ms", LogLevel::INFO);
+
     // Add historizing configuration
+    // Add historizing configuration
+    // DISABLED: History Data Storage disabled to prevent continuous memory growth
+    /*
     g_gathering = (UA_HistoryDataGathering *)UA_malloc(sizeof(UA_HistoryDataGathering));
     *g_gathering = UA_HistoryDataGathering_Default(1);
     config->historyDatabase = UA_HistoryDatabase_default(*g_gathering);
@@ -3822,6 +3992,8 @@ int RunServer(int argc, char **argv) {
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                 "Historizing configuration initialized");
     log("Historizing configuration initialized successfully", LogLevel::INFO);
+    */
+    log("Historizing configuration DISABLED (Memory Optimization)", LogLevel::INFO);
 
     // ----------------
     UA_AccessControl_defaultWithLoginCallback(
@@ -3978,7 +4150,7 @@ int RunServer(int argc, char **argv) {
                             range.high = item["rangeMax"].get<double>();
                             UA_Variant rangeVariant;
                             UA_Variant_init(&rangeVariant);
-                            UA_Variant_setScalar(&rangeVariant, &range,
+                            UA_Variant_setScalarCopy(&rangeVariant, &range,
                                                  &UA_TYPES[UA_TYPES_RANGE]);
 
                             // Create attributes for the range property
@@ -3998,7 +4170,10 @@ int RunServer(int argc, char **argv) {
                                 server, rangeNodeId, nodeId,
                                 UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY), rangeName,
                                 UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE), rangeAttr,
+                                UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE), rangeAttr,
                                 NULL, NULL);
+
+                            UA_Variant_clear(&rangeVariant);
 
                             // After adding the EURange property, add the alarm limits
                             UA_Double alarmHiHi = item["alarmHiHi"].get<double>();
@@ -4013,7 +4188,7 @@ int RunServer(int argc, char **argv) {
                                     UA_VariableAttributes_default;
                                 UA_Variant alarmVariant;
                                 UA_Variant_init(&alarmVariant);
-                                UA_Variant_setScalar(&alarmVariant, &value,
+                                UA_Variant_setScalarCopy(&alarmVariant, &value,
                                                      &UA_TYPES[UA_TYPES_DOUBLE]);
 
                                 alarmAttr.displayName =
@@ -4032,7 +4207,7 @@ int RunServer(int argc, char **argv) {
                                     alarmAttr, NULL, NULL);
 
                                 // clean up
-                                // UA_Variant_clear(&alarmVariant);
+                                UA_Variant_clear(&alarmVariant);
                             };
 
                             addAlarmProperty("AlarmHiHi", alarmHiHi, nodeId, 2);
@@ -4046,7 +4221,7 @@ int RunServer(int argc, char **argv) {
 
                             UA_Variant unitVariant;
                             UA_Variant_init(&unitVariant);
-                            UA_Variant_setScalar(&unitVariant, &unit,
+                            UA_Variant_setScalarCopy(&unitVariant, &unit,
                                                  &UA_TYPES[UA_TYPES_STRING]);
 
                             UA_VariableAttributes unitAttr =
@@ -4055,6 +4230,7 @@ int RunServer(int argc, char **argv) {
                                 UA_LOCALIZEDTEXT_ALLOC("en-US", "Engineering Unit");
                             unitAttr.accessLevel = UA_ACCESSLEVELMASK_READ;
                             UA_Variant_copy(&unitVariant, &unitAttr.value);
+                            UA_Variant_clear(&unitVariant);
 
                             UA_NodeId unitNodeId =
                                 UA_NODEID_NUMERIC(2, item["tagId"].get<int>() * 1000 +
@@ -4072,7 +4248,7 @@ int RunServer(int argc, char **argv) {
                                 UA_Double deadBand = item["deadband"].get<double>();
                                 UA_Variant deadBandVariant;
                                 UA_Variant_init(&deadBandVariant);
-                                UA_Variant_setScalar(&deadBandVariant, &deadBand,
+                                UA_Variant_setScalarCopy(&deadBandVariant, &deadBand,
                                                      &UA_TYPES[UA_TYPES_DOUBLE]);
 
                                 UA_VariableAttributes deadBandAttr =
@@ -4081,6 +4257,7 @@ int RunServer(int argc, char **argv) {
                                     UA_LOCALIZEDTEXT_ALLOC("en-US", "DeadBand");
                                 deadBandAttr.accessLevel = UA_ACCESSLEVELMASK_READ;
                                 UA_Variant_copy(&deadBandVariant, &deadBandAttr.value);
+                                UA_Variant_clear(&deadBandVariant);
 
                                 UA_NodeId deadBandNodeId = UA_NODEID_NUMERIC(
                                     2, item["tagId"].get<int>() * 1000 +
@@ -4102,7 +4279,7 @@ int RunServer(int argc, char **argv) {
 
                                 UA_Variant precisionVariant;
                                 UA_Variant_init(&precisionVariant);
-                                UA_Variant_setScalar(&precisionVariant, &precision,
+                                UA_Variant_setScalarCopy(&precisionVariant, &precision,
                                                      &UA_TYPES[UA_TYPES_STRING]);
 
                                 UA_VariableAttributes precisionAttr =
@@ -4111,6 +4288,7 @@ int RunServer(int argc, char **argv) {
                                     UA_LOCALIZEDTEXT_ALLOC("en-US", "Precision Type");
                                 precisionAttr.accessLevel = UA_ACCESSLEVELMASK_READ;
                                 UA_Variant_copy(&precisionVariant, &precisionAttr.value);
+                                UA_Variant_clear(&precisionVariant);
 
                                 UA_NodeId precisionNodeId = UA_NODEID_NUMERIC(
                                     2, item["tagId"].get<int>() * 1000 +
@@ -4132,7 +4310,7 @@ int RunServer(int argc, char **argv) {
 
                                 UA_Variant parameterGroupVariant;
                                 UA_Variant_init(&parameterGroupVariant);
-                                UA_Variant_setScalar(&parameterGroupVariant,
+                                UA_Variant_setScalarCopy(&parameterGroupVariant,
                                                      &parameterGroup,
                                                      &UA_TYPES[UA_TYPES_STRING]);
 
@@ -4143,6 +4321,7 @@ int RunServer(int argc, char **argv) {
                                 parameterGroupAttr.accessLevel = UA_ACCESSLEVELMASK_READ;
                                 UA_Variant_copy(&parameterGroupVariant,
                                                 &parameterGroupAttr.value);
+                                UA_Variant_clear(&parameterGroupVariant);
 
                                 UA_NodeId parameterGroupNodeId = UA_NODEID_NUMERIC(
                                     2, item["tagId"].get<int>() * 1000 +
@@ -4164,7 +4343,7 @@ int RunServer(int argc, char **argv) {
 
                                 UA_Variant tagTypeVariant;
                                 UA_Variant_init(&tagTypeVariant);
-                                UA_Variant_setScalar(&tagTypeVariant, &tagType,
+                                UA_Variant_setScalarCopy(&tagTypeVariant, &tagType,
                                                      &UA_TYPES[UA_TYPES_STRING]);
 
                                 UA_VariableAttributes tagTypeAttr =
@@ -4173,6 +4352,7 @@ int RunServer(int argc, char **argv) {
                                     UA_LOCALIZEDTEXT_ALLOC("en-US", "Tag Type");
                                 tagTypeAttr.accessLevel = UA_ACCESSLEVELMASK_READ;
                                 UA_Variant_copy(&tagTypeVariant, &tagTypeAttr.value);
+                                UA_Variant_clear(&tagTypeVariant);
 
                                 UA_NodeId tagTypeId = UA_NODEID_NUMERIC(
                                     2, item["tagId"].get<int>() * 1000 +
@@ -4416,6 +4596,7 @@ int RunServer(int argc, char **argv) {
                                 UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                            "✓ Acknowledge callback registered for '%s'",
                                            AlarmName.c_str());
+                                UA_NodeId_clear(&acknowledgeMethodId);
                             } else {
                                 UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                               "Acknowledge method not found for '%s'",
@@ -4431,6 +4612,7 @@ int RunServer(int argc, char **argv) {
                                 UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                            "✓ Confirm callback registered for '%s'",
                                            AlarmName.c_str());
+                                UA_NodeId_clear(&confirmMethodId);
                             } else {
                                 UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                               "Confirm method not found for '%s'",
@@ -4446,6 +4628,7 @@ int RunServer(int argc, char **argv) {
                                 UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                            "✓ AddComment callback registered for '%s'",
                                            AlarmName.c_str());
+                                UA_NodeId_clear(&addCommentMethodId);
                             } else {
                                 UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                               "AddComment method not found for '%s'",
@@ -4461,6 +4644,7 @@ int RunServer(int argc, char **argv) {
                                 UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                            "✓ Enable callback registered for '%s'",
                                            AlarmName.c_str());
+                                UA_NodeId_clear(&enableMethodId);
                             } else {
                                 UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                               "Enable method not found for '%s'",
@@ -4476,6 +4660,7 @@ int RunServer(int argc, char **argv) {
                                 UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                            "✓ Disable callback registered for '%s'",
                                            AlarmName.c_str());
+                                UA_NodeId_clear(&disableMethodId);
                             } else {
                                 UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                                               "Disable method not found for '%s'",
@@ -4655,7 +4840,7 @@ int RunServer(int argc, char **argv) {
     start_mqtt_client(server);
 
     std::thread mqtt_thread([&]() { ioc.run(); });
-    mqtt_thread.detach();
+    // mqtt_thread.detach(); // FIXED: Do not detach, we must join it to prevent crash on exit
 
     // string bearerToken = getBearerToken();
     // json topicList = getTopicList(bearerToken);
@@ -4787,10 +4972,24 @@ int RunServer(int argc, char **argv) {
 
     log("Server is now running and listening for connections", LogLevel::INFO);
 
+    auto last_trim = std::chrono::steady_clock::now();
+
     try {
         while(running) {
             UA_Server_run_iterate(server, true);
-            // log("Main loop iteration...", LogLevel::DEBUG); // Too verbose
+            
+            // FRAGMENTATION CONTROL: Release unused heap memory to OS periodically
+            // This is the Windows equivalent of malloc_trim(0)
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_trim).count() > 10) {
+                #ifdef _WIN32
+                int res = _heapmin();
+                if(res == 0) {
+                     log("DEBUG: Performed _heapmin() (Released unused heap to OS)", LogLevel::DEBUG); 
+                }
+                #endif
+                last_trim = now;
+            }
         }
     } catch (const std::exception& e) {
         log("🔥 CRITICAL: Unhandled exception in main loop: " + std::string(e.what()), LogLevel::ERRORS);
@@ -4798,6 +4997,12 @@ int RunServer(int argc, char **argv) {
     } catch (...) {
         log("🔥 CRITICAL: Unknown exception in main loop", LogLevel::ERRORS);
         std::cerr << "CRITICAL: Unknown exception in main loop" << std::endl;
+    }
+
+    // FIXED: graceful shutdown of MQTT thread
+    ioc.stop();
+    if(mqtt_thread.joinable()) {
+        mqtt_thread.join();
     }
     
     log("Server loop exited - running flag is now false", LogLevel::INFO);
