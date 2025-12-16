@@ -14,6 +14,7 @@
 #include <open62541/plugin/securitypolicy_default.h>
 #include <open62541/server.h>
 #include <open62541/server_config_default.h>
+#include <open62541/util.h>
 
 #include <algorithm>
 #include <iostream>
@@ -1919,16 +1920,15 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
     std::lock_guard<std::mutex> lock(g_alarmMutex);
 
     // STEP 2: Fire RefreshStartEvent
+    // STEP 2: Fire RefreshStartEvent
     {
-        UA_NodeId startEventId;
-        UA_Server_createEvent(
-            server, UA_NODEID_NUMERIC(0, UA_NS0ID_REFRESHSTARTEVENTTYPE), &startEventId);
+        UA_ByteString eventId = UA_BYTESTRING_NULL;
         UA_LocalizedText msg = UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Refresh Start");
-        UA_Server_writeObjectProperty_scalar(server, startEventId,
-                                             UA_QUALIFIEDNAME(0, (char *)"Message"), &msg,
-                                             &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-        UA_Server_triggerEvent(server, startEventId,
-                               UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER), NULL, UA_TRUE);
+        // Source: Server, Type: RefreshStartEventType, Severity: 100 (Info)
+        UA_Server_createEvent(server, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_REFRESHSTARTEVENTTYPE), 
+                              100, msg, NULL, NULL, &eventId);
+        UA_ByteString_clear(&eventId);
     }
 
     // STEP 3: Iterate through all alarms
@@ -2005,162 +2005,81 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
             if(bi != branchMap.end())
                 branchId = bi->second.branchNodeId;
 
-            // === CREATE TEMPORARY EVENT NODE ===
-            UA_NodeId tempEventNodeId;
-            UA_StatusCode rc = UA_Server_createEvent(
-                server, UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE),
-                &tempEventNodeId);
-            
-            if(rc != UA_STATUSCODE_GOOD) {
-                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                              "Failed to create temp event for GUID '%s': %s",
-                              guid.c_str(), UA_StatusCode_name(rc));
-                continue;
+            // === CREATE EVENT WITH KEY-VALUE MAP ===
+            UA_KeyValueMap *map = UA_KeyValueMap_new();
+            if(map) {
+                // ActiveState/Id
+                UA_Boolean val = bs.active;
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ActiveState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                
+                // ActiveState
+                UA_LocalizedText valLT = bs.active ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Active") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Inactive");
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ActiveState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+
+                // AckedState/Id
+                val = bs.acked;
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"AckedState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+                // AckedState
+                valLT = bs.acked ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Acknowledged") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unacknowledged");
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"AckedState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+
+                // ConfirmedState/Id
+                val = bs.confirmed;
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+                // ConfirmedState
+                valLT = bs.confirmed ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Confirmed") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unconfirmed");
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+
+                // Retain
+                val = shouldRetain;
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"Retain"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+                // Time
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"Time"), &bs.time, &UA_TYPES[UA_TYPES_DATETIME]);
+
+                // ReceiveTime
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ReceiveTime"), &bs.receiveTime, &UA_TYPES[UA_TYPES_DATETIME]);
+
+                // Quality
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"Quality"), &bs.quality, &UA_TYPES[UA_TYPES_STATUSCODE]);
+
+                // EnabledState/Id
+                val = UA_TRUE;
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"EnabledState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+                // EnabledState
+                valLT = UA_LOCALIZEDTEXT((char*)"en", (char*)"Enabled");
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"EnabledState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+
+                // BranchId
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"BranchId"), &branchId, &UA_TYPES[UA_TYPES_NODEID]);
+
+                // SourceNode
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"SourceNode"), &sourceNodeId, &UA_TYPES[UA_TYPES_NODEID]);
+
+                // EventType
+                UA_NodeId eventTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE);
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"EventType"), &eventTypeId, &UA_TYPES[UA_TYPES_NODEID]);
+
+                // ConditionClassId
+                UA_NodeId condClassId = UA_NODEID_NULL;
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConditionClassId"), &condClassId, &UA_TYPES[UA_TYPES_NODEID]);
+
+                // ConditionName
+                UA_String condName = UA_STRING((char *)alarmKey.c_str());
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConditionName"), &condName, &UA_TYPES[UA_TYPES_STRING]);
+
+                // ConditionId
+                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConditionId"), &conditionNodeId, &UA_TYPES[UA_TYPES_NODEID]);
             }
 
-            // === POPULATE TEMPORARY EVENT NODE WITH BRANCH DATA ===
+            // Message & Severity (Arguments)
+            UA_LocalizedText msgText = UA_LOCALIZEDTEXT((char*)"en-US", (char*)bs.message.c_str()); // Stack allocated is fine for immediate call?
+            // Actually UA_LOCALIZEDTEXT macro expects char pointers, creates shallow copies on stack.
+            // UA_Server_createEvent copies. 
             
-            // ActiveState/Id (Boolean)
-            UA_Boolean actVal = bs.active ? UA_TRUE : UA_FALSE;
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"ActiveState/Id"),
-                &actVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            
-            // ActiveState (LocalizedText)
-            UA_LocalizedText actText = bs.active ? 
-                UA_LOCALIZEDTEXT((char *)"en", (char *)"Active") :
-                UA_LOCALIZEDTEXT((char *)"en", (char *)"Inactive");
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"ActiveState"),
-                &actText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-            // AckedState/Id (Boolean)
-            UA_Boolean ackVal = bs.acked ? UA_TRUE : UA_FALSE;
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"AckedState/Id"),
-                &ackVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            
-            // AckedState (LocalizedText)
-            UA_LocalizedText ackText = bs.acked ?
-                UA_LOCALIZEDTEXT((char *)"en", (char *)"Acknowledged") :
-                UA_LOCALIZEDTEXT((char *)"en", (char *)"Unacknowledged");
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"AckedState"),
-                &ackText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-            // ConfirmedState/Id (Boolean)
-            UA_Boolean cnfVal = bs.confirmed ? UA_TRUE : UA_FALSE;
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"ConfirmedState/Id"),
-                &cnfVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            
-            // ConfirmedState (LocalizedText)
-            UA_LocalizedText cnfText = bs.confirmed ?
-                UA_LOCALIZEDTEXT((char *)"en", (char *)"Confirmed") :
-                UA_LOCALIZEDTEXT((char *)"en", (char *)"Unconfirmed");
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"ConfirmedState"),
-                &cnfText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-            // Retain (Boolean)
-            UA_Boolean retainVal = shouldRetain ? UA_TRUE : UA_FALSE;
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"Retain"),
-                &retainVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-            // Severity (UInt16)
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"Severity"),
-                &bs.severity, &UA_TYPES[UA_TYPES_UINT16]);
-
-            // Message (LocalizedText)
-            UA_LocalizedText msgText = 
-                UA_LOCALIZEDTEXT_ALLOC((char *)"en-US", (char *)bs.message.c_str());
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"Message"),
-                &msgText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-            UA_LocalizedText_clear(&msgText);
-
-            // Time (DateTime)
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"Time"),
-                &bs.time, &UA_TYPES[UA_TYPES_DATETIME]);
-
-            // ReceiveTime (DateTime)
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"ReceiveTime"),
-                &bs.receiveTime, &UA_TYPES[UA_TYPES_DATETIME]);
-
-            // Quality (StatusCode)
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"Quality"),
-                &bs.quality, &UA_TYPES[UA_TYPES_STATUSCODE]);
-
-            // EnabledState/Id (Boolean) - MANDATORY for condition events
-            UA_Boolean enabledVal = UA_TRUE;  // Always enabled during refresh
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"EnabledState/Id"),
-                &enabledVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            
-            // EnabledState (LocalizedText)
-            UA_LocalizedText enabledText = UA_LOCALIZEDTEXT((char *)"en", (char *)"Enabled");
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"EnabledState"),
-                &enabledText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-            // BranchId (NodeId) - CRITICAL for client matching
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"BranchId"),
-                &branchId, &UA_TYPES[UA_TYPES_NODEID]);
-
-            // SourceNode (NodeId)
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"SourceNode"),
-                &sourceNodeId, &UA_TYPES[UA_TYPES_NODEID]);
-
-            // EventType (NodeId) - Helps clients identify event type
-            UA_NodeId eventTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE);
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"EventType"),
-                &eventTypeId, &UA_TYPES[UA_TYPES_NODEID]);
-
-            // ConditionClassId (set to base condition class)
-            UA_NodeId condClassId = UA_NODEID_NULL;
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"ConditionClassId"),
-                &condClassId, &UA_TYPES[UA_TYPES_NODEID]);
-
-            // ConditionName (String)
-            UA_String condName = UA_STRING((char *)alarmKey.c_str());
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"ConditionName"),
-                &condName, &UA_TYPES[UA_TYPES_STRING]);
-
-            // ConditionId (NodeId) - CRITICAL: Links event to parent condition
-            UA_Server_writeObjectProperty_scalar(
-                server, tempEventNodeId,
-                UA_QUALIFIEDNAME(0, (char *)"ConditionId"),
-                &conditionNodeId, &UA_TYPES[UA_TYPES_NODEID]);
-
             // DEBUG: Log what we're about to fire
             UA_String branchIdStr = UA_STRING_NULL;
             UA_NodeId_print(&branchId, &branchIdStr);
@@ -2171,16 +2090,25 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
                        bs.active, bs.acked, bs.severity);
             UA_String_clear(&branchIdStr);
 
-            // === TRIGGER EVENT (temp node auto-deleted with UA_TRUE) ===
+            // Fire Event
             UA_ByteString newEventId = UA_BYTESTRING_NULL;
-            rc = UA_Server_triggerEvent(server, tempEventNodeId, sourceNodeId,
-                                        &newEventId, UA_TRUE);
-            
+            UA_StatusCode rc = UA_Server_createEvent(
+                server, sourceNodeId,
+                UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE),
+                bs.severity, msgText, map, NULL, &newEventId);
+
             if(rc == UA_STATUSCODE_GOOD && newEventId.length > 0) {
                 // Store the new EventId so client can acknowledge it
                 bs.addEventId(&newEventId);
+            } else {
+                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                              "Failed to create temp event for GUID '%s': %s",
+                              guid.c_str(), UA_StatusCode_name(rc));
             }
+            
             UA_ByteString_clear(&newEventId);
+            UA_KeyValueMap_delete(map);
+
         }
 
         // ========================================================
@@ -2279,17 +2207,15 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
     }
 
     // STEP 8: Fire RefreshEndEvent
+    // STEP 8: Fire RefreshEndEvent
     {
-        UA_NodeId endEventId;
-        UA_Server_createEvent(server, UA_NODEID_NUMERIC(0, UA_NS0ID_REFRESHENDEVENTTYPE),
-                              &endEventId);
-        UA_LocalizedText msg =
-            UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Refresh Complete");
-        UA_Server_writeObjectProperty_scalar(server, endEventId,
-                                             UA_QUALIFIEDNAME(0, (char *)"Message"), &msg,
-                                             &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-        UA_Server_triggerEvent(server, endEventId, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
-                               NULL, UA_TRUE);
+        UA_ByteString eventId = UA_BYTESTRING_NULL;
+        UA_LocalizedText msg = UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Refresh Complete");
+        // Source: Server, Type: RefreshEndEventType, Severity: 100
+        UA_Server_createEvent(server, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_REFRESHENDEVENTTYPE),
+                              100, msg, NULL, NULL, &eventId);
+        UA_ByteString_clear(&eventId);
     }
 
     return UA_STATUSCODE_GOOD;

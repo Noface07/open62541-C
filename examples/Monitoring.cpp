@@ -343,24 +343,29 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
 
 void handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext,
                    UA_UInt32 monId, void *monContext,
-                   size_t nEventFields, UA_Variant *eventFields) {
-                    log("Received Event Notification (" + to_string(nEventFields) + " fields):");
+                   const UA_KeyValueMap eventFields) {
+    log("Received Event Notification (" + to_string(eventFields.mapSize) + " fields):");
     
-    for(size_t i = 0; i < nEventFields; ++i) {
-        if(UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_UINT16])) {
-            UA_UInt16 severity = *(UA_UInt16 *)eventFields[i].data;
-            log("  Severity: " + severity);
-        } else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_LOCALIZEDTEXT])) {
-            UA_LocalizedText *lt = (UA_LocalizedText *)eventFields[i].data;
+    for(size_t i = 0; i < eventFields.mapSize; ++i) {
+        UA_KeyValuePair *pair = &eventFields.map[i];
+        UA_Variant *value = &pair->value;
+        
+        // pair->key is UA_QualifiedName. We can print it too if we want.
+
+        if(UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_UINT16])) {
+            UA_UInt16 severity = *(UA_UInt16 *)value->data;
+            log("  Severity: " + std::to_string(severity));
+        } else if (UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT])) {
+            UA_LocalizedText *lt = (UA_LocalizedText *)value->data;
             log("  Message: " + std::string((char *)lt->text.data, lt->text.length));
         }
-        else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_STRING])) {
-            UA_String *s = (UA_String *)eventFields[i].data;
+        else if (UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_STRING])) {
+            UA_String *s = (UA_String *)value->data;
             log("  Source Name: " + std::string((char *)s->data, s->length));
         }
 
-        else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_DATETIME])) {
-            UA_DateTime dt = *(UA_DateTime *)eventFields[i].data;
+        else if (UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_DATETIME])) {
+            UA_DateTime dt = *(UA_DateTime *)value->data;
             UA_Int64 UnixTime = UA_DateTime_toUnixTime(dt);
 
             // Convert to time_t (seconds since epoch)
@@ -374,12 +379,12 @@ void handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext,
             log("  Time: " + string(buf));
         }
 
-        else if (UA_Variant_hasScalarType(&eventFields[i], &UA_TYPES[UA_TYPES_NODEID])) {
-            UA_NodeId *nid = (UA_NodeId *)eventFields[i].data;
+        else if (UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_NODEID])) {
+            UA_NodeId *nid = (UA_NodeId *)value->data;
             log("  NODE ID: ns=" + to_string(nid->namespaceIndex) + ";");
             switch (nid->identifierType) {
                 case UA_NODEIDTYPE_NUMERIC:
-                    log("i=" + nid->identifier.numeric);
+                    log("i=" + std::to_string(nid->identifier.numeric));
                     break;
                 case UA_NODEIDTYPE_STRING:
                     log("s=" + std::string((char *)nid->identifier.string.data,
@@ -396,7 +401,7 @@ void handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext,
         }
 
          else {
-            log("  Unknown field type" , LogLevel::ERRORS);
+            // log("  Unknown field type" , LogLevel::ERRORS);
         }
     }
     std::cout << std::endl;

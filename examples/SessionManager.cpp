@@ -126,37 +126,48 @@ bool SessionManager::registerSession(const UA_NodeId& sessionId,
 }
 
 // Unregister session and cleanup
+// Unregister session and cleanup
 void SessionManager::unregisterSession(const UA_NodeId& sessionId) {
-    std::lock_guard<std::mutex> lock(managerMutex);
-    
-    std::string sessionKey = formatNodeId(&sessionId);
-    auto it = sessions.find(sessionKey);
-    
-    if(it != sessions.end()) {
-        auto& ctx = it->second;
+    std::unique_ptr<SessionContext> ctx_ptr;
+    std::string shortCode;
+
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
         
-        log("🛑 Closing session for org '" + ctx->shortCode + "' (OrgID: " + 
-            std::to_string(ctx->orgId) + ")", LogLevel::INFO);
+        std::string sessionKey = formatNodeId(&sessionId);
+        auto it = sessions.find(sessionKey);
         
+        if(it != sessions.end()) {
+            // Take ownership of the context locally
+            ctx_ptr = std::move(it->second);
+            // Remove from map immediately
+            sessions.erase(it);
+            
+            if(ctx_ptr) {
+                shortCode = ctx_ptr->shortCode;
+                log("🛑 Closing session for org '" + shortCode + "' (OrgID: " + 
+                    std::to_string(ctx_ptr->orgId) + ")", LogLevel::INFO);
+            }
+        }
+    } // Unlock managerMutex here
+
+    // Perform cleanup without holding the lock
+    if(ctx_ptr) {
         // Signal worker thread to stop
-        ctx->shouldStop.store(true);
+        ctx_ptr->shouldStop.store(true);
         
         log("⏳ Waiting for worker thread to terminate...", LogLevel::DEBUG);
         
         // Wait for thread to finish
-        if(ctx->workerThread.joinable()) {
-            ctx->workerThread.join();
+        if(ctx_ptr->workerThread.joinable()) {
+            ctx_ptr->workerThread.join();
             log("✓ Worker thread terminated successfully", LogLevel::INFO);
         }
         
-        // Save data for logging before destruction
-        std::string shortCode = ctx->shortCode;
-        
-        // Remove from map (unique_ptr auto-deletes)
-        sessions.erase(it);
-        
         log("✓ Session closed and resources cleaned up for org '" + 
             shortCode + "'", LogLevel::INFO);
+        
+        // ctx_ptr destructor runs here, freeing the memory
     }
 }
 
