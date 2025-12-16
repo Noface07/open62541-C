@@ -13,7 +13,9 @@ using json = nlohmann::ordered_json;
 
 extern std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
 extern void GlobalMQTT_Subscribe(const std::string &topic);
-extern void GlobalMQTT_Unsubscribe(const std::string &topic); // New Reference
+extern void GlobalMQTT_Unsubscribe(const std::string &topic);
+extern void GlobalMQTT_UnsubscribeBatch(const std::vector<std::string> &topics); // Optimization
+
 extern std::map<std::string, UA_NodeId> nodeMap;
 extern std::mutex g_nodeMap_mutex;
 
@@ -636,7 +638,10 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
         while(!ctx->shouldStop.load()) {
             // Thread stays alive, handling periodic tasks if needed
             // MQTT messages are handled by global handler (filtered by namespace)
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            
+            // Wait for signal (immediate wake-up) or timeout (1s for periodic checks)
+            std::unique_lock<std::mutex> lock(ctx->cvMutex);
+            ctx->cv.wait_for(lock, std::chrono::seconds(1), [&]{ return ctx->shouldStop.load(); });
         }
         
     } catch(const std::exception& e) {
@@ -653,8 +658,10 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
     log("🧹 Cleaning up resources for org '" + ctx->shortCode + "'", LogLevel::INFO);
 
     // 1. Unsubscribe from MQTT Topics
-    for(const auto& topic : ctx->topics) {
-         GlobalMQTT_Unsubscribe(topic);
+    // 1. Unsubscribe from MQTT Topics
+    if(!ctx->topics.empty()) {
+        log("🧹 Batch unsubscribing from " + std::to_string(ctx->topics.size()) + " topics...", LogLevel::INFO);
+        GlobalMQTT_UnsubscribeBatch(ctx->topics);
     }
     // Also unsubscribe from Emitter topics used in alarms?! 
     // Those are dynamic. We should track them or rely on g_triggerToAlarmMap check?

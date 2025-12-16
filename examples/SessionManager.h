@@ -4,6 +4,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,6 +34,10 @@ struct SessionContext {
     std::thread workerThread;
     std::atomic<bool> shouldStop;
     
+    // Thread synchronization for fast shutdown
+    std::condition_variable cv;
+    std::mutex cvMutex;
+
     // Org-specific resources
     std::vector<std::string> topics;
     std::map<std::string, UA_NodeId> nodeMap;
@@ -43,6 +48,7 @@ struct SessionContext {
     
     SessionContext() : shouldStop(false), namespaceIndex(0), orgId(0) {}
 };
+
 
 // Thread-safe session manager
 class SessionManager {

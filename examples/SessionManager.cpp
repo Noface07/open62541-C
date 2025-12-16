@@ -155,6 +155,7 @@ void SessionManager::unregisterSession(const UA_NodeId& sessionId) {
     if(ctx_ptr) {
         // Signal worker thread to stop
         ctx_ptr->shouldStop.store(true);
+        ctx_ptr->cv.notify_all(); // Wake up worker thread immediately
         
         log("⏳ Waiting for worker thread to terminate...", LogLevel::DEBUG);
         
