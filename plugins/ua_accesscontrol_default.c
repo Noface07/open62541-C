@@ -29,9 +29,9 @@ typedef struct {
 #define ANONYMOUS_POLICY "open62541-anonymous-policy"
 #define CERTIFICATE_POLICY "open62541-certificate-policy"
 #define USERNAME_POLICY "open62541-username-policy"
-const UA_String anonymous_policy = UA_STRING_STATIC(ANONYMOUS_POLICY);
-const UA_String certificate_policy = UA_STRING_STATIC(CERTIFICATE_POLICY);
-const UA_String username_policy = UA_STRING_STATIC(USERNAME_POLICY);
+static const UA_String anonymous_policy = UA_STRING_STATIC(ANONYMOUS_POLICY);
+static const UA_String certificate_policy = UA_STRING_STATIC(CERTIFICATE_POLICY);
+static const UA_String username_policy = UA_STRING_STATIC(USERNAME_POLICY);
 
 /************************/
 /* Access Control Logic */
@@ -108,8 +108,8 @@ activateSession_default(UA_Server *server, UA_AccessControl *ac,
         UA_Boolean match = false;
         if(context->loginCallback) {
             if(context->loginCallback(&userToken->userName, &userToken->password,
-               context->usernamePasswordLoginSize, context->usernamePasswordLogin,
-               sessionContext, context->loginContext) == UA_STATUSCODE_GOOD)
+                                      context->usernamePasswordLoginSize, context->usernamePasswordLogin,
+                                      sessionContext, context->loginContext) == UA_STATUSCODE_GOOD)
                 match = true;
         } else {
             for(size_t i = 0; i < context->usernamePasswordLoginSize; i++) {

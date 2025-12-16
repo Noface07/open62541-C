@@ -18,6 +18,7 @@
 #include <open62541/types.h>
 #include <open62541/types_generated.h>
 
+#include "parse_num.h"
 #include "util/ua_util_internal.h"
 #include "../deps/itoa.h"
 #include "../deps/base64.h"
@@ -91,23 +92,32 @@ UA_findDataType(const UA_NodeId *typeId) {
 }
 
 void
-UA_cleanupDataTypeWithCustom(const UA_DataTypeArray *customTypes) {
-    while (customTypes) {
-        const UA_DataTypeArray *next = customTypes->next;
-        if (customTypes->cleanup) {
-            for(size_t i = 0; i < customTypes->typesSize; ++i) {
-                const UA_DataType *type = &customTypes->types[i];
+UA_DataType_clear(UA_DataType *type) {
 #ifdef UA_ENABLE_TYPEDESCRIPTION
-                UA_free((void*)(uintptr_t)type->typeName);
-                for(size_t j = 0; j < type->membersSize; ++j) {
-                    const UA_DataTypeMember *m = &type->members[j];
-                    UA_free((void*)(uintptr_t)m->memberName);
-                }
+    UA_free((void*)(uintptr_t)type->typeName);
+    for(size_t j = 0; j < type->membersSize; ++j) {
+        UA_DataTypeMember *m = &type->members[j];
+        UA_free((void*)(uintptr_t)m->memberName);
+    }
 #endif
-                UA_free((void*)type->members);
+    UA_NodeId_clear(&type->typeId);
+    UA_NodeId_clear(&type->binaryEncodingId);
+    UA_NodeId_clear(&type->xmlEncodingId);
+    UA_free(type->members);
+    memset(type, 0, sizeof(UA_DataType));
+}
+
+void
+UA_cleanupDataTypeWithCustom(UA_DataTypeArray *customTypes) {
+    while(customTypes) {
+        UA_DataTypeArray *next = customTypes->next;
+        if(customTypes->cleanup) {
+            for(size_t i = 0; i < customTypes->typesSize; ++i) {
+                UA_DataType *type = &customTypes->types[i];
+                UA_DataType_clear(type);
             }
-            UA_free((void*)(uintptr_t)customTypes->types);
-            UA_free((void*)(uintptr_t)customTypes);
+            UA_free(customTypes->types);
+            UA_free(customTypes);
         }
         customTypes = next;
     }
@@ -116,6 +126,36 @@ UA_cleanupDataTypeWithCustom(const UA_DataTypeArray *customTypes) {
 /*****************/
 /* Builtin Types */
 /*****************/
+
+UA_Boolean
+UA_StatusCode_isBad(UA_StatusCode code) {
+    return ((code >> 30) >= 0x02);
+}
+
+UA_Boolean
+UA_StatusCode_isUncertain(UA_StatusCode code) {
+    return (((code >> 30) == 0x01) && ((code >> 30) < 0x02));
+}
+
+UA_Boolean
+UA_StatusCode_isGood(UA_StatusCode code) {
+    return ((code >> 30) == 0x00);
+}
+
+UA_Boolean
+UA_StatusCode_equalTop(UA_StatusCode s1, UA_StatusCode s2) {
+    return ((s1 & 0xFFFF0000) == (s2 & 0xFFFF0000));
+}
+
+UA_String
+UA_STRING(char *chars) {
+    UA_String s = {0, NULL};
+    if(!chars)
+        return s;
+    s.length = strlen(chars);
+    s.data = (UA_Byte*)chars;
+    return s;
+}
 
 UA_String
 UA_String_fromChars(const char *src) {
@@ -252,6 +292,27 @@ UA_String_vformat(UA_String *str, const char *format, va_list args) {
 }
 
 /* QualifiedName */
+UA_Boolean
+UA_QualifiedName_isNull(const UA_QualifiedName *q) {
+    return (q->namespaceIndex == 0 && q->name.length == 0);
+}
+
+UA_QualifiedName
+UA_QUALIFIEDNAME(UA_UInt16 nsIndex, char *chars) {
+    UA_QualifiedName qn;
+    qn.namespaceIndex = nsIndex;
+    qn.name = UA_STRING(chars);
+    return qn;
+}
+
+UA_QualifiedName
+UA_QUALIFIEDNAME_ALLOC(UA_UInt16 nsIndex, const char *chars) {
+    UA_QualifiedName qn;
+    qn.namespaceIndex = nsIndex;
+    qn.name = UA_STRING_ALLOC(chars);
+    return qn;
+}
+
 static UA_StatusCode
 QualifiedName_copy(const UA_QualifiedName *src, UA_QualifiedName *dst,
                    const UA_DataType *_) {
@@ -335,6 +396,16 @@ UA_QualifiedName_print(const UA_QualifiedName *qn, UA_String *output) {
 }
 
 /* DateTime */
+UA_Int64
+UA_DateTime_toUnixTime(UA_DateTime date) {
+    return (date - UA_DATETIME_UNIX_EPOCH) / UA_DATETIME_SEC;
+}
+
+UA_DateTime
+UA_DateTime_fromUnixTime(UA_Int64 unixDate) {
+    return (unixDate * UA_DATETIME_SEC) + UA_DATETIME_UNIX_EPOCH;
+}
+
 UA_DateTimeStruct
 UA_DateTime_toStruct(UA_DateTime t) {
     /* Divide, then subtract -> avoid underflow. Also, negative numbers are
@@ -388,6 +459,164 @@ UA_DateTime_fromStruct(UA_DateTimeStruct ts) {
     return t;
 }
 
+#ifdef UA_ENABLE_PARSING
+UA_StatusCode
+UA_DateTime_parse(UA_DateTime *dst, const UA_String str) {
+    if(str.length == 0)
+        return UA_STATUSCODE_BADDECODINGERROR;
+
+    struct musl_tm dts;
+    memset(&dts, 0, sizeof(dts));
+
+    size_t pos = 0;
+    size_t len;
+
+    /* Parse the year. The ISO standard asks for four digits. But we accept up
+     * to five with an optional plus or minus in front due to the range of the
+     * DateTime 64bit integer. But in that case we require the year and the
+     * month to be separated by a '-'. Otherwise we cannot know where the month
+     * starts. */
+    if(str.data[0] == '-' || str.data[0] == '+')
+        pos++;
+    UA_Int64 year = 0;
+    len = parseInt64((char*)&str.data[pos], 5, &year);
+    pos += len;
+    if(len != 4 && str.data[pos] != '-')
+        return UA_STATUSCODE_BADDECODINGERROR;
+    if(str.data[0] == '-')
+        year = -year;
+    dts.tm_year = (UA_Int16)year - 1900;
+    if(str.data[pos] == '-')
+        pos++;
+
+    /* Parse the month */
+    UA_UInt64 month = 0;
+    len = parseUInt64((char*)&str.data[pos], 2, &month);
+    pos += len;
+    UA_CHECK(len == 2, return UA_STATUSCODE_BADDECODINGERROR);
+    dts.tm_mon = (UA_UInt16)month - 1;
+    if(str.data[pos] == '-')
+        pos++;
+
+    /* Parse the day and check the T between date and time */
+    UA_UInt64 day = 0;
+    len = parseUInt64((char*)&str.data[pos], 2, &day);
+    pos += len;
+    UA_CHECK(len == 2 || str.data[pos] != 'T',
+             return UA_STATUSCODE_BADDECODINGERROR);
+    dts.tm_mday = (UA_UInt16)day;
+    pos++;
+
+    /* Parse the hour */
+    UA_UInt64 hour = 0;
+    len = parseUInt64((char*)&str.data[pos], 2, &hour);
+    pos += len;
+    UA_CHECK(len == 2, return UA_STATUSCODE_BADDECODINGERROR);
+    dts.tm_hour = (UA_UInt16)hour;
+    if(str.data[pos] == ':')
+        pos++;
+
+    /* Parse the minute */
+    UA_UInt64 min = 0;
+    len = parseUInt64((char*)&str.data[pos], 2, &min);
+    pos += len;
+    UA_CHECK(len == 2, return UA_STATUSCODE_BADDECODINGERROR);
+    dts.tm_min = (UA_UInt16)min;
+    if(str.data[pos] == ':')
+        pos++;
+
+    /* Parse the second */
+    UA_UInt64 sec = 0;
+    len = parseUInt64((char*)&str.data[pos], 2, &sec);
+    pos += len;
+    UA_CHECK(len == 2, return UA_STATUSCODE_BADDECODINGERROR);
+    dts.tm_sec = (UA_UInt16)sec;
+
+    /* Compute the seconds since the Unix epoch */
+    long long sinceunix = musl_tm_to_secs(&dts);
+
+    /* Are we within the range that can be represented? */
+    long long sinceunix_min =
+        (long long)(UA_INT64_MIN / UA_DATETIME_SEC) -
+        (long long)(UA_DATETIME_UNIX_EPOCH / UA_DATETIME_SEC) -
+        (long long)1; /* manual correction due to rounding */
+    long long sinceunix_max = (long long)
+        ((UA_INT64_MAX - UA_DATETIME_UNIX_EPOCH) / UA_DATETIME_SEC);
+    if(sinceunix < sinceunix_min || sinceunix > sinceunix_max)
+        return UA_STATUSCODE_BADDECODINGERROR;
+
+    /* Convert to DateTime. Add or subtract one extra second here to prevent
+     * underflow/overflow. This is reverted once the fractional part has been
+     * added. */
+    sinceunix -= (sinceunix > 0) ? 1 : -1;
+    UA_DateTime dt = (UA_DateTime)
+        (sinceunix + (UA_DATETIME_UNIX_EPOCH / UA_DATETIME_SEC)) * UA_DATETIME_SEC;
+
+    /* Parse the fraction of the second if defined */
+    if(str.data[pos] == ',' || str.data[pos] == '.') {
+        pos++;
+        double frac = 0.0;
+        double denom = 0.1;
+        while(pos < str.length &&
+              str.data[pos] >= '0' && str.data[pos] <= '9') {
+            frac += denom * (str.data[pos] - '0');
+            denom *= 0.1;
+            pos++;
+        }
+        frac += 0.00000005; /* Correct rounding when converting to integer */
+        dt += (UA_DateTime)(frac * UA_DATETIME_SEC);
+    }
+
+    /* Time zone handling */
+    int tzSign = 0;
+    UA_UInt64 tzHour = 0, tzMin = 0;
+    if(str.data[pos] == 'Z') {
+        pos++;
+    } else if(str.data[pos] == '+' || str.data[pos] == '-') {
+        tzSign = (str.data[pos] == '-') ? -1 : 1;
+        pos++;
+        len = parseUInt64((char*)&str.data[pos], 2, &tzHour);
+        pos += len;
+        if(str.data[pos] == ':')
+            pos++;
+        len = parseUInt64((char*)&str.data[pos], 2, &tzMin);
+        pos += len;
+        UA_Int64 offsetSeconds = (UA_Int64)(tzHour * 3600 + tzMin * 60) * tzSign;
+        dt -= (UA_DateTime)(offsetSeconds * UA_DATETIME_SEC);
+    } else {
+        return UA_STATUSCODE_BADDECODINGERROR;
+    }
+
+    /* Remove the underflow/overflow protection (see above) */
+    if(sinceunix > 0) {
+        if(dt > UA_INT64_MAX - UA_DATETIME_SEC)
+            return UA_STATUSCODE_BADDECODINGERROR;
+        dt += UA_DATETIME_SEC;
+    } else {
+        if(dt < UA_INT64_MIN + UA_DATETIME_SEC)
+            return UA_STATUSCODE_BADDECODINGERROR;
+        dt -= UA_DATETIME_SEC;
+    }
+
+    /* We must be at the end of the string */
+    if(pos != str.length)
+        return UA_STATUSCODE_BADDECODINGERROR;
+
+    *dst = dt;
+    return UA_STATUSCODE_GOOD;
+}
+
+UA_DateTime
+UA_DATETIME(const char *chars) {
+    UA_DateTime dst;
+    UA_StatusCode res =
+        UA_DateTime_parse(&dst, UA_STRING((char*)(uintptr_t)chars));
+    if(res != UA_STATUSCODE_GOOD)
+        UA_DateTime_init(&dst);
+    return dst;
+}
+#endif
+
 /* Guid */
 static const u8 hexmapLower[16] =
     {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
@@ -433,6 +662,15 @@ UA_Guid_print(const UA_Guid *guid, UA_String *output) {
     UA_Guid_to_hex(guid, output->data, true);
     return UA_STATUSCODE_GOOD;
 }
+
+#ifdef UA_ENABLE_PARSING
+UA_Guid
+UA_GUID(const char *chars) {
+    UA_Guid guid;
+    UA_Guid_parse(&guid, UA_STRING((char*)(uintptr_t)chars));
+    return guid;
+}
+#endif
 
 /* ByteString */
 UA_StatusCode
@@ -505,6 +743,68 @@ UA_NodeId_order(const UA_NodeId *n1, const UA_NodeId *n2) {
     return nodeIdOrder(n1, n2, NULL);
 }
 
+UA_NodeId
+UA_NODEID_NUMERIC(UA_UInt16 nsIndex, UA_UInt32 identifier) {
+    UA_NodeId id;
+    memset(&id, 0, sizeof(UA_NodeId));
+    id.namespaceIndex = nsIndex;
+    id.identifierType = UA_NODEIDTYPE_NUMERIC;
+    id.identifier.numeric = identifier;
+    return id;
+}
+
+UA_NodeId
+UA_NODEID_STRING(UA_UInt16 nsIndex, char *chars) {
+    UA_NodeId id;
+    memset(&id, 0, sizeof(UA_NodeId));
+    id.namespaceIndex = nsIndex;
+    id.identifierType = UA_NODEIDTYPE_STRING;
+    id.identifier.string = UA_STRING(chars);
+    return id;
+}
+
+UA_NodeId
+UA_NODEID_STRING_ALLOC(UA_UInt16 nsIndex,
+                       const char *chars) {
+    UA_NodeId id;
+    memset(&id, 0, sizeof(UA_NodeId));
+    id.namespaceIndex = nsIndex;
+    id.identifierType = UA_NODEIDTYPE_STRING;
+    id.identifier.string = UA_STRING_ALLOC(chars);
+    return id;
+}
+
+UA_NodeId
+UA_NODEID_GUID(UA_UInt16 nsIndex, UA_Guid guid) {
+    UA_NodeId id;
+    memset(&id, 0, sizeof(UA_NodeId));
+    id.namespaceIndex = nsIndex;
+    id.identifierType = UA_NODEIDTYPE_GUID;
+    id.identifier.guid = guid;
+    return id;
+}
+
+UA_NodeId
+UA_NODEID_BYTESTRING(UA_UInt16 nsIndex, char *chars) {
+    UA_NodeId id;
+    memset(&id, 0, sizeof(UA_NodeId));
+    id.namespaceIndex = nsIndex;
+    id.identifierType = UA_NODEIDTYPE_BYTESTRING;
+    id.identifier.byteString = UA_BYTESTRING(chars);
+    return id;
+}
+
+UA_NodeId
+UA_NODEID_BYTESTRING_ALLOC(UA_UInt16 nsIndex,
+                           const char *chars) {
+    UA_NodeId id;
+    memset(&id, 0, sizeof(UA_NodeId));
+    id.namespaceIndex = nsIndex;
+    id.identifierType = UA_NODEIDTYPE_BYTESTRING;
+    id.identifier.byteString = UA_BYTESTRING_ALLOC(chars);
+    return id;
+}
+
 /* sdbm-hash (http://www.cse.yorku.ca/~oz/hash.html) */
 u32
 UA_ByteString_hash(u32 initialHashValue,
@@ -540,7 +840,7 @@ nodeIdSize(const UA_NodeId *id, u8 *nsStr, u8 *numIdStr, UA_String nsUri,
            UA_Escaping idEsc) {
     /* Namespace length */
     size_t len = 0;
-    if(nsUri.length > 0) {
+    if(nsUri.data != NULL) {
         len += 5; /* nsu=; */
         len += UA_String_escapedSize(nsUri, UA_ESCAPING_PERCENT);
     } else if(id->namespaceIndex > 0) {
@@ -577,8 +877,10 @@ nodeIdSize(const UA_NodeId *id, u8 *nsStr, u8 *numIdStr, UA_String nsUri,
 static u8 *
 printNodeIdBody(const UA_NodeId *id, UA_String nsUri, u8* nsStr, u8* numIdStr, u8 *pos,
                 const UA_NamespaceMapping *nsMapping, UA_Escaping idEsc) {
+    size_t len;
+
     /* Encode the namespace */
-    if(nsUri.length > 0) {
+    if(nsUri.data != NULL) {
         memcpy(pos, "nsu=", 4);
         pos += 4;
         pos += UA_String_escapeInsert(pos, nsUri, UA_ESCAPING_PERCENT);
@@ -586,7 +888,7 @@ printNodeIdBody(const UA_NodeId *id, UA_String nsUri, u8* nsStr, u8* numIdStr, u
     } else if(id->namespaceIndex > 0) {
         memcpy(pos, "ns=", 3);
         pos += 3;
-        size_t len = strlen((char*)nsStr);
+        len = strlen((char*)nsStr);
         memcpy(pos, nsStr, len);
         pos += len;
         *pos++ = ';';
@@ -597,7 +899,7 @@ printNodeIdBody(const UA_NodeId *id, UA_String nsUri, u8* nsStr, u8* numIdStr, u
     case UA_NODEIDTYPE_NUMERIC:
         memcpy(pos, "i=", 2);
         pos += 2;
-        size_t len = strlen((char*)numIdStr);
+        len = strlen((char*)numIdStr);
         memcpy(pos, numIdStr, len);
         pos += len;
         break;
@@ -677,6 +979,14 @@ UA_NodeId_print(const UA_NodeId *id, UA_String *output) {
     return UA_NodeId_printEx(id, output, NULL);
 }
 
+#ifdef UA_ENABLE_PARSING
+UA_NodeId UA_NODEID(const char *chars) {
+    UA_NodeId id;
+    UA_NodeId_parse(&id, UA_STRING((char*)(uintptr_t)chars));
+    return id;
+}
+#endif
+
 /* ExpandedNodeId */
 static void
 ExpandedNodeId_clear(UA_ExpandedNodeId *p, const UA_DataType *_) {
@@ -692,6 +1002,71 @@ ExpandedNodeId_copy(UA_ExpandedNodeId const *src, UA_ExpandedNodeId *dst,
     dst->serverIndex = src->serverIndex;
     return retval;
 }
+
+UA_ExpandedNodeId
+UA_EXPANDEDNODEID_NUMERIC(UA_UInt16 nsIndex, UA_UInt32 identifier) {
+    UA_ExpandedNodeId id;
+    memset(&id, 0, sizeof(UA_ExpandedNodeId));
+    id.nodeId = UA_NODEID_NUMERIC(nsIndex, identifier);
+    return id;
+}
+
+UA_ExpandedNodeId
+UA_EXPANDEDNODEID_STRING(UA_UInt16 nsIndex, char *chars) {
+    UA_ExpandedNodeId id;
+    memset(&id, 0, sizeof(UA_ExpandedNodeId));
+    id.nodeId = UA_NODEID_STRING(nsIndex, chars);
+    return id;
+}
+
+UA_ExpandedNodeId
+UA_EXPANDEDNODEID_STRING_ALLOC(UA_UInt16 nsIndex, const char *chars) {
+    UA_ExpandedNodeId id;
+    memset(&id, 0, sizeof(UA_ExpandedNodeId));
+    id.nodeId = UA_NODEID_STRING_ALLOC(nsIndex, chars);
+    return id;
+}
+
+UA_ExpandedNodeId
+UA_EXPANDEDNODEID_STRING_GUID(UA_UInt16 nsIndex, UA_Guid guid) {
+    UA_ExpandedNodeId id;
+    memset(&id, 0, sizeof(UA_ExpandedNodeId));
+    id.nodeId = UA_NODEID_GUID(nsIndex, guid);
+    return id;
+}
+
+UA_ExpandedNodeId
+UA_EXPANDEDNODEID_BYTESTRING(UA_UInt16 nsIndex, char *chars) {
+    UA_ExpandedNodeId id;
+    memset(&id, 0, sizeof(UA_ExpandedNodeId));
+    id.nodeId = UA_NODEID_BYTESTRING(nsIndex, chars);
+    return id;
+}
+
+UA_ExpandedNodeId
+UA_EXPANDEDNODEID_BYTESTRING_ALLOC(UA_UInt16 nsIndex, const char *chars) {
+    UA_ExpandedNodeId id;
+    memset(&id, 0, sizeof(UA_ExpandedNodeId));
+    id.nodeId = UA_NODEID_BYTESTRING_ALLOC(nsIndex, chars);
+    return id;
+}
+
+UA_ExpandedNodeId
+UA_EXPANDEDNODEID_NODEID(UA_NodeId nodeId) {
+    UA_ExpandedNodeId id;
+    memset(&id, 0, sizeof(UA_ExpandedNodeId));
+    id.nodeId = nodeId;
+    return id;
+}
+
+#ifdef UA_ENABLE_PARSING
+UA_ExpandedNodeId
+UA_EXPANDEDNODEID(const char *chars) {
+    UA_ExpandedNodeId id;
+    UA_ExpandedNodeId_parse(&id, UA_STRING((char*)(uintptr_t)chars));
+    return id;
+}
+#endif
 
 UA_Boolean
 UA_ExpandedNodeId_isLocal(const UA_ExpandedNodeId *n) {
@@ -720,7 +1095,7 @@ UA_ExpandedNodeId_printEx(const UA_ExpandedNodeId *eid, UA_String *output,
                           size_t serverUrisSize, const UA_String *serverUris) {
     /* Try to map the NamespaceIndex to the Uri */
     UA_String nsUri = eid->namespaceUri;
-    if(nsUri.length == 0 && eid->nodeId.namespaceIndex > 0 && nsMapping)
+    if(nsUri.data == NULL && eid->nodeId.namespaceIndex > 0 && nsMapping)
         UA_NamespaceMapping_index2Uri(nsMapping, eid->nodeId.namespaceIndex, &nsUri);
 
     /* Try to map the ServerIndex to a Uri */
@@ -888,6 +1263,32 @@ UA_ExtensionObject_hasDecodedType(const UA_ExtensionObject *eo,
 }
 
 /* Variant */
+UA_Boolean
+UA_Variant_isEmpty(const UA_Variant *v) {
+    return v->type == NULL;
+}
+
+UA_Boolean
+UA_Variant_isScalar(const UA_Variant *v) {
+    return (v->type != NULL && v->arrayLength == 0 &&
+            v->data > UA_EMPTY_ARRAY_SENTINEL);
+}
+
+UA_Boolean
+UA_Variant_hasScalarType(const UA_Variant *v, const UA_DataType *type) {
+    return UA_Variant_isScalar(v) && type == v->type;
+}
+
+UA_Boolean
+UA_Variant_isArray(const UA_Variant *v) {
+    return (v->type != NULL && !UA_Variant_isScalar(v));
+}
+
+UA_Boolean
+UA_Variant_hasArrayType(const UA_Variant *v, const UA_DataType *type) {
+    return (!UA_Variant_isScalar(v)) && type == v->type;
+}
+
 static void
 Variant_clear(UA_Variant *p, const UA_DataType *_) {
     /* The content is "borrowed" */
@@ -1315,6 +1716,22 @@ UA_Variant_setRangeCopy(UA_Variant *v, const void * UA_RESTRICT array,
 }
 
 /* LocalizedText */
+UA_LocalizedText
+UA_LOCALIZEDTEXT(char *locale, char *text) {
+    UA_LocalizedText lt;
+    lt.locale = UA_STRING(locale);
+    lt.text = UA_STRING(text);
+    return lt;
+}
+
+UA_LocalizedText
+UA_LOCALIZEDTEXT_ALLOC(const char *locale, const char *text) {
+    UA_LocalizedText lt;
+    lt.locale = UA_STRING_ALLOC(locale);
+    lt.text = UA_STRING_ALLOC(text);
+    return lt;
+}
+
 static void
 LocalizedText_clear(UA_LocalizedText *p, const UA_DataType *_) {
     String_clear(&p->locale, NULL);
@@ -1347,8 +1764,8 @@ DataValue_copy(UA_DataValue const *src, UA_DataValue *dst,
 }
 
 UA_StatusCode
-UA_DataValue_copyVariantRange(const UA_DataValue *src, UA_DataValue * UA_RESTRICT dst,
-                              const UA_NumericRange range) {
+UA_DataValue_copyRange(const UA_DataValue *src, UA_DataValue * UA_RESTRICT dst,
+                       const UA_NumericRange range) {
     memcpy(dst, src, sizeof(UA_DataValue));
     UA_Variant_init(&dst->value);
     UA_StatusCode retval = UA_Variant_copyRange(&src->value, &dst->value, range);
@@ -1399,6 +1816,10 @@ void *
 UA_new(const UA_DataType *type) {
     void *p = UA_calloc(1, type->memSize);
     return p;
+}
+
+void UA_init(void *p, const UA_DataType *type) {
+    memset(p, 0, type->memSize);
 }
 
 static UA_StatusCode
@@ -2119,6 +2540,11 @@ UA_Order UA_order(const void *p1, const void *p2, const UA_DataType *type) {
     return orderJumpTable[type->typeKind](p1, p2, type);
 }
 
+UA_Boolean
+UA_equal(const void *p1, const void *p2, const UA_DataType *type) {
+    return (UA_order(p1, p2, type) == UA_ORDER_EQ);
+}
+
 /******************/
 /* Array Handling */
 /******************/
@@ -2412,6 +2838,14 @@ UA_NumericRange_parse(UA_NumericRange *range, const UA_String str) {
     }
 
     return retval;
+}
+
+UA_NumericRange
+UA_NUMERICRANGE(const char *s) {
+    UA_NumericRange nr;
+    memset(&nr, 0, sizeof(nr));
+    UA_NumericRange_parse(&nr, UA_STRING((char*)(uintptr_t)s));
+    return nr;
 }
 
 /*********************/

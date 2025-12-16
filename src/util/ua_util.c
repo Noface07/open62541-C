@@ -23,10 +23,15 @@
 #include "pcg_basic.h"
 #include "base64.h"
 #include "itoa.h"
+
+#if defined(UA_ARCHITECTURE_WIN32)
+#include <WinBase.h>
+#endif
+
 #include "../../deps/parse_num.h"
 #include "../../deps/libc_time.h"
 
-const char * attributeIdNames[28] = {
+static const char * attributeIdNames[28] = {
     "Invalid", "NodeId", "NodeClass", "BrowseName", "DisplayName", "Description",
     "WriteMask", "UserWriteMask", "IsAbstract", "Symmetric", "InverseName",
     "ContainsNoLoops", "EventNotifier", "Value", "DataType", "ValueRank",
@@ -332,135 +337,6 @@ UA_ByteString_fromBase64(UA_ByteString *bs,
     return UA_STATUSCODE_GOOD;
 }
 
-/* DateTime parsing for both JSON and XML */
-UA_StatusCode
-decodeDateTime(const UA_ByteString s, UA_DateTime *dst) {
-    /* The last character has to be 'Z'. We can omit some length checks later on
-     * because we know the atoi functions stop before the 'Z'. */
-    if(s.length == 0 || s.data[s.length-1] != 'Z')
-        return UA_STATUSCODE_BADDECODINGERROR;
-
-    struct musl_tm dts;
-    memset(&dts, 0, sizeof(dts));
-
-    size_t pos = 0;
-    size_t len;
-
-    /* Parse the year. The ISO standard asks for four digits. But we accept up
-     * to five with an optional plus or minus in front due to the range of the
-     * DateTime 64bit integer. But in that case we require the year and the
-     * month to be separated by a '-'. Otherwise we cannot know where the month
-     * starts. */
-    if(s.data[0] == '-' || s.data[0] == '+')
-        pos++;
-    UA_Int64 year = 0;
-    len = parseInt64((char*)&s.data[pos], 5, &year);
-    pos += len;
-    if(len != 4 && s.data[pos] != '-')
-        return UA_STATUSCODE_BADDECODINGERROR;
-    if(s.data[0] == '-')
-        year = -year;
-    dts.tm_year = (UA_Int16)year - 1900;
-    if(s.data[pos] == '-')
-        pos++;
-
-    /* Parse the month */
-    UA_UInt64 month = 0;
-    len = parseUInt64((char*)&s.data[pos], 2, &month);
-    pos += len;
-    UA_CHECK(len == 2, return UA_STATUSCODE_BADDECODINGERROR);
-    dts.tm_mon = (UA_UInt16)month - 1;
-    if(s.data[pos] == '-')
-        pos++;
-
-    /* Parse the day and check the T between date and time */
-    UA_UInt64 day = 0;
-    len = parseUInt64((char*)&s.data[pos], 2, &day);
-    pos += len;
-    UA_CHECK(len == 2 || s.data[pos] != 'T',
-             return UA_STATUSCODE_BADDECODINGERROR);
-    dts.tm_mday = (UA_UInt16)day;
-    pos++;
-
-    /* Parse the hour */
-    UA_UInt64 hour = 0;
-    len = parseUInt64((char*)&s.data[pos], 2, &hour);
-    pos += len;
-    UA_CHECK(len == 2, return UA_STATUSCODE_BADDECODINGERROR);
-    dts.tm_hour = (UA_UInt16)hour;
-    if(s.data[pos] == ':')
-        pos++;
-
-    /* Parse the minute */
-    UA_UInt64 min = 0;
-    len = parseUInt64((char*)&s.data[pos], 2, &min);
-    pos += len;
-    UA_CHECK(len == 2, return UA_STATUSCODE_BADDECODINGERROR);
-    dts.tm_min = (UA_UInt16)min;
-    if(s.data[pos] == ':')
-        pos++;
-
-    /* Parse the second */
-    UA_UInt64 sec = 0;
-    len = parseUInt64((char*)&s.data[pos], 2, &sec);
-    pos += len;
-    UA_CHECK(len == 2, return UA_STATUSCODE_BADDECODINGERROR);
-    dts.tm_sec = (UA_UInt16)sec;
-
-    /* Compute the seconds since the Unix epoch */
-    long long sinceunix = musl_tm_to_secs(&dts);
-
-    /* Are we within the range that can be represented? */
-    long long sinceunix_min =
-        (long long)(UA_INT64_MIN / UA_DATETIME_SEC) -
-        (long long)(UA_DATETIME_UNIX_EPOCH / UA_DATETIME_SEC) -
-        (long long)1; /* manual correction due to rounding */
-    long long sinceunix_max = (long long)
-        ((UA_INT64_MAX - UA_DATETIME_UNIX_EPOCH) / UA_DATETIME_SEC);
-    if(sinceunix < sinceunix_min || sinceunix > sinceunix_max)
-        return UA_STATUSCODE_BADDECODINGERROR;
-
-    /* Convert to DateTime. Add or subtract one extra second here to prevent
-     * underflow/overflow. This is reverted once the fractional part has been
-     * added. */
-    sinceunix -= (sinceunix > 0) ? 1 : -1;
-    UA_DateTime dt = (UA_DateTime)
-        (sinceunix + (UA_DATETIME_UNIX_EPOCH / UA_DATETIME_SEC)) * UA_DATETIME_SEC;
-
-    /* Parse the fraction of the second if defined */
-    if(s.data[pos] == ',' || s.data[pos] == '.') {
-        pos++;
-        double frac = 0.0;
-        double denom = 0.1;
-        while(pos < s.length &&
-              s.data[pos] >= '0' && s.data[pos] <= '9') {
-            frac += denom * (s.data[pos] - '0');
-            denom *= 0.1;
-            pos++;
-        }
-        frac += 0.00000005; /* Correct rounding when converting to integer */
-        dt += (UA_DateTime)(frac * UA_DATETIME_SEC);
-    }
-
-    /* Remove the underflow/overflow protection (see above) */
-    if(sinceunix > 0) {
-        if(dt > UA_INT64_MAX - UA_DATETIME_SEC)
-            return UA_STATUSCODE_BADDECODINGERROR;
-        dt += UA_DATETIME_SEC;
-    } else {
-        if(dt < UA_INT64_MIN + UA_DATETIME_SEC)
-            return UA_STATUSCODE_BADDECODINGERROR;
-        dt -= UA_DATETIME_SEC;
-    }
-
-    /* We must be at the end of the string (ending with 'Z' as checked above) */
-    if(pos != s.length - 1)
-        return UA_STATUSCODE_BADDECODINGERROR;
-
-    *dst = dt;
-    return UA_STATUSCODE_GOOD;
-}
-
 static u8
 printNum(i32 n, char *pos, u8 min_digits) {
     char digits[10];
@@ -573,10 +449,40 @@ UA_KeyValueMap_set(UA_KeyValueMap *map,
                                &UA_TYPES[UA_TYPES_KEYVALUEPAIR]);
 }
 
+UA_EXPORT UA_StatusCode
+UA_KeyValueMap_setShallow(UA_KeyValueMap *map,
+                          const UA_QualifiedName key,
+                          UA_Variant *value) {
+    if(map == NULL || value == NULL)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+
+    /* Key exists already */
+    UA_Variant *target;
+    const UA_Variant *v = UA_KeyValueMap_get(map, key);
+    if(v) {
+        target = (UA_Variant*)(uintptr_t)v;
+        UA_Variant_clear(target);
+    } else {
+        /* Append to the array */
+        UA_KeyValuePair pair;
+        pair.key = key;
+        UA_Variant_init(&pair.value);
+        UA_StatusCode res =
+            UA_Array_appendCopy((void**)&map->map, &map->mapSize, &pair,
+                                &UA_TYPES[UA_TYPES_KEYVALUEPAIR]);
+        if(res != UA_STATUSCODE_GOOD)
+            return res;
+        target = &map->map[map->mapSize-1].value;
+    }
+
+    *target = *value;
+    return UA_STATUSCODE_GOOD;
+}
+
 UA_StatusCode
 UA_KeyValueMap_setScalar(UA_KeyValueMap *map,
                          const UA_QualifiedName key,
-                         void * UA_RESTRICT p,
+                         const void * UA_RESTRICT p,
                          const UA_DataType *type) {
     if(p == NULL || type == NULL)
         return UA_STATUSCODE_BADINVALIDARGUMENT;
@@ -584,8 +490,21 @@ UA_KeyValueMap_setScalar(UA_KeyValueMap *map,
     UA_Variant_init(&v);
     v.type = type;
     v.arrayLength = 0;
-    v.data = p;
+    v.data = (void*)(uintptr_t)p;
     return UA_KeyValueMap_set(map, key, &v);
+}
+
+UA_StatusCode
+UA_KeyValueMap_setScalarShallow(UA_KeyValueMap *map, const UA_QualifiedName key,
+                                void *UA_RESTRICT p, const UA_DataType *type) {
+    if(p == NULL || type == NULL)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    UA_Variant v;
+    UA_Variant_init(&v);
+    v.type = type;
+    v.arrayLength = 0;
+    v.data = p;
+    return UA_KeyValueMap_setShallow(map, key, &v);
 }
 
 const UA_Variant *
@@ -931,11 +850,11 @@ UA_String_unescape(UA_String *str, UA_Boolean copyEscape, UA_Escaping esc) {
                 byte <<= 4;
 
                 if(pos[2] >= 'a')
-                    byte += pos[2] - ('a' - 10);
+                    byte += (u8)(pos[2] - ('a' - 10));
                 else if(pos[2] >= 'A')
-                    byte += pos[2] - ('A' - 10);
+                    byte += (u8)(pos[2] - ('A' - 10));
                 else
-                    byte += pos[2] - '0';
+                    byte += (u8)(pos[2] - '0');
 
                 pos += 2;
                 *writepos++ = byte;
@@ -1042,8 +961,6 @@ UA_String_escapeAppend(UA_String *s, const UA_String s2, UA_Escaping esc) {
     s->length += escapedLength;
     return UA_STATUSCODE_GOOD;
 }
-
-#ifdef UA_ENABLE_PARSING
 
 static UA_StatusCode
 moveTmpToOut(UA_String *tmp, UA_String *out) {
@@ -1280,8 +1197,6 @@ UA_ReadValueId_print(const UA_ReadValueId *rvi, UA_String *out) {
 
     return moveTmpToOut(&tmp, out);
 }
-
-#endif
 
 /************************/
 /* Cryptography Helpers */

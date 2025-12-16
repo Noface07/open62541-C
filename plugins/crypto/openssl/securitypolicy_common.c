@@ -42,9 +42,10 @@ modification history
 #define SHA1_DIGEST_LENGTH 20          /* 160 bits */
 #define RSA_DECRYPT_BUFFER_LENGTH 2048 /* bytes */
 
-/* Strings for ECC policies */
+/* Label strings for ECC policies */
 UA_String serverLabel = UA_STRING_STATIC("opcua-server");
 UA_String clientLabel = UA_STRING_STATIC("opcua-client");
+UA_String sessionLabel = UA_STRING_STATIC("opcua-secret");
 
 /* Cast to prevent warnings in LibreSSL */
 #define SHA256EVP() ((EVP_MD *)(uintptr_t)EVP_sha256())
@@ -1675,8 +1676,6 @@ UA_OpenSSL_ECC_DeriveKeys (const int curveID,
                            const UA_ByteString * key2,
                            UA_ByteString * out) {
     UA_StatusCode ret = UA_STATUSCODE_GOOD;
-    UA_Boolean generateLocal = true;
-    const UA_ByteString * remotePublicKey = NULL;
     UA_ByteString sharedSecret = UA_BYTESTRING_NULL;
     UA_ByteString salt = UA_BYTESTRING_NULL;
 
@@ -1686,6 +1685,7 @@ UA_OpenSSL_ECC_DeriveKeys (const int curveID,
     UA_Byte * keyPubEnc = NULL;
     size_t keyPubEncSize = 0;
 
+    /* Get the local ephemeral public key to use in comparison */
 #if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
     keyPubEncSize = EVP_PKEY_get1_encoded_public_key(localEphemeralKeyPair, &keyPubEnc);
 #else
@@ -1696,16 +1696,39 @@ UA_OpenSSL_ECC_DeriveKeys (const int curveID,
         goto errout;
     }
 
+    /* Determine the label for salt generation, remote ephemeral public key for ECDH, and 
+    info for HKDF */
+    UA_ByteString* label = NULL;
+    const UA_ByteString * remoteEphPubKey = NULL;
+
+    /* (Temporary) measure to signal salt generation for sessions */
+    /* out should always be allocated before this check, so it shouldn't cause problems */
+    if (out->data[0] == 0x03 && out->data[1] == 0x03 && out->data[2] == 0x04 ) {
+        label = &sessionLabel;
+        if (applicationType == UA_APPLICATIONTYPE_SERVER) {
+            remoteEphPubKey = key2;
+        } else {
+            remoteEphPubKey = key1; 
+        }
+    }
     /* Comparing from the second byte since the first byte has 0x04 from the encoding */
-    if (memcmp(&keyPubEnc[1], key1->data, key1->length) == 0) {
-        /* Remote keys */
-        generateLocal = false;
-        remotePublicKey = key2;
+    else if (memcmp(&keyPubEnc[1], key1->data, key1->length) == 0) {
+        /* Key 1 is local ephemeral public key => generating remote keys */
+        remoteEphPubKey = key2;
+        if (applicationType == UA_APPLICATIONTYPE_SERVER) {
+            label = &clientLabel;
+        } else {
+            label = &serverLabel;
+        }
     }
     else if (memcmp(&keyPubEnc[1], key2->data, key2->length) == 0) {
-        /* Local keys */
-        generateLocal = true;
-        remotePublicKey = key1;
+        /* Key 2 is local ephemeral public key => generating local keys */
+        remoteEphPubKey = key1;
+        if (applicationType == UA_APPLICATIONTYPE_SERVER) {
+            label = &serverLabel;
+        } else {
+            label = &clientLabel;
+        }
     }
     else {
         /* invalid */
@@ -1714,39 +1737,24 @@ UA_OpenSSL_ECC_DeriveKeys (const int curveID,
     }
 
     /* Use ECDH to calculate shared secret */
-    if (UA_STATUSCODE_GOOD != UA_OpenSSL_ECDH(curveID, localEphemeralKeyPair, remotePublicKey, &sharedSecret)) {
+    if (UA_STATUSCODE_GOOD != UA_OpenSSL_ECDH(curveID, localEphemeralKeyPair, remoteEphPubKey, &sharedSecret)) {
         ret = UA_STATUSCODE_BADINTERNALERROR;
         goto errout;
     }
 
-    /* Select label for salt generation */
-    UA_ByteString *label = NULL;
-
-    switch(applicationType) {
-    case UA_APPLICATIONTYPE_SERVER:
-        if (generateLocal)
-            label = &serverLabel;
-        else
-            label = &clientLabel;
-        break;
-    case UA_APPLICATIONTYPE_CLIENT:
-    if (generateLocal)
-            label = &clientLabel;
-        else
-            label = &serverLabel;
-        break;
-    default:
-        ret = UA_STATUSCODE_BADINTERNALERROR;
-        break;
-    }
-
     /* Calculate salt */
-    if (UA_STATUSCODE_GOOD != UA_OpenSSL_ECC_GenerateSalt(out->length, label, key1, key2, &salt)) {
+    /* The order of the (ephemeral public) keys (key1, key2) is reversed because the caller sends 
+    [remote, local] for local key computation and [local, remote] for remote key computation.
+    According to 6.8.1., the local salt computation appends the keys in order [local | remote] and the
+    remote salt computation [remote | local]. Therefore, no additional logic is required, reversing the 
+    order is sufficient. */
+    if (UA_STATUSCODE_GOOD != UA_OpenSSL_ECC_GenerateSalt(out->length, label, key2, key1, &salt)) {
         ret = UA_STATUSCODE_BADINTERNALERROR;
         goto errout;
     }
 
     /* Call HKDF to derive keys */
+    /* Salt is given as the info argument (check 6.8.1., tables 66 and 67) */
     if (UA_STATUSCODE_GOOD != UA_OpenSSL_HKDF(hashAlgorithm, &sharedSecret, &salt, &salt, out)) {
         ret = UA_STATUSCODE_BADINTERNALERROR;
         goto errout;

@@ -59,6 +59,9 @@ UA_SecureChannel_generateLocalKeys(const UA_SecureChannel *channel) {
     UA_ByteString localEncryptingKey = {encrKL, &buf.data[signKL]};
     UA_ByteString localIv = {encrBS, &buf.data[signKL + encrKL]};
 
+    /* TODO: Signal that no ECC salt is generated. Find a clean solution for this.  */
+    buf.data[0] = 0x00;
+
     /* Generate key */
     retval = sm->generateKey(sp->policyContext, &channel->remoteNonce,
                              &channel->localNonce, &buf);
@@ -101,6 +104,9 @@ generateRemoteKeys(const UA_SecureChannel *channel) {
     UA_ByteString remoteSigningKey = {signKL, buf.data};
     UA_ByteString remoteEncryptingKey = {encrKL, &buf.data[signKL]};
     UA_ByteString remoteIv = {encrBS, &buf.data[signKL + encrKL]};
+
+    /* TODO: Signal that no ECC salt is generated. Find a clean solution for this.  */
+    buf.data[0] = 0x00;
 
     /* Generate key */
     retval = sm->generateKey(sp->policyContext, &channel->localNonce,
@@ -453,11 +459,12 @@ decryptAndVerifyChunk(const UA_SecureChannel *channel,
        UA_LOG_WARNING_CHANNEL(channel->securityPolicy->logger, channel,
                               "Could not verify the signature"); return res);
 
-    /* Compute the padding if the payload as encrypted */
+    /* Compute the padding if the payload is encrypted (not ECC policy) */
     size_t padSize = 0;
-    if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT ||
+    if(((messageType != UA_MESSAGETYPE_OPN) && (channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)) ||
        (messageType == UA_MESSAGETYPE_OPN &&
-        cryptoModule->encryptionAlgorithm.uri.length > 0)) {
+        cryptoModule->encryptionAlgorithm.uri.length > 0 && 
+        !isEccPolicy(channel->securityPolicy))) {
         padSize = decodePadding(channel, cryptoModule, chunk, sigsize);
         UA_LOG_TRACE_CHANNEL(channel->securityPolicy->logger, channel,
                              "Calculated padding size to be %lu",

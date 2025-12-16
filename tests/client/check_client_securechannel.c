@@ -124,9 +124,9 @@ START_TEST(SecureChannel_timeout_fail) {
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
 
     UA_ClientConfig *cconfig = UA_Client_getConfig(client);
+    pauseServer();
     UA_fakeSleep(cconfig->secureChannelLifeTime + 1);
-    /* TODO: Manually trigger an eventloop iteration (stop sleeping in select) for the server thread */
-    UA_realSleep(500 + 1); // UA_MAXTIMEOUT+1 wait to be sure UA_Server_run_iterate can be completely executed
+    runServer();
 
     UA_Variant val;
     UA_Variant_init(&val);
@@ -184,7 +184,9 @@ START_TEST(SecureChannel_reconnect) {
 
     UA_ClientConfig *cconfig = UA_Client_getConfig(client);
     UA_fakeSleep(cconfig->secureChannelLifeTime + 1);
-    UA_realSleep(50 + 1);
+    pauseServer();
+    UA_Server_run_iterate(server, true);
+    runServer();
 
     retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
     ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
@@ -224,7 +226,7 @@ END_TEST
  * #None SecureChannels. To be compatible with them, only check if the
  * certificate matches IF it gets sent in th asymHeader of the OPN message. */
 START_TEST(SecureChannel_serverCert) {
-    UA_Client *client = UA_Client_new();
+    UA_Client *client = UA_Client_newForUnitTest();
     UA_ClientConfig_setDefault(UA_Client_getConfig(client));
 
     UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
@@ -263,7 +265,7 @@ dateTime_nowMonotonicWithOffset(UA_EventLoop *el) {
 
 /* Simulate a deviation between the "wallclock" and the monotonic clock */
 START_TEST(SecureChannel_differentMonotonicClock) {
-    UA_Client *client = UA_Client_new();
+    UA_Client *client = UA_Client_newForUnitTest();
     UA_ClientConfig_setDefault(UA_Client_getConfig(client));
 
     UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");

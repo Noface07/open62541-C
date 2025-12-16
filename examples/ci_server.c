@@ -19,8 +19,6 @@
 * The server certificate and private key are loaded from the command line arguments.
 */
 
-#define MIN_ARGS 4
-
 static UA_UsernamePasswordLogin logins[3] = {
     {UA_STRING_STATIC("peter"), UA_STRING_STATIC("peter123")},
     {UA_STRING_STATIC("paula"), UA_STRING_STATIC("paula123")},
@@ -144,7 +142,7 @@ int main(int argc, char* argv[]) {
         // print the certificat and private key
         printf("certificate: %.*s\n", (int)certificate.length, certificate.data);
     } else {
-        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_APPLICATION,
                      "Missing arguments. Arguments are "
                      "<port> <server-certificate.der> <private-key.der> "
                      "[<trustlist1.crl>, ...]");
