@@ -3969,17 +3969,20 @@ int RunServer(int argc, char **argv) {
     // Prevent unbounded growth of notification queues if clients are slow
     
     config->maxSessions = 100;
+    config->maxSecureChannels = 50;      // Limit concurrent TCP connections
+    config->maxSessionTimeout = 10000.0; // Prune detached sessions after 10s to free MonitoredItems
     config->maxSubscriptionsPerSession = 50;
     config->maxMonitoredItemsPerSubscription = 1000;
+    config->maxMonitoredItems = 1000;   // Global limit to prevent TimerTree explosion
+    config->maxSubscriptions = 200;      // Global limit for subscriptions
     config->publishingIntervalLimits.min = 100.0; // Enforce min 100ms publishing interval
     config->samplingIntervalLimits.min = 500.0;   // Throttle sampling to max 5Hz to prevent notification flood
-    config->publishingIntervalLimits.min = 100.0;  // Don't let them poll faster than 100ms
     config->publishingIntervalLimits.max = 3600.0 * 1000.0;
-    config->queueSizeLimits.max = 100;                // Standard: Unlimited (was 1/100 for debugging)
+    config->queueSizeLimits.max = 1;                // Minimal Queue: Only keep latest value (No Buffering)
     config->enableRetransmissionQueue = true;  // Enable retransmission queue
     config->maxRetransmissionQueueSize = 100;         // Standard: Unlimited (was 1/10 for debugging)
-    config->maxNotificationsPerPublish = 2000;      // Limit per PublishResponse
-    log("Performance Limits applied: MaxSessions=100, MaxSubs=50, MinPubInt=100ms", LogLevel::INFO);
+    config->maxNotificationsPerPublish = 1000;      // Limit per PublishResponse
+    log("Performance Limits used: MaxSessions=100, GlobalMAXMI=20000", LogLevel::INFO);
 
     // Add historizing configuration
     // Add historizing configuration
@@ -4988,6 +4991,22 @@ int RunServer(int argc, char **argv) {
                      log("DEBUG: Performed _heapmin() (Released unused heap to OS)", LogLevel::DEBUG); 
                 }
                 #endif
+                
+                // MONITORING DIAGNOSTICS: Log active MonitoredItems count
+                UA_Variant val;
+                UA_Variant_init(&val);
+                UA_NodeId diagNodeId = UA_NODEID_NUMERIC(0, 2271); // Global: Server_ServerDiagnostics_ServerDiagnosticsSummary_CurrentMonitoredItemsCount
+                UA_StatusCode retval = UA_Server_readValue(server, diagNodeId, &val);
+                if(retval == UA_STATUSCODE_GOOD) {
+                    if(UA_Variant_hasScalarType(&val, &UA_TYPES[UA_TYPES_UINT32])) {
+                        UA_UInt32 count = *(UA_UInt32*)val.data;
+                        log("DIAGNOSTICS: Current Monitored Items = " + std::to_string(count), LogLevel::INFO);
+                    }
+                    UA_Variant_clear(&val);
+                } else {
+                    log("DIAGNOSTICS FAILED: Could not read Node ns=1;i=54543 (Error: " + std::string(UA_StatusCode_name(retval)) + ")", LogLevel::INFO);
+                }
+
                 last_trim = now;
             }
         }

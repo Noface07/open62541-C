@@ -25,6 +25,8 @@ set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/tools/cmake")
 
 find_package(Python3 REQUIRED)
 find_package(Git)
+# find_package(nng CONFIG REQUIRED) # Moved to dependency of UA_ENABLE_PUBSUB
+
 include(AssignSourceGroup)
 include(GNUInstallDirs)
 
@@ -321,7 +323,10 @@ option(UA_ENABLE_DEBUG_SANITIZER "Use sanitizer in debug mode" ON)
 mark_as_advanced(UA_ENABLE_DEBUG_SANITIZER)
 
 # General PubSub setup
-option(UA_ENABLE_PUBSUB "Enable the PubSub protocol" ON)
+option(UA_ENABLE_PUBSUB "Enable the PubSub protocol" OFF)
+if(UA_ENABLE_PUBSUB)
+    find_package(nng CONFIG REQUIRED)
+endif()
 
 option(UA_ENABLE_PUBSUB_SKS "Enable Security Key Service support for publisher and subscriber" OFF)
 mark_as_advanced(UA_ENABLE_PUBSUB_SKS)

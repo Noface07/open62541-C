@@ -29,6 +29,7 @@ static bool checkAccess(UA_Server *server, const UA_NodeId *sessionId, const UA_
     }
 
     std::string nsUri((char*)uri.data, uri.length);
+    UA_String_clear(&uri); // FIX: Free namespace string to prevent leak
 
     // LOGGING
 
@@ -46,6 +47,7 @@ static bool checkAccess(UA_Server *server, const UA_NodeId *sessionId, const UA_
     // If the namespace starts with "anexee:", it belongs to a tenant.
     if(nsUri.rfind("anexee:", 0) == 0) {
         log("⛔ Access Denied: User '" + ctx->shortCode + "' cannot access Node in '" + nsUri + "'", LogLevel::INFO);
+        // UA_String_clear(&uri); // Already cleared above
         return false; // Access denied: Belongs to another Org
     }
 
