@@ -25,69 +25,6 @@ extern void writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *s
               const UA_NodeId *nodeId, void *nodeContext, const UA_NumericRange *range,
               const UA_DataValue *data);
 
-// ============================================================================
-// Helper Functions for Alarm Creation
-// ============================================================================
-
-static UA_NodeId findChildNodeIdAnyNS(UA_Server *server, UA_NodeId parentId, const char *searchName) {
-    UA_NodeId result = UA_NODEID_NULL;
-    UA_String searchNameStr = UA_STRING((char*)searchName);
-
-    UA_BrowseDescription bd;
-    UA_BrowseDescription_init(&bd);
-    bd.nodeId = parentId;
-    bd.browseDirection = UA_BROWSEDIRECTION_FORWARD;
-    bd.includeSubtypes = true;
-    bd.referenceTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_HIERARCHICALREFERENCES);
-    bd.resultMask = UA_BROWSERESULTMASK_BROWSENAME;
-
-    UA_BrowseResult bres = UA_Server_browse(server, 0, &bd);
-
-    for(size_t i = 0; i < bres.referencesSize; ++i) {
-        UA_ReferenceDescription *ref = &bres.references[i];
-        if(UA_String_equal(&ref->browseName.name, &searchNameStr)) {
-            UA_NodeId_copy(&ref->nodeId.nodeId, &result);
-            break;
-        }
-    }
-    UA_BrowseResult_clear(&bres);
-    return result;
-}
-
-static UA_NodeId findNodeByPath(UA_Server *server, UA_NodeId startNode, const std::vector<const char*>& path) {
-    UA_NodeId current;
-    UA_NodeId_copy(&startNode, &current);
-    
-    for(const char* name : path) {
-        UA_NodeId next = findChildNodeIdAnyNS(server, current, name);
-        UA_NodeId_clear(&current); // Clear previous
-        if(UA_NodeId_isNull(&next)) return UA_NODEID_NULL;
-        current = next;
-    }
-    return current;
-}
-
-static void setStealthValueByPath(UA_Server *server, UA_NodeId baseNode, 
-                                 std::vector<const char*> path, 
-                                 void *newValue, const UA_DataType *type) {
-    UA_NodeId targetNode = findNodeByPath(server, baseNode, path);
-    if(UA_NodeId_isNull(&targetNode)) {
-        UA_NodeId_clear(&targetNode);
-        return;
-    }
-    
-    UA_Variant val;
-    UA_Variant_init(&val);
-    UA_Variant_setScalar(&val, newValue, type);
-    UA_Server_writeValue(server, targetNode, val);
-    UA_NodeId_clear(&targetNode);
-}
-
-static void setStealthValueChecked(UA_Server *server, UA_NodeId baseNode, 
-                                  const char* name, 
-                                  void *newValue, const UA_DataType *type) {
-    setStealthValueByPath(server, baseNode, {name}, newValue, type);
-}
 
 // ============================================================================
 // Helper Functions for Address Space Creation

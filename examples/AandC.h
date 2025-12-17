@@ -6,7 +6,8 @@
 #include <vector>
 #include <map>
 #include <mutex>
-#include <nlohmann/json.hpp> // Added for json type in function declaration
+#include <unordered_map>
+#include <nlohmann/json.hpp>
 
 /**
  * @brief A custom comparator for using UA_NodeId as a key in std::map.
@@ -53,17 +54,6 @@ extern std::mutex g_alarmMutex;
 extern void GlobalMQTT_Subscribe(const std::string &topic);
 
 /**
- * @brief A global map to store and access alarm information for each monitored process node.
- *
- * The key is the UA_NodeId of the process variable (e.g., a sensor reading).
- * The value is the MonitoredNodeAlarmInfo struct containing all related alarm data.
- *
- * Declared as 'extern' so it can be accessed by any file that includes this header,
- * while being defined in a single .cpp file.
- */
-// extern std::map<UA_NodeId, MonitoredNodeAlarmInfo, UA_NodeId_less_than> monitoredAlarms;
-
-/**
  * @brief Information about an MQTT Topic (tag) for Generic Telemetry
  */
 struct TopicInfo {
@@ -72,29 +62,172 @@ struct TopicInfo {
     std::string tagType;
     double rangeMin;
     double rangeMax;
-    // int source;
-    // int infoId;
-    // int quality;
-    // int updateType;
 };
 
 extern std::unordered_map<std::string, TopicInfo> topicMap;
 extern std::mutex g_topicMap_mutex;
 
-/**
- * @brief Creates an instance of ExclusiveLimitAlarmType and links it to a process node.
- *
- * @param server The UA_Server instance.
- * @param processNodeId The NodeId of the variable that this alarm is monitoring.
- * @param displayName The display name for the alarm, used to generate the alarm node's name.
- * @param item A JSON object containing alarm limit configurations (e.g., alarmHiHi, alarmHi).
- * @param outAlarmInstanceId A pointer to a UA_NodeId where the new alarm's NodeId will be stored.
- * @return UA_StatusCode indicating the result of the operation.
+
+
+
+
+
+
+// ----------------------------------------------------------------------------------------------------------------
+
+/* Branch management: Map GUID → Branch NodeId for each alarm condition
+ * 
+ * OPC UA Alarms & Conditions support branches to track multiple simultaneous
+ * occurrences of the same alarm condition. Each branch is identified by a unique
+ * BranchId (NodeId). In this implementation:
+ * 
+ * - Main branch: BranchId = NULL (uses condition NodeId directly)
+ * - GUID branches: Each unique AEInstanceID GUID gets its own branch NodeId
+ * 
+ * Branches are typically not visible in the Address Space and this standard does not define a standard way to make them visible.
  */
-// UA_StatusCode createAndLinkExclusiveLimitAlarm(...) - Removed as unused
+struct AlarmBranchInfo {
+    UA_NodeId branchNodeId;      // The branch NodeId (or condition NodeId for main branch)
+    UA_NodeId conditionNodeId;   // The main Condition NodeId (added for ConditionRefresh)
+    std::string guid;             // The AEInstanceID GUID
+    bool isMainBranch;            // true if this is the main branch (GUID empty/null)
+};
+
+// Map: alarmKey → (GUID → BranchInfo)
+extern std::unordered_map<std::string, std::unordered_map<std::string, AlarmBranchInfo>> g_alarmBranches;
+extern std::mutex g_alarmBranches_mutex;
+
+// ----------------------------------------------------------------------------------------------------------------
+
+/* Branch state tracking: Track state for each branch (GUID) separately
+ * This allows independent acknowledgment/confirmation per branch
+ */
+struct BranchState {
+    bool active;
+    bool acked;
+    bool confirmed;
+    UA_UInt16 severity;
+    std::string message;
+    UA_DateTime time;
+    UA_DateTime receiveTime;
+    UA_Boolean retain;
+    UA_StatusCode quality;
+    std::vector<UA_ByteString> eventIds;  // Track ALL EventIds for this state (multiple events may be generated)
+    
+    BranchState() : active(false), acked(false), confirmed(false), severity(0),
+                    time(0), receiveTime(0), retain(UA_FALSE), quality(UA_STATUSCODE_GOOD) {
+    }
+    
+    ~BranchState() {
+        clearEventIds();
+    }
+    
+    void clearEventIds() {
+        for(auto &eventId : eventIds) {
+            UA_ByteString_clear(&eventId);
+        }
+        eventIds.clear();
+    }
+    
+    void addEventId(const UA_ByteString *newEventId) {
+        if(newEventId && newEventId->length > 0) {
+            UA_ByteString copy;
+            UA_ByteString_init(&copy);
+            UA_ByteString_copy(newEventId, &copy);
+            eventIds.push_back(copy);
+        }
+    }
+    
+    bool hasEventId(const UA_ByteString *searchEventId) const {
+        for(const auto &eventId : eventIds) {
+            if(UA_ByteString_equal(&eventId, searchEventId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    // Copy constructor
+    BranchState(const BranchState& other) {
+        active = other.active;
+        acked = other.acked;
+        confirmed = other.confirmed;
+        severity = other.severity;
+        message = other.message;
+        time = other.time;
+        receiveTime = other.receiveTime;
+        retain = other.retain;
+        quality = other.quality;
+        for(const auto &eventId : other.eventIds) {
+            UA_ByteString copy;
+            UA_ByteString_init(&copy);
+            UA_ByteString_copy(&eventId, &copy);
+            eventIds.push_back(copy);
+        }
+    }
+    
+    // Assignment operator
+    BranchState& operator=(const BranchState& other) {
+        if(this != &other) {
+            active = other.active;
+            acked = other.acked;
+            confirmed = other.confirmed;
+            severity = other.severity;
+            message = other.message;
+            time = other.time;
+            receiveTime = other.receiveTime;
+            retain = other.retain;
+            quality = other.quality;
+            clearEventIds();
+            for(const auto &eventId : other.eventIds) {
+                UA_ByteString copy;
+                UA_ByteString_init(&copy);
+                UA_ByteString_copy(&eventId, &copy);
+                eventIds.push_back(copy);
+            }
+        }
+        return *this;
+    }
+};
+
+
+extern std::unordered_map<std::string, std::vector<TriggerToAlarmMapping>> g_triggerToAlarmMap;
+extern std::mutex g_alarmMutex;
+extern std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
+extern std::unordered_map<std::string, std::unordered_map<std::string, AlarmBranchInfo>> g_alarmBranches;
+extern std::unordered_map<std::string, std::unordered_map<std::string, BranchState>> g_branchStates;
+
+
+extern void GlobalMQTT_Subscribe(const std::string &topic);
+void publish_to_mqtt(const std::string &topic, const std::string &payload);
+
+void performDisable(UA_Server *server, const UA_NodeId &alarmId,const std::string &alarmKey);
+std::string getPreciseTimestamp();
+UA_StatusCode getOrCreateAlarmBranch(UA_Server *server, const UA_NodeId &conditionId,
+                       const std::string &guid, const std::string &alarmKey,
+                       UA_NodeId *outBranchId);
+
+// Helper Functions exposed for SessionWorker.cpp
+UA_NodeId findChildNodeIdAnyNS(UA_Server *server, UA_NodeId parentId, const char *searchName);
+UA_NodeId findNodeByPath(UA_Server *server, UA_NodeId startNode, const std::vector<const char*>& path);
+UA_StatusCode setStealthValueByPath(UA_Server *server, UA_NodeId baseNode, 
+                           std::vector<const char*> path, 
+                           void *newValue, const UA_DataType *type);
+UA_StatusCode setStealthValueChecked(UA_Server *server, UA_NodeId baseNode, 
+                            const char* name, 
+                            void *newValue, const UA_DataType *type);
+std::string findAlarmKeyForCondition(const UA_NodeId *alarmNodeId);
+
 
 
 // --- Alarm Method Callbacks (Exposed for Multi-Tenancy) ---
+
+UA_StatusCode ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
+                                           void *sessionContext, const UA_NodeId *methodId,
+                                           void *methodContext, const UA_NodeId *objectId,
+                                           void *objectContext, size_t inputSize,
+                                           const UA_Variant *input, size_t outputSize,
+                                           UA_Variant *output);
 
 UA_StatusCode customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
                                       void *sessionContext, const UA_NodeId *methodId,
