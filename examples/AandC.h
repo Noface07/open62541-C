@@ -61,7 +61,7 @@ extern void GlobalMQTT_Subscribe(const std::string &topic);
  * Declared as 'extern' so it can be accessed by any file that includes this header,
  * while being defined in a single .cpp file.
  */
-extern std::map<UA_NodeId, MonitoredNodeAlarmInfo, UA_NodeId_less_than> monitoredAlarms;
+// extern std::map<UA_NodeId, MonitoredNodeAlarmInfo, UA_NodeId_less_than> monitoredAlarms;
 
 /**
  * @brief Information about an MQTT Topic (tag) for Generic Telemetry
@@ -91,11 +91,7 @@ extern std::mutex g_topicMap_mutex;
  * @param outAlarmInstanceId A pointer to a UA_NodeId where the new alarm's NodeId will be stored.
  * @return UA_StatusCode indicating the result of the operation.
  */
-UA_StatusCode createAndLinkExclusiveLimitAlarm(UA_Server *server,
-                                             const UA_NodeId *processNodeId,
-                                             const std::string &displayName,
-                                             const nlohmann::json &item,
-                                             UA_NodeId *outAlarmInstanceId);
+// UA_StatusCode createAndLinkExclusiveLimitAlarm(...) - Removed as unused
 
 
 // --- Alarm Method Callbacks (Exposed for Multi-Tenancy) ---

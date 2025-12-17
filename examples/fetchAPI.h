@@ -45,12 +45,13 @@ json getBearerToken(std::string host, std::string port, std::string username, st
  * @return A JSON object representing the complete server and tag hierarchy.
  * @throws std::exception on connection or HTTP errors.
  */
-json getHierarchy(std::string host, std::string port, std::string bearerToken, std::string json_body, std::string target);
+json getResponse(std::string host, std::string port, std::string bearerToken,
+            std::string json_body, std::string target);
 
 /**
  * @brief Parses the JSON hierarchy into a vector of C++ structs.
  *
- * This function calls getHierarchy internally and processes the JSON response,
+ * This function calls getResponse internally and processes the JSON response,
  * populating the global `Mapping` variable as a side effect.
  *
  * @param host The hostname or IP address of the API server.

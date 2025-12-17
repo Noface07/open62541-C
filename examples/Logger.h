@@ -17,7 +17,7 @@ extern bool g_logging_enabled;  // Global control for file logging
 inline bool g_debug = false;
 inline bool g_logging_enabled = false;
 
-enum LogLevel { INFO, DEBUG, ERRORS };
+enum LogLevel { INFO, DEBUG, ERRORS , WARNING , FATAL};
 
 // Logging configuration structure
 struct LogConfig {

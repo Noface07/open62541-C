@@ -7,12 +7,13 @@
 #include <future>
 #include <map>
 #include <sstream>
-#include "AandC.h"
+
 
 using json = nlohmann::ordered_json;
 
 extern std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
 extern void GlobalMQTT_Subscribe(const std::string &topic);
+extern void GlobalMQTT_SubscribeBatch(const std::vector<std::string> &topics);
 extern void GlobalMQTT_Unsubscribe(const std::string &topic);
 extern void GlobalMQTT_UnsubscribeBatch(const std::vector<std::string> &topics); // Optimization
 
@@ -206,7 +207,8 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
             }
         })";
         
-        auto futureResponse = std::async(std::launch::async, getHierarchy,
+        auto futureResponse =
+            std::async(std::launch::async, getResponse,
                                         apiHost, apiPort, bearerToken,
                                         topicJsonBody, "/api/GetTopicList");
         json topicResponse = futureResponse.get();
@@ -355,7 +357,12 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                     topicMap[ns] = info;
                 }
                 // 📡 Dynamic Subscribe
-                GlobalMQTT_Subscribe(ns);
+                // Queue topic for batch subscription later to ensure nodes are ready
+                // Deduplicate to prevent massive vector growth
+                if(std::find(ctx->topics.begin(), ctx->topics.end(), ns) == ctx->topics.end()) {
+                    ctx->topics.push_back(ns);
+                } 
+
                 nodesCreated++;
                 
                 // Add EURange property if available
@@ -438,7 +445,13 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
         log("✓ Created " + std::to_string(nodesCreated) + " variable nodes for org '" + 
             ctx->shortCode + "' in namespace " + std::to_string(ctx->namespaceIndex) + 
             " ('" + ctx->namespaceUri + "')", LogLevel::INFO);
-        
+            
+        // 📡 BATCH SUBSCRIBE: Now that all nodes are created, perform subscription
+        if(!ctx->topics.empty()) {
+            log("📡 Batch subscribing to " + std::to_string(ctx->topics.size()) + " topics...", LogLevel::INFO);
+            GlobalMQTT_SubscribeBatch(ctx->topics);
+        }
+
         // ====================================================================
         // STEP 4: Fetch org-specific alarms
         // ====================================================================
@@ -658,11 +671,17 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
     log("🧹 Cleaning up resources for org '" + ctx->shortCode + "'", LogLevel::INFO);
 
     // 1. Unsubscribe from MQTT Topics
-    // 1. Unsubscribe from MQTT Topics
-    if(!ctx->topics.empty()) {
-        log("🧹 Batch unsubscribing from " + std::to_string(ctx->topics.size()) + " topics...", LogLevel::INFO);
-        GlobalMQTT_UnsubscribeBatch(ctx->topics);
-    }
+        if(!ctx->topics.empty()) {
+            log("🧹 Batch unsubscribing from " + std::to_string(ctx->topics.size()) + " topics...", LogLevel::INFO);
+            GlobalMQTT_UnsubscribeBatch(ctx->topics);
+        }
+        log("DEBUG: MQTT Unsubscribe complete. Clearing local maps...", LogLevel::DEBUG);
+
+        // 2. Clear Alarm Map (Local)
+        ctx->alarmMap.clear();
+        log("DEBUG: Local Alarm Map cleared.", LogLevel::DEBUG);
+        
+        // 3. Remove from Global Maps (if we added them)
     // Also unsubscribe from Emitter topics used in alarms?! 
     // Those are dynamic. We should track them or rely on g_triggerToAlarmMap check?
     // Current implementation only tracks 'topics' (generic telemetry).

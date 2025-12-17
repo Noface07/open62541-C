@@ -126,7 +126,7 @@ json getBearerToken(string host, string port , string username, string password)
 
 
 
-json getHierarchy(string host , string port , string bearerToken , string json_body , string target) {
+json getResponse(string host , string port , string bearerToken , string json_body , string target) {
 
 try{
     // std::string host = host;
@@ -173,123 +173,19 @@ try{
     return result;
 
     } catch (const std::exception &e) {
-    log("getHierarchy Error: " + string(e.what()),LogLevel::ERRORS);
+    log("getResponse Error: " + string(e.what()),LogLevel::ERRORS);
         throw; // Re-throw to allow retry logic to handle it
     }
     
 }
 
 
-json
-GetAllOrganizationList(string host, string port, string bearerToken, string json_body,
-             string target) {
-
-    try {
-        int version = 11;
-
-        // Set up I/O context and connection
-        tcp::resolver resolver(http_ioc);
-        beast::tcp_stream stream(http_ioc);
-
-        // Resolve and connect
-        auto const results = resolver.resolve(host, port);
-        stream.connect(results);
-
-        // Build HTTP POST request
-        beast::http::request<beast::http::string_body> req{beast::http::verb::post,
-                                                           target, version};
-        req.set(beast::http::field::host, host);
-        req.set(beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-        req.set(beast::http::field::content_type, "application/json");
-
-        // Set Bearer Authorization header
-        req.set(beast::http::field::authorization, "Bearer " + bearerToken);
-
-        req.body() = json_body;
-        req.prepare_payload();
-
-        // Send request
-        beast::http::write(stream, req);
-
-        // Get response
-        beast::flat_buffer buffer;
-        beast::http::response<beast::http::string_body> res;
-        beast::http::read(stream, buffer, res);
-
-        // Output response
-
-        // log(res.body().c_str(), LogLevel::DEBUG);
-        json result = json::parse(res.body());
-        // Shutdown connection
-        beast::error_code ec;
-        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
-
-        return result;
-
-    } catch(const std::exception &e) {
-        log("GetAllOrganizationList Error: " + string(e.what()), LogLevel::ERRORS);
-        throw;  // Re-throw to allow retry logic to handle it
-    }
-}
-
-
-json
-GetUserProfile(string host, string port, string bearerToken, string json_body,
-             string target) {
-
-    try {
-        int version = 11;
-
-        // Set up I/O context and connection
-        tcp::resolver resolver(http_ioc);
-        beast::tcp_stream stream(http_ioc);
-
-        // Resolve and connect
-        auto const results = resolver.resolve(host, port);
-        stream.connect(results);
-
-        // Build HTTP POST request
-        beast::http::request<beast::http::string_body> req{beast::http::verb::post,
-                                                           target, version};
-        req.set(beast::http::field::host, host);
-        req.set(beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-        req.set(beast::http::field::content_type, "application/json");
-
-        // Set Bearer Authorization header
-        req.set(beast::http::field::authorization, "Bearer " + bearerToken);
-
-        req.body() = json_body;
-        req.prepare_payload();
-
-        // Send request
-        beast::http::write(stream, req);
-
-        // Get response
-        beast::flat_buffer buffer;
-        beast::http::response<beast::http::string_body> res;
-        beast::http::read(stream, buffer, res);
-
-        // Output response
-
-        // log(res.body().c_str(), LogLevel::DEBUG);
-        json result = json::parse(res.body());
-        // Shutdown connection
-        beast::error_code ec;
-        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
-
-        return result;
-
-    } catch(const std::exception &e) {
-        log("GetUserProfile Error: " + string(e.what()), LogLevel::ERRORS);
-        throw;  // Re-throw to allow retry logic to handle it
-    }
-}
-
 vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearerToken, string json_body, string target) {
 
     vector<ServerInfoO> servers;
     if(!bearerToken.empty()) {
-        auto futureResponse = std::async(std::launch::async, getHierarchy, host, port,bearerToken, json_body, target);
+        auto futureResponse = std::async(std::launch::async, getResponse, host, port,
+                                         bearerToken, json_body, target);
         json response = futureResponse.get();
 
         if(response.contains("servers") && response["servers"].is_array()) {
@@ -444,7 +340,8 @@ vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToke
     vector<AlarmConfig> alarms;
     if(!bearerToken.empty()) {
         try {
-        auto futureResponse = std::async(std::launch::async, getHierarchy, host, port,bearerToken, json_body, target);
+            auto futureResponse = std::async(std::launch::async, getResponse, host, port,
+                                             bearerToken, json_body, target);
         json response = futureResponse.get();
 
         // Check for 'data' field (actual API response format)
@@ -628,7 +525,7 @@ ParseOrgConfig(string host, string port, string bearerToken, string json_body,
 
     if(!bearerToken.empty()) {
         try {
-            auto futureResponse = std::async(std::launch::async, GetAllOrganizationList,
+            auto futureResponse = std::async(std::launch::async, getResponse,
                                              host, port,
                                              bearerToken, json_body, target);
             json response = futureResponse.get();
@@ -683,7 +580,7 @@ UserProfile ParseUserProfile(string host, string port, string bearerToken,
 
     if(!bearerToken.empty()) {
         try {
-            auto futureResponse = std::async(std::launch::async, GetUserProfile,
+            auto futureResponse = std::async(std::launch::async, getResponse,
                                              host, port,
                                              bearerToken, json_body, target);
             json response = futureResponse.get();
@@ -819,8 +716,7 @@ std::vector<ServerConfig> ParseServerConfig(const std::string &host,
     }
 
     try {
-        auto futureResponse = std::async(std::launch::async,
-                                         getHierarchy,
+        auto futureResponse = std::async(std::launch::async, getResponse,
                                          host, port, bearerToken, json_body, target);
         json response = futureResponse.get();
 

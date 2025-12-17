@@ -1,12 +1,6 @@
 /* This work is licensed under a Creative Commons CCZero 1.0 Universal License.
  * See http://creativecommons.org/publicdomain/zero/1.0/ for more information. */
 
-//  ./server D:\OPC UA Server\OPCUA- open 62451\open62541-C\certs\server_cert.der D:\OPC
-//  UA Server\OPCUA- open 62451\open62541-C\certs\server_key.der [trust1.der trust2.der
-//  ...]
-//  ./server D:\OPC UA Server\OPCUA- open 62451\open62541-C\certs\server_cert.der D:\OPC
-//  UA Server\OPCUA- open 62451\open62541-C\certs\server_key.der
-
 #include <open62541/plugin/accesscontrol_default.h>
 #include <open62541/plugin/certificategroup_default.h>
 #include <open62541/plugin/log_stdout.h>
@@ -15,6 +9,8 @@
 #include <open62541/server.h>
 #include <open62541/server_config_default.h>
 #include <open62541/util.h>
+#include <open62541/client.h>
+#include <open62541/client_config_default.h>
 
 #include <algorithm>
 #include <iostream>
@@ -27,8 +23,6 @@
 #include <vector>
 #include <unordered_map>
 #include <set>
-#include <open62541/client.h>
-#include <open62541/client_config_default.h>
 
 #include <chrono>
 #include <future>
@@ -41,6 +35,11 @@
 #include "fetchAPI.h"
 #include "SessionManager.h"
 #include "Encryption.h"
+#include "alarm_enums.h"
+#include "AccessControl.h"
+#include "ServerConfig.h"
+#include "ServiceUtils.h"
+
 #include <async_mqtt/all.hpp>
 #include <async_mqtt/asio_bind/predefined_layer/mqtts.hpp>
 #include <async_mqtt/asio_bind/predefined_layer/ws.hpp>
@@ -53,11 +52,8 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
 #include <nlohmann/json.hpp>
-#include "alarm_enums.h"
-#include "AccessControl.h"
 #include <windows.h>
-#include "ServerConfig.h"
-#include "ServiceUtils.h"
+
 #ifdef _WIN32
 #include <malloc.h> // For _heapmin
 #endif
@@ -67,7 +63,6 @@ SERVICE_STATUS g_ServiceStatus;
 SERVICE_STATUS_HANDLE g_StatusHandle;
 
 
-// Helper to spawn a child server instance with configuration passed via Stdin
 // Helper to spawn a child server instance with configuration passed via Stdin
 void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config, const std::string& bearerToken, bool headless, HANDLE hJob) {
     // 0. Get Absolute Path of Self (Robust against CWD changes)
@@ -556,31 +551,51 @@ static UA_UsernamePasswordLogin usernamePasswordLogin[2] = {
 // Your custom logger callback
 static void
 myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg,
-      va_list /*args*/) {
+      va_list args) {
 
-    // Never format with va_list to avoid specifier/argument mismatches. Just pass
-    // through.
+    // Early optimization: Ignore DEBUG logs completely 
+    if(level == UA_LOGLEVEL_DEBUG) return;
+
     try {
-        const char *text = msg ? msg : "";
+        std::string text;
         
+        // SAFEGUARD: Only use printf formatting for specific Core messages we need to expand.
+        // For everything else, print the raw message to avoid CRT Assertions on invalid specifiers (e.g. "%N").
+        if(strchr(msg, '%') != nullptr && 
+           strstr(msg, "Adding Condition failed") != nullptr) {
+            
+            char buffer[1024];
+            // Use _vsnprintf_s on Windows if possible, or standard vsnprintf
+            #ifdef _WIN32
+            #endif
+            text = std::string(buffer);
+        } else {
+            // Default: strictly literal (safe)
+            text = msg;
+        }
+
         // Filter out specific noisy logs
-        if (strstr(text, "AddNode: Node could not add") != nullptr) {
+        if (text.find("AddNode: Node could not add") != std::string::npos) {
              return;
         }
+        if (text.find("Deleting the MonitoredItem") != std::string::npos) {
+             return;
+        }
+        
         switch(level) {
             case UA_LOGLEVEL_FATAL:
+                log(text, LogLevel::FATAL);
+                break;
             case UA_LOGLEVEL_ERROR:
-                log(std::string(text), LogLevel::ERRORS);
+                log(text, LogLevel::ERRORS);
                 break;
             case UA_LOGLEVEL_WARNING:
-                log(std::string(text), LogLevel::INFO);
+                log(text, LogLevel::WARNING);
                 break;
             case UA_LOGLEVEL_INFO:
-                log(std::string(text), LogLevel::INFO);
+                log(text, LogLevel::INFO);
                 break;
-            case UA_LOGLEVEL_DEBUG:
-                /* Suppress noisy DEBUG logs from core (e.g., Sample and Publish Callback)
-                 */
+            default:
                 break;
         }
     } catch(...) {
@@ -737,9 +752,7 @@ getOrCreateFolder(UA_Server *server, const string &path, const string &name,
         return nodeMap[path];
     UA_ObjectAttributes oAttr = UA_ObjectAttributes_default;
     oAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", name.c_str());
-    if(name == "PLANT-001") {
-        oAttr.eventNotifier = 1;
-    }
+
     UA_NodeId nodeId = UA_NODEID_STRING_ALLOC(1, path.c_str());
     UA_QualifiedName qName = UA_QUALIFIEDNAME_ALLOC(1, name.c_str());
     UA_Server_addObjectNode(server, nodeId, parent,
@@ -757,8 +770,6 @@ client_t amcl{ioc.get_executor()};
 
 // MQTT connection state and message queue for reconnection
 std::atomic<bool> g_mqtt_connected{false};
-std::atomic<int> g_mqtt_backpressure_count{0}; // DIAGNOSTIC: Track in-flight tasks
-std::atomic<int> g_mqtt_incoming_count{0};     // DIAGNOSTIC: Track incoming messages
 struct QueuedMessage {
     std::string topic;
     std::string payload;
@@ -770,6 +781,9 @@ thread_local bool is_internal_write = false;
 
 /* Global event notifier origin; if null, defaults to Server */
 static UA_NodeId g_eventNotifierNode = UA_NODEID_NULL;
+
+// Signal flag for MQTT subscription loop wake-up
+std::atomic<bool> g_signal_pending{false};
 
 // To publish from any thread:
 void
@@ -785,12 +799,6 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
     }
     
     // Connected - publish normally
-    // DIAGNOSTIC START
-    int pending = g_mqtt_backpressure_count.fetch_add(1);
-    if(pending > 1000 && pending % 500 == 0) {
-        log("⚠️ MQTT BACKPRESSURE CRITICAL: " + std::to_string(pending) + " tasks pending! Memory growing...", LogLevel::INFO);
-    }
-    // DIAGNOSTIC END
 
     as::post(ioc, [topic, payload]() {
         as::co_spawn(
@@ -806,7 +814,6 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
                     g_mqtt_queue.push_back({topic, payload});
                     log("[MQTT-QUEUE] Message requeued after error (queue size: " + std::to_string(g_mqtt_queue.size()) + ")", LogLevel::ERRORS);
                 }
-                g_mqtt_backpressure_count.fetch_sub(1); // DIAGNOSTIC: Task done
                 co_return;
             },
             as::detached);
@@ -900,124 +907,6 @@ findNodeByPath(UA_Server *server, UA_NodeId startNode, const std::vector<const c
     }
     return current;
 }
-
-// static UA_NodeId
-// findNodeByPath(UA_Server *server, UA_NodeId startNode, const std::vector<const char*>& path) {
-//     UA_NodeId current = UA_NODEID_NULL;
-    
-//     // We start by copying the startNode so we can manage memory uniformly in the loop
-//     UA_NodeId_copy(&startNode, &current);
-
-//     for(const char* targetName : path) {
-//         // Use our robust "AnyNS" helper to find the next step
-//         UA_NodeId next = findChildNodeIdAnyNS(server, current, targetName);
-        
-//         // Clean up the previous 'current' node
-//         UA_NodeId_clear(&current);
-
-//         // If the path is broken, return NULL immediately
-//         if(UA_NodeId_isNull(&next)) {
-//             return UA_NODEID_NULL;
-//         }
-        
-//         // Advance to the next node
-//         current = next; 
-//     }
-
-//     return current;
-// }
-
-// --------------------------------------------------------------------------------------------
-
-// // Helper for stealth writes on nested properties (e.g. AckedState/Id)
-// static void
-// setStealthValueByPath(UA_Server *server, UA_NodeId alarmId, 
-//                      std::vector<const char*> path, 
-//                      void *newValue, const UA_DataType *type) {
-//     UA_NodeId targetNode = findNodeByPath(server, alarmId, path);
-    
-//     if(UA_NodeId_isNull(&targetNode)) {
-//         // Silently skip if not found
-//         return;
-//     }
-
-//     // Read current value
-//     UA_Variant current;
-//     UA_Variant_init(&current);
-//     UA_Server_readValue(server, targetNode, &current);
-
-//     bool isSame = false;
-//     if(current.type == type) {
-//         if(type == &UA_TYPES[UA_TYPES_BOOLEAN]) {
-//             isSame = (*(UA_Boolean*)current.data == *(UA_Boolean*)newValue);
-//         } else if(type == &UA_TYPES[UA_TYPES_UINT16]) {
-//             isSame = (*(UA_UInt16*)current.data == *(UA_UInt16*)newValue);
-//         } else if(type == &UA_TYPES[UA_TYPES_NODEID]) {
-//             isSame = UA_NodeId_equal((UA_NodeId*)current.data, (UA_NodeId*)newValue);
-//         }
-//         // Add more types as needed
-//     }
-
-//     // ONLY WRITE IF DIFFERENT
-//     if(!isSame) {
-//         UA_Variant v;
-//         UA_Variant_init(&v);
-//         UA_Variant_setScalarCopy(&v, newValue, type);
-//         UA_Server_writeValue(server, targetNode, v); // STEALTH WRITE
-//         UA_Variant_clear(&v);
-//     }
-
-//     UA_Variant_clear(&current);
-//     UA_NodeId_clear(&targetNode);
-// }
-
-// // Helper function for stealth writes with diff checking
-// static void
-// setStealthValueChecked(UA_Server *server, UA_NodeId alarmId, const char *propertyName, 
-//                        void *newValue, const UA_DataType *type) {
-//     UA_NodeId propertyNode = findChildNodeIdAnyNS(server, alarmId, propertyName);
-//     if(UA_NodeId_isNull(&propertyNode)) {
-//         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
-//                       "Could not find property '%s' for stealth write", propertyName);
-//         return;
-//     }
-
-//     // READ CURRENT VALUE
-//     UA_Variant current;
-//     UA_Variant_init(&current);
-//     UA_Server_readValue(server, propertyNode, &current);
-
-//     // COMPARE (Simple comparison for scalar types)
-//     bool isSame = false;
-//     if(current.type == type) {
-//         if(type == &UA_TYPES[UA_TYPES_UINT16]) {
-//             isSame = (*(UA_UInt16*)current.data == *(UA_UInt16*)newValue);
-//         } else if(type == &UA_TYPES[UA_TYPES_BOOLEAN]) {
-//             isSame = (*(UA_Boolean*)current.data == *(UA_Boolean*)newValue);
-//         } else if(type == &UA_TYPES[UA_TYPES_NODEID]) {
-//             isSame = UA_NodeId_equal((UA_NodeId*)current.data, (UA_NodeId*)newValue);
-//         } else if(type == &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]) {
-//             UA_LocalizedText *currentLT = (UA_LocalizedText*)current.data;
-//             UA_LocalizedText *newLT = (UA_LocalizedText*)newValue;
-//             isSame = UA_String_equal(&currentLT->text, &newLT->text);
-//         }
-//         // Add more type comparisons as needed
-//     }
-
-//     // ONLY WRITE IF DIFFERENT
-//     if(!isSame) {
-//         UA_Variant v;
-//         UA_Variant_init(&v);
-//         UA_Variant_setScalarCopy(&v, newValue, type);
-//         UA_Server_writeValue(server, propertyNode, v);
-//         UA_Variant_clear(&v);
-//     }
-
-//     UA_Variant_clear(&current);
-//     UA_NodeId_clear(&propertyNode);
-// }
-
-
 
 
 /**
@@ -1843,13 +1732,12 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
 
     // STEP 1: Lock Mutex
     std::lock_guard<std::mutex> lock(g_alarmMutex);
-
-    // STEP 2: Fire RefreshStartEvent
+    
     // STEP 2: Fire RefreshStartEvent
     {
         UA_ByteString eventId = UA_BYTESTRING_NULL;
         UA_LocalizedText msg = UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Refresh Start");
-        // Source: Server, Type: RefreshStartEventType, Severity: 100 (Info)
+
         UA_Server_createEvent(server, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
                               UA_NODEID_NUMERIC(0, UA_NS0ID_REFRESHSTARTEVENTTYPE), 
                               100, msg, NULL, NULL, &eventId);
@@ -2039,99 +1927,98 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
         // ========================================================
         // STEP 5: CALCULATE AGGREGATE STATE
         // ========================================================
-        bool aggActive = false;
-        bool aggAcked = true;
-        bool aggConfirmed = true;
-        UA_UInt16 aggSeverity = 0;
-        bool anyRetained = false;
+        //bool aggActive = false;
+        //bool aggAcked = true;
+        //bool aggConfirmed = true;
+        //UA_UInt16 aggSeverity = 0;
+        //bool anyRetained = false;
 
-        for(const auto &bp : branchStateMapIt->second) {
-            if(bp.second.active) {
-                aggActive = true;
-                if(bp.second.severity > aggSeverity)
-                    aggSeverity = bp.second.severity;
-            }
-            // Branch contributes if Active OR Unacked
-            if(bp.second.active || !bp.second.acked) {
-                anyRetained = true;
-                if(!bp.second.acked)
-                    aggAcked = false;
-                if(!bp.second.confirmed)
-                    aggConfirmed = false;
-            }
-        }
+        //for(const auto &bp : branchStateMapIt->second) {
+        //    if(bp.second.active) {
+        //        aggActive = true;
+        //        if(bp.second.severity > aggSeverity)
+        //            aggSeverity = bp.second.severity;
+        //    }
+        //    // Branch contributes if Active OR Unacked
+        //    if(bp.second.active || !bp.second.acked) {
+        //        anyRetained = true;
+        //        if(!bp.second.acked)
+        //            aggAcked = false;
+        //        if(!bp.second.confirmed)
+        //            aggConfirmed = false;
+        //    }
+        //}
 
-        if(!anyRetained) {
-            aggAcked = true;
-            aggConfirmed = true;
-            aggSeverity = 0;
-        }
+        //if(!anyRetained) {
+        //    aggAcked = true;
+        //    aggConfirmed = true;
+        //    aggSeverity = 0;
+        //}
 
-        // Retain Logic: Active OR Unacked
-        UA_Boolean aggRetain = (aggActive || !aggAcked) ? UA_TRUE : UA_FALSE;
+        //// Retain Logic: Active OR Unacked
+        //UA_Boolean aggRetain = (aggActive || !aggAcked) ? UA_TRUE : UA_FALSE;
 
         // ========================================================
         // STEP 6: RESTORE AGGREGATE STATE TO MAIN CONDITION NODE (STEALTH MODE)
         // ========================================================
-        {
-            // ActiveState/Id (STEALTH MODE)
-            UA_Boolean valActive = aggActive ? UA_TRUE : UA_FALSE;
-            setStealthValueByPath(server, conditionNodeId, {"ActiveState", "Id"}, &valActive, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        //{
+        //    // ActiveState/Id (STEALTH MODE)
+        //    UA_Boolean valActive = aggActive ? UA_TRUE : UA_FALSE;
+        //    setStealthValueByPath(server, conditionNodeId, {"ActiveState", "Id"}, &valActive, &UA_TYPES[UA_TYPES_BOOLEAN]);
 
-            // ActiveState (LocalizedText) - stealth write
-            UA_LocalizedText activeText =
-                aggActive ? UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Active")
-                          : UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Inactive");
-            setStealthValueChecked(server, conditionNodeId, "ActiveState", &activeText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+        //    // ActiveState (LocalizedText) - stealth write
+        //    UA_LocalizedText activeText =
+        //        aggActive ? UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Active")
+        //                  : UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Inactive");
+        //    setStealthValueChecked(server, conditionNodeId, "ActiveState", &activeText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
 
-            // AckedState/Id (STEALTH MODE)
-            UA_Boolean valAcked = aggAcked ? UA_TRUE : UA_FALSE;
-            setStealthValueByPath(server, conditionNodeId, {"AckedState", "Id"}, &valAcked, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        //    // AckedState/Id (STEALTH MODE)
+        //    UA_Boolean valAcked = aggAcked ? UA_TRUE : UA_FALSE;
+        //    setStealthValueByPath(server, conditionNodeId, {"AckedState", "Id"}, &valAcked, &UA_TYPES[UA_TYPES_BOOLEAN]);
 
-            // AckedState (LocalizedText) - stealth write
-            UA_LocalizedText ackedText =
-                aggAcked ? UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Acknowledged")
-                         : UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Unacknowledged");
-            setStealthValueChecked(server, conditionNodeId, "AckedState", &ackedText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+        //    // AckedState (LocalizedText) - stealth write
+        //    UA_LocalizedText ackedText =
+        //        aggAcked ? UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Acknowledged")
+        //                 : UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Unacknowledged");
+        //    setStealthValueChecked(server, conditionNodeId, "AckedState", &ackedText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
 
-            // ConfirmedState/Id (STEALTH MODE)
-            UA_Boolean valConfirmed = aggConfirmed ? UA_TRUE : UA_FALSE;
-            setStealthValueByPath(server, conditionNodeId, {"ConfirmedState", "Id"}, &valConfirmed, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        //    // ConfirmedState/Id (STEALTH MODE)
+        //    UA_Boolean valConfirmed = aggConfirmed ? UA_TRUE : UA_FALSE;
+        //    setStealthValueByPath(server, conditionNodeId, {"ConfirmedState", "Id"}, &valConfirmed, &UA_TYPES[UA_TYPES_BOOLEAN]);
 
-            // ConfirmedState (LocalizedText) - stealth write
-            UA_LocalizedText cnfText =
-                aggConfirmed ? UA_LOCALIZEDTEXT((char *)"en", (char *)"Confirmed")
-                             : UA_LOCALIZEDTEXT((char *)"en", (char *)"Unconfirmed");
-            setStealthValueChecked(server, conditionNodeId, "ConfirmedState", &cnfText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+        //    // ConfirmedState (LocalizedText) - stealth write
+        //    UA_LocalizedText cnfText =
+        //        aggConfirmed ? UA_LOCALIZEDTEXT((char *)"en", (char *)"Confirmed")
+        //                     : UA_LOCALIZEDTEXT((char *)"en", (char *)"Unconfirmed");
+        //    setStealthValueChecked(server, conditionNodeId, "ConfirmedState", &cnfText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
 
-            // Severity - stealth write
-            setStealthValueChecked(server, conditionNodeId, "Severity", &aggSeverity, &UA_TYPES[UA_TYPES_UINT16]);
+        //    // Severity - stealth write
+        //    setStealthValueChecked(server, conditionNodeId, "Severity", &aggSeverity, &UA_TYPES[UA_TYPES_UINT16]);
 
-            // Retain - stealth write
-            setStealthValueChecked(server, conditionNodeId, "Retain", &aggRetain, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        //    // Retain - stealth write
+        //    setStealthValueChecked(server, conditionNodeId, "Retain", &aggRetain, &UA_TYPES[UA_TYPES_BOOLEAN]);
 
-            // Reset BranchId to NULL (Aggregate) - stealth write
-            UA_NodeId nullId = UA_NODEID_NULL;
-            setStealthValueChecked(server, conditionNodeId, "BranchId", &nullId, &UA_TYPES[UA_TYPES_NODEID]);
-        }
+        //    // Reset BranchId to NULL (Aggregate) - stealth write
+        //    UA_NodeId nullId = UA_NODEID_NULL;
+        //    setStealthValueChecked(server, conditionNodeId, "BranchId", &nullId, &UA_TYPES[UA_TYPES_NODEID]);
+        //}
 
-        // ========================================================
-        // STEP 7: TRIGGER AGGREGATE EVENT (Standard Pattern)
-        // ========================================================
-        if(aggRetain) {
-            UA_ByteString aggEid = UA_BYTESTRING_NULL;
-            UA_Server_triggerConditionEvent(server, conditionNodeId, sourceNodeId,
-                                            &aggEid);
-            UA_ByteString_clear(&aggEid);
-            
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                       "ConditionRefresh: Triggered aggregate event (BranchId=NULL)");
-        }
+        //// ========================================================
+        //// STEP 7: TRIGGER AGGREGATE EVENT (Standard Pattern)
+        //// ========================================================
+        //if(aggRetain) {
+        //    UA_ByteString aggEid = UA_BYTESTRING_NULL;
+        //    UA_Server_triggerConditionEvent(server, conditionNodeId, sourceNodeId,
+        //                                    &aggEid);
+        //    UA_ByteString_clear(&aggEid);
+        //    
+        //    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+        //               "ConditionRefresh: Triggered aggregate event (BranchId=NULL)");
+        //}
 
         UA_NodeId_clear(&sourceNodeId);
     }
 
-    // STEP 8: Fire RefreshEndEvent
     // STEP 8: Fire RefreshEndEvent
     {
         UA_ByteString eventId = UA_BYTESTRING_NULL;
@@ -2163,18 +2050,12 @@ static std::string findGUIDForBranchId(const UA_NodeId *branchId, const std::str
     return "";
 }
 
-
-
-
-
-// Write callback for OPC UA node value changes
-// Write callback for OPC UA node value changes
 // Write callback for OPC UA node value changes
 void
 writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
               const UA_NodeId *nodeId, void *nodeContext, const UA_NumericRange *range,
               const UA_DataValue *data) {
-    if (is_internal_write) return;  // 🔒 Prevent feedback loop
+    if (is_internal_write) return;  
 
     // Find the topic for this node
     std::string topic;
@@ -2228,30 +2109,32 @@ writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
 
         // Generate ISO 8601 Timestamp with 100ns precision (High Resolution)
         {
-            auto now = std::chrono::system_clock::now();
-            std::time_t t = std::chrono::system_clock::to_time_t(now);
-            std::tm tm_buf;
-            #if defined(_WIN32)
-                localtime_s(&tm_buf, &t);
-            #else
-                localtime_r(&tm_buf, &t);
-            #endif
-            
-            // Calculate fractional seconds (100ns precision)
-            auto duration = now.time_since_epoch();
-            auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
-            auto fractional = duration - seconds;
-            long long fractional_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(fractional).count();
+            //auto now = std::chrono::system_clock::now();
+            //std::time_t t = std::chrono::system_clock::to_time_t(now);
+            //std::tm tm_buf;
+            //#if defined(_WIN32)
+            //    localtime_s(&tm_buf, &t);
+            //#else
+            //    localtime_r(&tm_buf, &t);
+            //#endif
+            //
+            //// Calculate fractional seconds (100ns precision)
+            //auto duration = now.time_since_epoch();
+            //auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
+            //auto fractional = duration - seconds;
+            //long long fractional_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(fractional).count();
 
-            char tsBuf[64];
-            std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+            //char tsBuf[64];
+            //std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+            //
+            //// Append fractional (7 digits) and Offset (+05:30)
+            //char finalBuf[128];
+            //// fractional_ns is nanoseconds (9 digits), we want 100ns (7 digits)
+            //snprintf(finalBuf, sizeof(finalBuf), "%s.%07lld+05:30", tsBuf, fractional_ns / 100);
             
-            // Append fractional (7 digits) and Offset (+05:30)
-            char finalBuf[128];
-            // fractional_ns is nanoseconds (9 digits), we want 100ns (7 digits)
-            snprintf(finalBuf, sizeof(finalBuf), "%s.%07lld+05:30", tsBuf, fractional_ns / 100);
-            
-            dataPoint["TimeStamp"] = std::string(finalBuf);
+            auto now = getPreciseTimestamp();
+
+            dataPoint["TimeStamp"] = std::string(now);
         }
 
         dataPoint["Source"] = (int)AlarmSource::OPC;       // 1 (OPC)
@@ -2617,8 +2500,6 @@ void queue_subscription(const std::string &topic) {
     if(topic.empty()) return;
     
     std::lock_guard<std::mutex> lock(g_sub_mutex);
-    
-    // log("DEBUG: queue_subscription called for '" + topic + "'", LogLevel::INFO);
 
     // Check if already subscribed to avoid unnecessary queueing
     if(g_subscribed_topics.find(topic) != g_subscribed_topics.end()) {
@@ -2642,9 +2523,32 @@ void queue_subscription(const std::string &topic) {
 // Helper to subscribe to a single topic dynamically
 void GlobalMQTT_Subscribe(const std::string &topic) {
     // FIXED: Removed connection check to allow offline queuing
-    // The queue logic will handle it, or we can check connection inside perform_subscriptions
-    // if we want, but queueing is better for reliability on reconnect.
     queue_subscription(topic);
+}
+
+// Helper to subscribe to manual batch
+void GlobalMQTT_SubscribeBatch(const std::vector<std::string> &topics) {
+    if(topics.empty()) return;
+    
+    std::lock_guard<std::mutex> lock(g_sub_mutex);
+    for(const auto& topic : topics) {
+        if(g_subscribed_topics.find(topic) == g_subscribed_topics.end()) {
+             // Only add if not already tracked
+             // Deduplicate against queue?
+             // queue_subscription handles queue dedup but we bypass it here for batch insertion
+             // to avoid N lock acquisitions.
+             
+             // Check queue manually? No, just push back. perform_subscriptions handles duplicates gracefully?
+             // Actually, queue_subscription logic checks queue presence.
+             // We should replicate that or just accept some duplicates (perform_subscriptions will coalesce?)
+             
+             // Simplest: Just push all. Subscribing twice is harmless (idempotent).
+             g_subscription_queue.push_back(topic);
+        }
+    }
+    
+    // Trigger ONCE
+    process_queue_signal();
 }
 
 // Helper to unsubscribe from manual batch
@@ -2730,6 +2634,7 @@ void process_queue_signal() {
     // Notify the main loop to wake up and check the queue
     // Must execute on IO thread for thread-safety (called from Worker threads)
     as::post(ioc, [](){
+        g_signal_pending.store(true); // Signal intention to wake up
         if(g_sub_timer) {
             std::size_t n = g_sub_timer->cancel();
             // log("DEBUG: [IO_THREAD] Cancelling timer for signal. Cancelled: " + std::to_string(n), LogLevel::INFO);
@@ -2799,15 +2704,15 @@ void start_mqtt_client(UA_Server *server) {
             // Reconnection loop
             while(running) {
                 try {
-                
-                    // [Connection Logic Redacted/Preserved]
-                    // ... (Assume connection logic is unchanged above) ...
+               
                     
 
                     log("Attempting to connect to MQTT broker...", LogLevel::INFO);
                     co_await amcl.async_underlying_handshake("216.48.184.131", "15579", as::use_awaitable);
+                    
+                    // HINT: CHANGE KEEP ALIVE HERE FOR CONNECTION DETECTION 
                     auto connack_opt = co_await amcl.async_start(
-                        am::v5::connect_packet{ true, 0x1234, "", std::nullopt, "portal", "dt0Unw7QRh" },
+                        am::v5::connect_packet{ true, 1, "", std::nullopt, "portal", "dt0Unw7QRh" },
                         as::use_awaitable);
                     
                     if(!connack_opt) throw std::runtime_error("Failed to start MQTT session");
@@ -2937,10 +2842,10 @@ void start_mqtt_client(UA_Server *server) {
                                                 
                                                 // Source/Quality/UpdateType enums
                                                 int sourceEnumValue = alarm.value("Source", 4); // 4=AEEngine
-                                                int qualityEnumValue = alarm.value("Quality", 192); // 192=Good
+                                                int qualityEnumValue = alarm.value("Quality", 1); // 1=Good
                                                 
                                                 // Enum conversion debug
-                                                // log("DEBUG: Quality Enum Value = " + std::to_string(qualityEnumValue), LogLevel::INFO);
+
                                                 
                                                 AlarmQuality qualityEnum = intToAlarmQuality(qualityEnumValue);
                                                 std::string quality = alarmQualityToString(qualityEnum);
@@ -2949,7 +2854,7 @@ void start_mqtt_client(UA_Server *server) {
                                                 UpdateType updateType = static_cast<UpdateType>(updateTypeValue);
                                                 
                                                 std::string timestamp = alarm.value("Timestamp", 
-                                                    std::format("{:%Y-%m-%d %H:%M:%S}", std::chrono::system_clock::now()));
+                                                    getPreciseTimestamp());
                                                 
                                                 // Extract Retain
                                                 bool retain = alarm.value("Retain", false);
@@ -3260,18 +3165,11 @@ void start_mqtt_client(UA_Server *server) {
                                         /* Regular data update path (Generic Telemetry) */
                                         // Check if topic exists in nodeMap
                                         std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
-                                        // DIAGNOSTIC: Incoming Message Log
-                                        int in_count = g_mqtt_incoming_count.fetch_add(1);
-                                        if(in_count % 100 == 0) {
-                                            log("📥 MQTT Rx: Processed " + std::to_string(in_count) + " messages (Internal Write Path)", LogLevel::INFO);
-                                        }
 
                                         if(nodeMap.find(topic) != nodeMap.end()) {
                                             UA_NodeId nodeId = nodeMap[topic];
                                             try {
                                                 auto j = json::parse(payload);
-                                                
-                                                    // 1. Check for Complex "Data" Array Payload
                                                     // 1. Check for Complex "Data" Array Payload
                                                 if(j.contains("Data") && j["Data"].is_array() && !j["Data"].empty()) {
                                                     const auto& dataItem = j["Data"][0];
@@ -3373,7 +3271,13 @@ void start_mqtt_client(UA_Server *server) {
                                 } catch (const boost::system::system_error& e) {
                                     if (e.code() == boost::asio::error::operation_aborted) {
                                         // log("DEBUG: Signal received (Timer cancelled)", LogLevel::DEBUG);
-                                        continue;
+                                        // Only continue if this was an explicit queue signal
+                                        if(g_signal_pending.exchange(false)) {
+                                            continue;
+                                        }
+                                        // Otherwise, it's a shutdown signal (from sibling task failure) -> Exit loop
+                                        log("DEBUG: Subscription Loop Cancelled (Sibling failure or Shutdown)", LogLevel::INFO);
+                                        co_return;
                                     }
                                     throw;
                                 }
@@ -3401,12 +3305,6 @@ void start_mqtt_client(UA_Server *server) {
 }
 
 
-
-// Orphaned legacy code removed
-
-
-
-
 // Migrated logic from main()
 int RunServer(int argc, char **argv) {
     // Determine if running as service (via arguments or context)
@@ -3425,17 +3323,6 @@ int RunServer(int argc, char **argv) {
         g_debug = false; 
     }
     
-    // Early console output before logging is initialized
-    if(!isService) {
-        log("==================================================", LogLevel::INFO);
-        log("OPC UA Server Starting...", LogLevel::INFO);
-        log("==================================================", LogLevel::INFO);
-    } else {
-        // Just log to file if service
-        // init_logging call comes later, but we can rely on default "server.log" or init call
-    }
-
-
     // Load configuration from appsettings.json
     log("Loading configuration from appsettings.json...", LogLevel::INFO);
     std::ifstream file("appsettings.json");
@@ -3500,6 +3387,9 @@ int RunServer(int argc, char **argv) {
     int retentionDays =
         Settingsconfig["Payload"]["OfflineQueueOptions"]["RetentionDays"].get<int>();
 
+    // Extract ConfigurationSettings
+    std::string NodeID = Settingsconfig["ConfigurationSettings"]["NodeID"].get<std::string>();
+
     std::cout << "✓ Configuration parsed successfully" << std::endl;
     std::cout << "API Host: " << applicationEndURLHost << ":" << applicationEndURLPort << std::endl;
 
@@ -3537,8 +3427,8 @@ int RunServer(int argc, char **argv) {
             log("Failed to acquire bearer token: " + std::string(e.what()), LogLevel::ERRORS);
         }
         
-        std::cout << "⚠️ Retrying in " << retryDelay << " seconds..." << std::endl;
-        log("⚠️ Retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::INFO);
+        std::cout << " Retrying in " << retryDelay << " seconds..." << std::endl;
+        log(" Retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::INFO);
         std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
         
         if(retryDelay < 15) {
@@ -3602,15 +3492,7 @@ int RunServer(int argc, char **argv) {
     log("OPC UA Server initialized", LogLevel::INFO);
     log("Setting up server configuration", LogLevel::DEBUG);
 
-    size_t nsIdx = UA_Server_addNamespace(server, "urn:my.properties");
-    log("Added namespace: urn:my.properties", LogLevel::DEBUG);
 
-    // NOTE: ConditionRefresh callback registration is done AFTER all conditions
-    // are created (see after mqtt_subscribe_and_update call), not here at startup.
-    // This is because open62541 sets its own callback when the first condition
-    // is created, so we must override it AFTER that happens.
-
-    // broker_start(argc, argv);
     // #ifdef UA_ENABLE_ENCRYPTION
     // UA_ServerConfig_setDefaultWithSecurityPolicies(config, 4840, &certificate,
     // &privateKey, trustList, trustListSize, NULL, 0, NULL, 0);
@@ -3626,11 +3508,12 @@ int RunServer(int argc, char **argv) {
     //     issuerList, issuerListSize,
     //     revocationList, revocationListSize);
 
-    std::string json_body = R"(
-    {
-        "data": { "nodeId": "ND01" } 
-    }
-    )";
+    std::string json_body = std::format(R"(
+    {{
+        "data": {{ "nodeId": "{}" }}
+    }}
+    )", NodeID);
+
     std::string target = "/api/GetOpcUaServersWithOrgMappings";
 
     ServerConfig current_config;
@@ -3650,7 +3533,7 @@ int RunServer(int argc, char **argv) {
         }
 
         try {
-             json j = json::parse(inputJSON);
+             json j = json::parse(inputJSON); 
              if(j.contains("bearerToken")) {
                  bearerToken = j["bearerToken"].get<std::string>();
                  // g_bearerToken = bearerToken; // If global exists?
@@ -3677,8 +3560,6 @@ int RunServer(int argc, char **argv) {
     } else {
         log("👑 Starting in MANAGER mode", LogLevel::INFO);
         
-        // Acquire bearer token (Legacy logic preserved for manager)
-        // Token already acquired in startup
         bearerToken = g_bearerToken;
 
         std::vector<ServerConfig> configs;
@@ -3846,10 +3727,10 @@ int RunServer(int argc, char **argv) {
     config->maxSessions = 100;
     config->maxSecureChannels = 50;      // Limit concurrent TCP connections
     config->maxSessionTimeout = 10000.0; // Prune detached sessions after 10s to free MonitoredItems
-    config->maxSubscriptionsPerSession = 50;
-    config->maxMonitoredItemsPerSubscription = 1000;
-    config->maxMonitoredItems = 1000;   // Global limit to prevent TimerTree explosion
-    config->maxSubscriptions = 200;      // Global limit for subscriptions
+    //config->maxSubscriptionsPerSession = 50;
+    //config->maxMonitoredItemsPerSubscription = 1000;
+    config->maxMonitoredItems = 0;   // Global limit to prevent TimerTree explosion
+    //config->maxSubscriptions = 200;      // Global limit for subscriptions
     config->publishingIntervalLimits.min = 100.0; // Enforce min 100ms publishing interval
     config->samplingIntervalLimits.min = 500.0;   // Throttle sampling to max 5Hz to prevent notification flood
     config->publishingIntervalLimits.max = 3600.0 * 1000.0;

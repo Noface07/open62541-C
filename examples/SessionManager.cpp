@@ -145,7 +145,7 @@ void SessionManager::unregisterSession(const UA_NodeId& sessionId) {
             
             if(ctx_ptr) {
                 shortCode = ctx_ptr->shortCode;
-                log("🛑 Closing session for org '" + shortCode + "' (OrgID: " + 
+                log(" Closing session for org '" + shortCode + "' (OrgID: " + 
                     std::to_string(ctx_ptr->orgId) + ")", LogLevel::INFO);
             }
         }
