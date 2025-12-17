@@ -1505,6 +1505,9 @@ void start_mqtt_client(UA_Server *server) {
                                                         // Retain
                                                         UA_Boolean ret = retain ? UA_TRUE : UA_FALSE;
                                                         setStealthValueChecked(server, alarmId, "Retain", &ret, &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+                                                        UA_Boolean shelve = shelved ? UA_TRUE : UA_FALSE;
+                                                        setStealthValueChecked(server, alarmId, "SuppressedOrShelved", &shelved, &UA_TYPES[UA_TYPES_BOOLEAN]);
                                                         
                                                         // Time
                                                         setStealthValueChecked(server, alarmId, "Time", &now, &UA_TYPES[UA_TYPES_DATETIME]);
