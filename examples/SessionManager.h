@@ -42,11 +42,31 @@ struct SessionContext {
     std::vector<std::string> topics;
     std::map<std::string, UA_NodeId> nodeMap;
     std::unordered_map<std::string, UA_NodeId> alarmMap; // Key: emitterNodeName-alarmName
+    std::vector<std::string> subscribedEmitters; // Track dynamic subscriptions for cleanup
     
     // Session metadata
     std::string sessionKey;
     
     SessionContext() : shouldStop(false), namespaceIndex(0), orgId(0) {}
+
+    ~SessionContext() {
+        shouldStop = true;
+        cv.notify_all();
+        if (workerThread.joinable()) {
+            workerThread.join();
+        }
+
+        for (auto& [_, nodeId] : nodeMap) {
+            UA_NodeId_clear(&nodeId);
+        }
+
+        for (auto& [_, nodeId] : alarmMap) {
+            UA_NodeId_clear(&nodeId);
+        }
+        
+        // MQTT Unsubscriptions are handled by SessionWorker before thread exit,
+        // or by SessionManager explicitly if needed.
+    }
 };
 
 
@@ -58,6 +78,9 @@ public:
     
     // Initialize with organization configurations
     void initialize(const std::vector<OrgConfig>& orgs);
+    
+    // Explicit shutdown to clean up sessions before server destruction
+    void shutdown();
     
     // Register new session (spawns worker thread)
     bool registerSession(const UA_NodeId& sessionId, const std::string& shortCode,

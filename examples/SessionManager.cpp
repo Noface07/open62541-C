@@ -11,11 +11,21 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
 
 // Destructor - cleanup all sessions
 SessionManager::~SessionManager() {
+    shutdown();
+}
+
+// Explicit shutdown
+void SessionManager::shutdown() {
     std::lock_guard<std::mutex> lock(managerMutex);
     
+    if(sessions.empty()) return; // Already shut down
+
     for(auto& sessionPair : sessions) {
         if(sessionPair.second) {
             sessionPair.second->shouldStop.store(true);
+            // Also notify condition variable to wake up valid contexts
+            sessionPair.second->cv.notify_all();
+
             if(sessionPair.second->workerThread.joinable()) {
                 sessionPair.second->workerThread.join();
             }

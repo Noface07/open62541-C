@@ -294,11 +294,13 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                     topicMap[ns] = info;
                 }
                 // 📡 Dynamic Subscribe
-                // Queue topic for batch subscription later to ensure nodes are ready
-                // Deduplicate to prevent massive vector growth
+                // Optimization: ctx->topics is already populated in Step 3 (Lines 161-166)
+                // We do NOT need to scan and add it again here. This removes an O(N^2) bottleneck.
+                /* 
                 if(std::find(ctx->topics.begin(), ctx->topics.end(), ns) == ctx->topics.end()) {
                     ctx->topics.push_back(ns);
                 } 
+                */ 
 
                 nodesCreated++;
                 
@@ -563,6 +565,7 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                          // via logic in perform_subscriptions (server.cpp) IF the topic is in the map.
                          log("DEBUG: Subscribing to Emitter Topic (Alarm Prepared): " + topic, LogLevel::INFO);
                          GlobalMQTT_Subscribe(topic);
+                         ctx->subscribedEmitters.push_back(topic);
                     } else {
                          log("WARNING: Emitter (ID: " + std::to_string(emitter.id) + 
                              ") has EMPTY emitterNodeName! MQTT subscription skipped.", LogLevel::ERRORS);
@@ -632,10 +635,9 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
     // but the NodeId struct in our map might own a string copy.
     // Answer: Yes, UA_NODEID_STRING_ALLOC allocates memory for the identifier.
     
-    for(auto& pair : ctx->nodeMap) {
-        UA_NodeId_clear(&pair.second);
-    }
-    ctx->nodeMap.clear();
+    // 2. Clear Context Maps (Nodes)
+    // MOVED: nodeMap clearing is now done later to ensure UA_Server_deleteNode is called first.
+    // ctx->nodeMap.clear(); // REMOVED PREMATURE CLEAR
 
     for(auto& pair : ctx->alarmMap) {
          UA_NodeId_clear(&pair.second);
@@ -649,16 +651,81 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
         for(const auto& topic : ctx->topics) {
              auto it = nodeMap.find(topic);
              if(it != nodeMap.end()) {
+                 // CRITICAL FIX: Delete the node from the SERVER address space!
+                 // Just clearing the NodeId struct leaks the actual node in the server.
+                 UA_Server_deleteNode(server, it->second, true); // true = delete references
+
                  UA_NodeId_clear(&it->second);
                  nodeMap.erase(it);
              }
         }
     }
+
+    // Also delete the Organization Root Folder (Recursively cleans up if children were missed)
+    if(!UA_NodeId_isNull(&orgRootFolder)) {
+        log("🧹 Deleting Org Root Folder from server...", LogLevel::INFO);
+        UA_Server_deleteNode(server, orgRootFolder, true);
+        UA_NodeId_clear(&orgRootFolder);
+    }
     
-    // We can't easily clean 'g_alarmByKey' or 'g_triggerToAlarmMap' without reverse lookup 
-    // or tracking what we added. 
-    // Given the 'duplicate check' fix, restarting the session won't explode memory at least.
-    // But failing to remove them means they persist forever.
+    // Safety: Iterate local nodeMap and try to delete any remaining nodes
+    // (In case they weren't in global map or under root folder)
+    for(auto& pair : ctx->nodeMap) {
+        // Ignore error if already deleted via hierarchy or global map
+        UA_Server_deleteNode(server, pair.second, true);
+        UA_NodeId_clear(&pair.second);
+    }
+    ctx->nodeMap.clear();
+
+    // REMOVED from topicMap (Generic Telemetry)
+    {
+        std::lock_guard<std::mutex> lock(g_topicMap_mutex);
+        for(const auto& topic : ctx->topics) {
+            topicMap.erase(topic);
+        }
+    }
+
+    // 4. Cleanup Global Alarm Maps (Prevent Leaks)
+    {
+        // Cleanup g_alarmByKey
+        // Note: g_alarmByKey values are allocated strings. We must clear them.
+        // We use ctx->alarmMap keys to identify which ones we own/created.
+        for(const auto& pair : ctx->alarmMap) {
+            auto it = g_alarmByKey.find(pair.first);
+            if(it != g_alarmByKey.end()) {
+                UA_NodeId_clear(&it->second); // Clear the global NodeId copy
+                g_alarmByKey.erase(it);
+            }
+        }
+    }
+
+    // 5. Cleanup Emitter Subscriptions and Trigger Mappings
+    if(!ctx->subscribedEmitters.empty()) {
+        log("🧹 Unsubscribing from " + std::to_string(ctx->subscribedEmitters.size()) + " emitter topics...", LogLevel::INFO);
+        // Unsubscribe from MQTT
+        GlobalMQTT_UnsubscribeBatch(ctx->subscribedEmitters);
+        
+        // Cleanup g_triggerToAlarmMap
+        std::lock_guard<std::mutex> lock(g_alarmMutex);
+        for(const auto& topic : ctx->subscribedEmitters) {
+            auto mapIt = g_triggerToAlarmMap.find(topic);
+            if(mapIt != g_triggerToAlarmMap.end()) {
+                 // Remove entries associated with our alarms
+                 auto& list = mapIt->second;
+                 // Remove if alarmKey exists in our local alarmMap
+                 auto originalSize = list.size();
+                 list.erase(std::remove_if(list.begin(), list.end(), 
+                     [&](const TriggerToAlarmMapping& m) {
+                         return ctx->alarmMap.find(m.alarmKey) != ctx->alarmMap.end();
+                     }), list.end());
+                 
+                 if(list.empty()) {
+                     g_triggerToAlarmMap.erase(mapIt);
+                 }
+            }
+        }
+    }
+    
     // Ideally ctx should track 'myAlarmKeys'.
     
     UA_NodeId_clear(&orgRootFolder);

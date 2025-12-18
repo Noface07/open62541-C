@@ -56,12 +56,55 @@
 
 #ifdef _WIN32
 #include <malloc.h> // For _heapmin
+#include <direct.h>  // For _getcwd
 #endif
 
 // Service Globals
 SERVICE_STATUS g_ServiceStatus;
 SERVICE_STATUS_HANDLE g_StatusHandle;
 
+using namespace std;
+namespace as = boost::asio;
+namespace am = async_mqtt;
+namespace beast = boost::beast;
+using tcp = boost::asio::ip::tcp;
+UA_Boolean running = true;
+
+
+// ------------------GLOBALS----------------------------------------//
+
+// MQTT Subscription Queue Globals
+std::mutex g_sub_mutex;
+std::vector<std::string> g_subscription_queue;
+std::vector<std::string> g_unsubscription_queue;
+std::set<std::string> g_subscribed_topics;
+std::unique_ptr<boost::asio::steady_timer> g_sub_timer;
+
+// Global NodeMap (Topic -> NodeId) for Generic Telemetry
+std::map<std::string, UA_NodeId> nodeMap;
+std::mutex g_nodeMap_mutex;
+std::mutex g_topicMap_mutex;
+std::recursive_mutex g_server_mutex;  // Protects UA_Server API access
+
+// ============================================================================
+// MULTI-TENANCY: Global Session Manager
+// ============================================================================
+SessionManager g_sessionManager;
+
+// Store API credentials and org list globally for worker threads and auth
+static std::string g_bearerToken;
+static std::string g_apiHost;
+static std::string g_apiPort;
+static std::string g_authUsername;  // From appsettings.json Authorization section
+static std::string g_authPassword;  // From appsettings.json Authorization section
+static std::vector<OrgConfig> g_organizations;  // List of all organizations
+static UA_Server *g_server = nullptr;
+
+//-----------------------END---------------------------------------//
+
+
+
+//----------------------HELPER------------------//
 
 // Helper to spawn a child server instance with configuration passed via Stdin
 void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config, const std::string& bearerToken, bool headless, HANDLE hJob) {
@@ -168,80 +211,32 @@ void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config
     CloseHandle(pi.hThread);
 }
 
-#ifdef _WIN32
-#include <direct.h>  // For _getcwd
-#endif
-
-using namespace std;
-namespace as = boost::asio;
-namespace am = async_mqtt;
-namespace beast = boost::beast;
-using tcp = boost::asio::ip::tcp;
-UA_Boolean running = true;
-
-
-// static UA_HistoryDataGathering *g_gathering = NULL;
-
-/* Cache created alarm Condition nodes keyed by emitter + alarm name */
-
-
-
-// ---------------------------------------------------------------------------------------------------------------
-// ---------------------------------------------------------------------------------------------------------------
-/* Map trigger topic (applicableTagName) to list of alarm keys (emitter+alarmName) */
-// TriggerToAlarmMapping struct moved to AandC.h
-
-
-
-// MQTT Subscription Queue Globals
-std::mutex g_sub_mutex;
-std::vector<std::string> g_subscription_queue;
-std::set<std::string> g_subscribed_topics;
-std::unique_ptr<boost::asio::steady_timer> g_sub_timer;
-
-// Global NodeMap (Topic -> NodeId) for Generic Telemetry
-// Global NodeMap (Topic -> NodeId) for Generic Telemetry
-std::map<std::string, UA_NodeId> nodeMap;
-std::mutex g_nodeMap_mutex;
-std::mutex g_topicMap_mutex;
-std::recursive_mutex g_server_mutex; // Protects UA_Server API access
-
-
-
-
-// ============================================================================
-// MULTI-TENANCY: Global Session Manager
-// ============================================================================
-SessionManager g_sessionManager;
-
-// Store API credentials and org list globally for worker threads and auth
-static std::string g_bearerToken;
-static std::string g_apiHost;
-static std::string g_apiPort;
-static std::string g_authUsername;  // From appsettings.json Authorization section
-static std::string g_authPassword;  // From appsettings.json Authorization section
-static std::vector<OrgConfig> g_organizations;  // List of all organizations
-static UA_Server* g_server = nullptr;
 
 /**
  * Extract organization ShortCode from endpoint URL
  * Example: "opc.tcp://0.0.0.0:53531/PLANT01" -> "PLANT01"
  */
-static std::string extractShortCodeFromEndpoint(const UA_String* endpointUrl) {
+static std::string
+extractShortCodeFromEndpoint(const UA_String *endpointUrl) {
     if(!endpointUrl || endpointUrl->length == 0) {
         return "";
     }
-    
-    std::string url((char*)endpointUrl->data, endpointUrl->length);
-    
+
+    std::string url((char *)endpointUrl->data, endpointUrl->length);
+
     // Find last slash to get path component
     size_t lastSlash = url.find_last_of('/');
     if(lastSlash != std::string::npos && lastSlash + 1 < url.length()) {
         return url.substr(lastSlash + 1);
     }
-    
-    return ""; // No path component found
+
+    return "";  // No path component found
 }
+//----------------------END------------------//
+
+
+
+
 
 /*
  * Session Open Callback - DISABLED
@@ -293,8 +288,6 @@ customActivateSession(UA_Server *server,
     if(isAnonymous) {
         log("❌ Anonymous login detected and rejected", LogLevel::ERRORS);
         return UA_STATUSCODE_BADUSERACCESSDENIED;
-        // username = g_authUsername;  // From appsettings.json
-        // password = g_authPassword;  // From appsettings.json
     } else {
         log("  User: " + username, LogLevel::INFO);
     }
@@ -743,25 +736,6 @@ formatNodeId(const UA_NodeId *nodeId) {
 
 
 
-/* Forward declarations */
-static std::string findGUIDForNodeId(const UA_NodeId *nodeId, const std::string &alarmKey);
-static std::string findGUIDForBranchId(const UA_NodeId *branchId, const std::string &alarmKey);
-
-
-
-
-
-
-// RAII Wrapper for UA_Variant to ensure cleanup
-struct ScopedVariant {
-    UA_Variant var;
-    ScopedVariant() { UA_Variant_init(&var); }
-    ~ScopedVariant() { UA_Variant_clear(&var); }
-    UA_Variant* get() { return &var; }
-    UA_Variant* operator&() { return &var; } // Helper for legacy C calls
-    // Note: Do not copy/move without deep copy logic.
-};
-
 
 
 
@@ -898,85 +872,6 @@ std::string getConditionEventId(UA_Server *server, UA_NodeId alarmId) {
     return eventIdStr;
 }
 
-/* Find GUID for a given NodeId (branch or condition) */
-static std::string findGUIDForNodeId(const UA_NodeId *nodeId, const std::string &alarmKey) {
-    // If alarmKey is provided, search in that specific alarm's branches
-    if(!alarmKey.empty()) {
-        // Check if this is a branch
-        auto branchMapIt = g_alarmBranches.find(alarmKey);
-        if(branchMapIt != g_alarmBranches.end()) {
-            for(const auto &branchPair : branchMapIt->second) {
-                if(UA_NodeId_equal(&branchPair.second.branchNodeId, nodeId)) {
-                    return branchPair.second.guid;
-                }
-            }
-        }
-        
-        // Check if this is the main condition
-        auto alarmIt = g_alarmByKey.find(alarmKey);
-        if(alarmIt != g_alarmByKey.end()) {
-            if(UA_NodeId_equal(&alarmIt->second, nodeId)) {
-                return "";  // Main branch has empty GUID
-            }
-        }
-    } else {
-        // Search across all alarms if alarmKey not provided
-        // First check all branches
-        for(const auto &alarmBranchPair : g_alarmBranches) {
-            for(const auto &branchPair : alarmBranchPair.second) {
-                if(UA_NodeId_equal(&branchPair.second.branchNodeId, nodeId)) {
-                    return branchPair.second.guid;
-                }
-            }
-        }
-        
-        // Then check all main conditions
-        for(const auto &alarmPair : g_alarmByKey) {
-            if(UA_NodeId_equal(&alarmPair.second, nodeId)) {
-                return "";  // Main branch has empty GUID
-            }
-        }
-    }
-    
-    return "";  // Not found
-}
-
-/* Cleanup inactive and acknowledged branches */
-static void
-cleanupBranches(const std::string &alarmKey) {
-    auto &branchMap = g_alarmBranches[alarmKey];
-    auto &branchStateMap = g_branchStates[alarmKey];
-
-    for(auto it = branchMap.begin(); it != branchMap.end();) {
-        const std::string &guid = it->first;
-        bool remove = false;
-        auto stateIt = branchStateMap.find(guid);
-
-        if(stateIt != branchStateMap.end()) {
-            // FIX: If you want Ack & Clear behavior, remove "&& confirmed" check
-            // Otherwise, branches will stick around forever waiting for a confirm that
-            // never comes.
-            if(!stateIt->second.active && stateIt->second.acked) {
-                remove = true;
-            }
-        } else {
-            remove = true;  // Orphaned branch info
-        }
-
-        if(remove) {
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                        "Cleaning up branch GUID '%s' for alarm '%s'", guid.c_str(),
-                        alarmKey.c_str());
-            if(stateIt != branchStateMap.end()) {
-                branchStateMap.erase(stateIt);
-            }
-            it = branchMap.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 
 
 /* ============================================================================
@@ -1054,79 +949,54 @@ void GlobalMQTT_SubscribeBatch(const std::vector<std::string> &topics) {
     process_queue_signal();
 }
 
+// Helper to queue unsubscription
+void queue_unsubscription(const std::string &topic) {
+    if(topic.empty()) return;
+    
+    std::lock_guard<std::mutex> lock(g_sub_mutex);
+    
+    // Check if we are actually subscribed
+    auto it = g_subscribed_topics.find(topic);
+    if(it == g_subscribed_topics.end()) {
+        return; // Not subscribed, ignore
+    }
+    
+    // Check if already in unsubscription queue
+    if(std::find(g_unsubscription_queue.begin(), g_unsubscription_queue.end(), topic) != g_unsubscription_queue.end()) {
+        return;
+    }
+    
+    // Also check if it's currently in the SUBSCRIPTION queue (race condition: sub -> unsub quickly)
+    // If so, remove from subscription queue instead of queuing an unsub
+    auto subIt = std::find(g_subscription_queue.begin(), g_subscription_queue.end(), topic);
+    if(subIt != g_subscription_queue.end()) {
+        g_subscription_queue.erase(subIt);
+        // log("DEBUG: Cancelled pending subscription for '" + topic + "'", LogLevel::INFO);
+        return;
+    }
+
+    g_unsubscription_queue.push_back(topic);
+    
+    // Remove from local tracking immediately to prevent logic from thinking we are still subbed
+    g_subscribed_topics.erase(it);
+    
+    // Trigger processing
+    process_queue_signal();
+}
+
 // Helper to unsubscribe from manual batch
 // Optimizes locking by taking lock once for all topics
 void GlobalMQTT_UnsubscribeBatch(const std::vector<std::string> &topics) {
     if(topics.empty()) return;
-    
-    std::lock_guard<std::mutex> lock(g_sub_mutex);
-    size_t removedCount = 0;
-    
+
     for(const auto& topic : topics) {
-        auto it = g_subscribed_topics.find(topic);
-        if(it != g_subscribed_topics.end()) {
-            g_subscribed_topics.erase(it);
-            removedCount++;
-        }
-        // Also remove from pending queue if present?
-        // Checking detailed queue for each item might be O(N*M), slow.
-        // But the queue is usually short.
-    }
-    
-    if(removedCount > 0) {
-        log("GlobalMQTT_UnsubscribeBatch: Removed " + std::to_string(removedCount) + " topics from tracking", LogLevel::INFO);
+        queue_unsubscription(topic);
     }
 }
 
 // Helper to unsubscribe from a single topic dynamically
 void GlobalMQTT_Unsubscribe(const std::string &topic) {
-    if(topic.empty()) return;
-
-    {
-        std::lock_guard<std::mutex> lock(g_sub_mutex);
-        // Remove from local tracking set
-        auto it = g_subscribed_topics.find(topic);
-        if(it != g_subscribed_topics.end()) {
-            g_subscribed_topics.erase(it);
-        } else {
-             // Not subscribed, nothing to do
-             return;
-        }
-
-        // Also remove from pending queue if present
-        auto qIt = std::find(g_subscription_queue.begin(), g_subscription_queue.end(), topic);
-        if(qIt != g_subscription_queue.end()) {
-            g_subscription_queue.erase(qIt);
-            return; // Was only in queue, not yet sent to broker
-        }
-    }
-
-    // Send Unsubscribe packet to broker (via IO thread)
-    // We reuse the process_queue logic somewhat, or post directly
-    as::post(ioc, [topic](){
-        if(!g_mqtt_connected.load()) return;
-        
-        // We need access to the client object. 
-        // Ideally we should have a 'queue_unsubscribe' similar to subscribe, 
-        // but for now posting directly if connected is a start.
-        // NOTE: Actual MQTT unsubscribe requires the client object which is local to the thread
-        // or accessible via a global. 
-        // Since 'client' (am::endpoint) is inside start_mqtt_client's lambda/scope or global?
-        // Wait, start_mqtt_client uses a local client ptr. 
-        
-        // REVISION: We need to queue the unsubscribe action just like subscribe if we want 
-        // strict correctness, OR we accept that we can only unsubscribe when allowed.
-        // For simplicity in this leak fix: we just remove from g_subscribed_topics so we don't 
-        // track it anymore. The broker will clean up subscriptions on disconnect anyway.
-        // BUT for a long-running session that unsubscribes, we DO want to tell the broker.
-        
-        // Assuming client is NOT easily accessible here without refactoring.
-        // However, we CLEARED it from g_subscribed_topics. 
-        // If we reconnect, we won't re-subscribe to it.
-        // This is sufficient to stop the "growth" of tracked topics in our memory.
-        
-        // log("GlobalMQTT_Unsubscribe: Removed '" + topic + "' from tracking", LogLevel::INFO);
-    });
+    queue_unsubscription(topic);
 }
 
 // ----------------------------------------------------------------------------
@@ -1150,6 +1020,64 @@ void process_queue_signal() {
 // Subscribe logic moves inside the loop controller
 as::awaitable<void> perform_subscriptions() {
     // log("DEBUG: perform_subscriptions called", LogLevel::INFO);
+    
+    // 1. Process Unsubscriptions First
+    std::vector<std::string> unsub_batch;
+    {
+        std::lock_guard<std::mutex> lock(g_sub_mutex);
+        size_t count = 0;
+        while(!g_unsubscription_queue.empty() && count < 50) {
+            unsub_batch.push_back(g_unsubscription_queue.front());
+            g_unsubscription_queue.erase(g_unsubscription_queue.begin());
+            count++;
+        }
+    }
+    
+    if(!unsub_batch.empty()) {
+        try {
+             // For Unsubscribe, we also need to include the /Event topics if they were alarm triggers
+             // But wait, the SessionWorker only knows the base topic. 
+             // We tracked 'topic' and 'topic/Event' in global set ONLY if we added them.
+             // But g_subscribed_topics only stores strings.
+             // If we subscribed to 'topic' and 'topic/Event', unsubscription usually comes with just 'topic' from the SessionWorker list.
+             // We need to mirror the logic: if topic was in triggerMap, we unsub 'topic/Event' too.
+             // PROBLEM: We cleaned up triggerMap BEFORE calling unsubscribe in SessionWorker.
+             // So we don't know if it was an alarm trigger anymore.
+             
+             // CORRECTION: SessionWorker removes from triggerMap AND calls unsubscribe.
+             // Ideally we should just unsubscribe from exactly what limits we want.
+             // If we just unsub 'topic', 'topic/Event' keeps flowing. This is bad.
+             
+             // PROPOSAL: Always try to unsubscribe 'topic/Event' as well just in case?
+             // Or rely on the fact that if we aren't tracking it, who cares? 
+             // Broker cares.
+             // Let's being heuristic: Unsubscribe both 'topic' and 'topic/Event' to be safe. 
+             // The broker will ignore if not subscribed.
+             
+             // Convert strings to async_mqtt topic type
+             std::vector<am::topic_sharename> final_unsub_list;
+             final_unsub_list.reserve(unsub_batch.size() * 2);
+
+             for(const auto& t : unsub_batch) {
+                 final_unsub_list.emplace_back(t);
+                 final_unsub_list.emplace_back(t + "/Event"); 
+             }
+             
+             auto unsuback_opt = co_await amcl.async_unsubscribe(
+                am::v5::unsubscribe_packet{*amcl.acquire_unique_packet_id(),
+                                         am::force_move(final_unsub_list)},
+                as::use_awaitable);
+                
+             if(unsuback_opt) {
+                log("✓ Unsubscribed from batch of " + std::to_string(unsub_batch.size()) + " topics (incl. Events)", LogLevel::INFO);
+             }
+             
+        } catch(const std::exception& e) {
+             log("ERROR: Unsubscription batch failed: " + std::string(e.what()), LogLevel::ERRORS);
+        }
+    }
+
+    // 2. Process Subscriptions
     std::vector<std::string> batch;
     {
         std::lock_guard<std::mutex> lock(g_sub_mutex);
@@ -1162,7 +1090,9 @@ as::awaitable<void> perform_subscriptions() {
     }
 
     if(batch.empty()) {
-        log("DEBUG: perform_subscriptions called but batch empty (race condition?)", LogLevel::INFO);
+        if(unsub_batch.empty()) {
+             // log("DEBUG: perform_subscriptions called but both batches empty", LogLevel::INFO);
+        }
         co_return;
     }
 
@@ -1179,7 +1109,6 @@ as::awaitable<void> perform_subscriptions() {
             }
         }
     }
-// ... (rest of function implicit) ...
 
     try {
         // Safe to call async_subscribe here because async_recv is NOT running in parallel
@@ -1215,7 +1144,7 @@ void start_mqtt_client(UA_Server *server) {
                     
                     // HINT: CHANGE KEEP ALIVE HERE FOR CONNECTION DETECTION 
                     auto connack_opt = co_await amcl.async_start(
-                        am::v5::connect_packet{ true, 1, "", std::nullopt, "portal", "dt0Unw7QRh" },
+                        am::v5::connect_packet{ true, 2, "", std::nullopt, "portal", "dt0Unw7QRh" },
                         as::use_awaitable);
                     
                     if(!connack_opt) throw std::runtime_error("Failed to start MQTT session");
@@ -1602,28 +1531,26 @@ void start_mqtt_client(UA_Server *server) {
                                                             double value = dataItem["Value"].get<double>();
                                                             
                                                             // Simplified: Zero-Copy Write (Server handles deduplication)
-                                                            UA_Variant myVar;
-                                                            UA_Variant_init(&myVar);
-                                                            UA_Variant_setScalar(&myVar, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                                            ScopedVariant myVar;
+                                                            UA_Variant_setScalarCopy(myVar.get(), &value, &UA_TYPES[UA_TYPES_DOUBLE]);
                                                             
                                                             {
                                                                 std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
                                                                 is_internal_write = true;
-                                                                UA_Server_writeValue(server, nodeId, myVar);
+                                                                UA_Server_writeValue(server, nodeId, myVar.var);
                                                                 is_internal_write = false;
                                                             }
                                                         } else if(dataItem["Value"].is_boolean()) {
                                                             UA_Boolean value = dataItem["Value"].get<bool>();
                                                             
                                                             // Simplified: Zero-Copy Write (Server handles deduplication)
-                                                            UA_Variant myVar;
-                                                            UA_Variant_init(&myVar);
-                                                            UA_Variant_setScalar(&myVar, &value, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                                                            ScopedVariant myVar;
+                                                            UA_Variant_setScalarCopy(myVar.get(), &value, &UA_TYPES[UA_TYPES_BOOLEAN]);
 
                                                             {
                                                                 std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
                                                                 is_internal_write = true;
-                                                                UA_Server_writeValue(server, nodeId, myVar);
+                                                                UA_Server_writeValue(server, nodeId, myVar.var);
                                                                 is_internal_write = false;
                                                             }
                                                         } else if(dataItem["Value"].is_string()) {
@@ -1631,14 +1558,13 @@ void start_mqtt_client(UA_Server *server) {
                                                             
                                                             // Simplified: Zero-Copy Write (Server handles deduplication)
                                                             UA_String value = UA_STRING((char*)strValue.c_str());
-                                                            UA_Variant myVar;
-                                                            UA_Variant_init(&myVar);
-                                                            UA_Variant_setScalar(&myVar, &value, &UA_TYPES[UA_TYPES_STRING]);
+                                                            ScopedVariant myVar;
+                                                            UA_Variant_setScalarCopy(myVar.get(), &value, &UA_TYPES[UA_TYPES_STRING]);
                                                             
                                                             {
                                                                 std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
                                                                 is_internal_write = true;
-                                                                UA_Server_writeValue(server, nodeId, myVar);
+                                                                UA_Server_writeValue(server, nodeId, myVar.var);
                                                                 is_internal_write = false;
                                                             }
                                                         }
@@ -1649,14 +1575,13 @@ void start_mqtt_client(UA_Server *server) {
                                                          double value = j["Value"].get<double>();
                                                          
                                                          // Simplified: Zero-Copy Write (Server handles deduplication)
-                                                         UA_Variant myVar;
-                                                         UA_Variant_init(&myVar);
-                                                         UA_Variant_setScalar(&myVar, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                                         ScopedVariant myVar;
+                                                         UA_Variant_setScalarCopy(myVar.get(), &value, &UA_TYPES[UA_TYPES_DOUBLE]);
                                                          
                                                          {
                                                              std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
                                                              is_internal_write = true; 
-                                                             UA_Server_writeValue(server, nodeId, myVar);
+                                                             UA_Server_writeValue(server, nodeId, myVar.var);
                                                              is_internal_write = false;
                                                          }
                                                      }
@@ -2090,7 +2015,6 @@ int RunServer(int argc, char **argv) {
         // Set global variables for worker threads
         g_server = server;
         g_bearerToken = BearerToken;
-        // g_apiHost and g_apiPort already set earlier
         
         log("✓ Session manager initialized with " + std::to_string(orgs.size()) + 
             " organizations", LogLevel::INFO);
@@ -2130,12 +2054,9 @@ int RunServer(int argc, char **argv) {
     // config->sessionPKI.clear(&config->sessionPKI);
     // UA_CertificateGroup_AcceptAll(&config->secureChannelPKI);
     // UA_CertificateGroup_AcceptAll(&config->sessionPKI);
-
-    // config->applicationDescription.applicationUri =
-    // UA_STRING_ALLOC("urn:Anexee.server");
+;
     config->applicationDescription.applicationUri =
         UA_STRING_ALLOC("urn:Anexee.server.application");
-    // config->applicationDescription.productUri = UA_STRING_ALLOC("urn:Anexee.server");
     config->applicationDescription.productUri = UA_STRING_ALLOC("urn:Anexee:product");
     config->applicationDescription.applicationName =
         UA_LOCALIZEDTEXT_ALLOC("en-US", "AnexeeServer");
@@ -2144,16 +2065,14 @@ int RunServer(int argc, char **argv) {
 
     // ========================================================================
     // PERFORMANCE TUNING: Limit Queues to prevent Memory Leaks
-    // ========================================================================
-    // Prevent unbounded growth of notification queues if clients are slow
-    
+    // ======================================================================== 
     config->maxSessions = 100;
     config->maxSecureChannels = 50;      // Limit concurrent TCP connections
     config->maxSessionTimeout = 10000.0; // Prune detached sessions after 10s to free MonitoredItems
     //config->maxSubscriptionsPerSession = 50;
     //config->maxMonitoredItemsPerSubscription = 1000;
     config->maxMonitoredItems = 0;   // Global limit to prevent TimerTree explosion
-    config->queueSizeLimits.max = 20000;  // Global limit for MonitoredItems
+    config->queueSizeLimits.max = 200;  // Global limit for MonitoredItems
     //config->maxSubscriptions = 200;      // Global limit for subscriptions
     config->publishingIntervalLimits.min = 100.0; // Enforce min 100ms publishing interval
     config->samplingIntervalLimits.min = 500.0;   // Throttle sampling to max 5Hz to prevent notification flood
@@ -2163,19 +2082,6 @@ int RunServer(int argc, char **argv) {
     config->maxNotificationsPerPublish = 1000;      // Limit per PublishResponse
     log("Performance Limits used: MaxSessions=100, GlobalMAXMI=20000", LogLevel::INFO);
 
-    // Add historizing configuration
-    // Add historizing configuration
-    // DISABLED: History Data Storage disabled to prevent continuous memory growth
-    /*
-    g_gathering = (UA_HistoryDataGathering *)UA_malloc(sizeof(UA_HistoryDataGathering));
-    *g_gathering = UA_HistoryDataGathering_Default(1);
-    config->historyDatabase = UA_HistoryDatabase_default(*g_gathering);
-
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "Historizing configuration initialized");
-    log("Historizing configuration initialized successfully", LogLevel::INFO);
-    */
-    log("Historizing configuration DISABLED (Memory Optimization)", LogLevel::INFO);
 
     // ----------------
     UA_AccessControl_defaultWithLoginCallback(
@@ -2206,35 +2112,27 @@ int RunServer(int argc, char **argv) {
 
 
 
-    // NOTE: BearerToken already acquired earlier (line ~3191)
-    // Duplicate definition removed to avoid redefinition error
+
+    //// Add an ALARM FOLDER INSIDE SERVER THEN ALL NODES WITH HASEVENTSOURCE WILL BE ADDED
+    //// TO THIS FOLDER
+    //UA_NodeId areaNodeId = UA_NODEID_NUMERIC(0, 54624);
+    //UA_ObjectAttributes objAttr = UA_ObjectAttributes_default;
+    //objAttr.displayName = UA_LOCALIZEDTEXT((char *)"en", (char *)"Alarms");
+    //UA_Server_addObjectNode(
+    //    server, UA_NODEID_NULL, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
+    //    UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), UA_QUALIFIEDNAME(1, (char *)"Alarms"),
+    //    UA_NODEID_NUMERIC(0, UA_NS0ID_BASEOBJECTTYPE), objAttr, NULL, &areaNodeId);
+
+    //UA_Server_addReference(server, UA_NODEID_NUMERIC(0, 2253),  // Server
+    //                       UA_NODEID_NUMERIC(0, UA_NS0ID_HASNOTIFIER),
+    //                       UA_EXPANDEDNODEID_NUMERIC(areaNodeId.namespaceIndex,
+    //                                                 areaNodeId.identifier.numeric),
+    //                       UA_TRUE);
+
+    ///* Use the Alarms object as the default Event Notifier origin */
+    //g_eventNotifierNode = areaNodeId;
 
 
-    // Add an ALARM FOLDER INSIDE SERVER THEN ALL NODES WITH HASEVENTSOURCE WILL BE ADDED
-    // TO THIS FOLDER
-    UA_NodeId areaNodeId = UA_NODEID_NUMERIC(0, 54624);
-    UA_ObjectAttributes objAttr = UA_ObjectAttributes_default;
-    objAttr.displayName = UA_LOCALIZEDTEXT((char *)"en", (char *)"Alarms");
-    UA_Server_addObjectNode(
-        server, UA_NODEID_NULL, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
-        UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), UA_QUALIFIEDNAME(1, (char *)"Alarms"),
-        UA_NODEID_NUMERIC(0, UA_NS0ID_BASEOBJECTTYPE), objAttr, NULL, &areaNodeId);
-
-    UA_Server_addReference(server, UA_NODEID_NUMERIC(0, 2253),  // Server
-                           UA_NODEID_NUMERIC(0, UA_NS0ID_HASNOTIFIER),
-                           UA_EXPANDEDNODEID_NUMERIC(areaNodeId.namespaceIndex,
-                                                     areaNodeId.identifier.numeric),
-                           UA_TRUE);
-
-    /* Use the Alarms object as the default Event Notifier origin */
-    g_eventNotifierNode = areaNodeId;
-
-
-    
-    // ========================================================================
-    // END OF COMMENTED OUT LEGACY CODE
-    // All topic/alarm initialization is now handled per-session in worker threads
-    // ========================================================================
 
     // Start MQTT Client (Async)
     start_mqtt_client(server);
@@ -2242,17 +2140,12 @@ int RunServer(int argc, char **argv) {
     std::thread mqtt_thread([&]() { ioc.run(); });
     // mqtt_thread.detach(); // FIXED: Do not detach, we must join it to prevent crash on exit
 
-    // string bearerToken = getBearerToken();
-    // json topicList = getTopicList(bearerToken);
-
-  
-
     log("Starting OPC UA Server...", LogLevel::INFO);
     log("Added repeated callback for counter updates", LogLevel::DEBUG);
 
     UA_StatusCode startupRc = UA_Server_run_startup(server);
     if(startupRc != UA_STATUSCODE_GOOD) {
-         log("❌ Server startup failed with code: " + std::string(UA_StatusCode_name(startupRc)), LogLevel::ERRORS);
+         log(" Server startup failed with code: " + std::string(UA_StatusCode_name(startupRc)), LogLevel::ERRORS);
          return EXIT_FAILURE;
     }
     log("Server startup completed successfully", LogLevel::INFO);
@@ -2264,7 +2157,7 @@ int RunServer(int argc, char **argv) {
     // must set our callbacks AFTER startup completes but BEFORE accepting
     // connections. This ensures multi-tenancy session detection works.
     // ========================================================================
-    log("⚙️ Configuring multi-tenancy session detection...", LogLevel::INFO);
+    log(" Configuring multi-tenancy session detection...", LogLevel::INFO);
     
     UA_ServerConfig *runningConfig = UA_Server_getConfig(server);
     
@@ -2282,93 +2175,7 @@ int RunServer(int argc, char **argv) {
     // ========================================================================
     
     log("Server is ready to accept connections", LogLevel::INFO);
-    // Register server with LDS now that it's running
 
-    // register server
-    // UA_ClientConfig cc;
-    // memset(&cc, 0, sizeof(UA_ClientConfig));
-    // UA_ClientConfig_setDefault(&cc);
-
-    // UA_ByteString client_cert = loadFile("client/own/certs/client_cert.der");
-    // UA_ByteString client_key = loadFile("client/own/certs/client_key.der");
-    // UA_ByteString server_cert = loadFile("server/own/certs/server_cert.der");
-    // UA_ByteString ca_cert = loadFile("ca/certs/ca.crt");
-    // UA_ByteString revocation_cert = loadFile("server/trusted/crl/crl.crl");
-
-    //     if (certificate.length == 0) {
-    //         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to load client
-    //         certificate"); return EXIT_FAILURE;
-    //     }
-    //     if (privateKey.length == 0) {
-    //         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to load client
-    //         private key"); return EXIT_FAILURE;
-    //     }
-    //     if (serverCerte.length == 0) {
-    //         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to load server
-    //         certificate into trust list"); return EXIT_FAILURE;
-    //     }
-
-    // UA_STACKARRAY(UA_ByteString, trustLists, 1);
-    // trustLists[0] = serverCerte;
-
-    // // Step 3: Apply encryption
-    // UA_ClientConfig_setDefaultEncryption(&cc, certificatee, privateKeye, NULL, 0,
-    // NULL, 0);
-
-    // UA_CertificateGroup_AcceptAll(&cc.certificateVerification);
-
-    // //cc.securityMode = UA_MESSAGESECURITYMODE_NONE;
-    // //cc.securityPolicyUri =
-    // //UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
-
-    // //UA_String_clear(&cc.applicationUri);
-    // cc.clientDescription.applicationUri =
-    // UA_STRING_ALLOC("urn:Anexee.server.application");
-    // //cc.clientDescription.applicationName = UA_LOCALIZEDTEXT_ALLOC("en-US",
-    // //"Anexee");
-    // //cc.clientDescription.productUri =
-    // //UA_STRING_ALLOC("urn:Anexee.server");
-
-    // //cc.userTokenPolicy.securityPolicyUri =
-    // //    UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
-    // //
-
-    // //cc.clientDescription.applicationUri =
-    // //    UA_STRING_ALLOC("urn:Anexee.server.application");
-    // cc.clientDescription.productUri = UA_STRING_ALLOC("urn:Anexee.server");
-    // cc.clientDescription.applicationName = UA_LOCALIZEDTEXT_ALLOC("en-US", "Anexee");
-    // cc.clientDescription.applicationType = UA_APPLICATIONTYPE_SERVER;
-
-    // cc.endpointUrl = UA_STRING_ALLOC("opc.tcp://localhost:4840");
-
-    // cc.userTokenPolicy.tokenType = UA_USERTOKENTYPE_ANONYMOUS;
-    // cc.userTokenPolicy.policyId = UA_STRING_ALLOC("anonymous-policy");
-
-    // cc.securityPolicyUri =
-    //     UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#None");
-    // cc.securityMode = UA_MESSAGESECURITYMODE_NONE;
-
-    // // Set if LDS requires user credentials (rare):
-    // //cc.userIdentityToken.encoding = UA_EXTENSIONOBJECT_DECODED;
-    // //cc.userIdentityToken.content.decoded.type =
-    // //    &UA_TYPES[UA_TYPES_USERNAMEIDENTITYTOKEN];
-    // //cc.userIdentityToken.content.decoded.data = UA_UserNameIdentityToken_new();
-    // //UA_UserNameIdentityToken *token =
-    // //    (UA_UserNameIdentityToken *)cc.userIdentityToken.content.decoded.data;
-
-    // cc.applicationUri = UA_STRING_ALLOC("urn:Anexee.server.application");
-
-    // const char *discoveryUrlStr = "opc.tcp://Asce:4840";
-    // UA_String discoveryUrl = UA_String_fromChars(discoveryUrlStr);
-
-    // UA_StatusCode result = UA_Server_registerDiscovery(server, &cc, discoveryUrl,
-    // UA_STRING_NULL); if(result != UA_STATUSCODE_GOOD) {
-    //    UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_SERVER,
-    //                 "Could not create periodic job for server register. StatusCode %s",
-    //                 UA_StatusCode_name(result));
-    //    UA_Server_delete(server);
-    //    return EXIT_FAILURE;
-    // }
 
     log("Server is now running and listening for connections", LogLevel::INFO);
 
@@ -2388,30 +2195,16 @@ int RunServer(int argc, char **argv) {
                      log("DEBUG: Performed _heapmin() (Released unused heap to OS)", LogLevel::DEBUG); 
                 }
                 #endif
-                
-                // MONITORING DIAGNOSTICS: Log active MonitoredItems count
-                UA_Variant val;
-                UA_Variant_init(&val);
-                UA_NodeId diagNodeId = UA_NODEID_NUMERIC(0, 2271); // Global: Server_ServerDiagnostics_ServerDiagnosticsSummary_CurrentMonitoredItemsCount
-                UA_StatusCode retval = UA_Server_readValue(server, diagNodeId, &val);
-                if(retval == UA_STATUSCODE_GOOD) {
-                    if(UA_Variant_hasScalarType(&val, &UA_TYPES[UA_TYPES_UINT32])) {
-                        UA_UInt32 count = *(UA_UInt32*)val.data;
-                        log("DIAGNOSTICS: Current Monitored Items = " + std::to_string(count), LogLevel::INFO);
-                    }
-                    UA_Variant_clear(&val);
-                } else {
-                    log("DIAGNOSTICS FAILED: Could not read Node ns=1;i=54543 (Error: " + std::string(UA_StatusCode_name(retval)) + ")", LogLevel::INFO);
-                }
+              
 
                 last_trim = now;
             }
         }
     } catch (const std::exception& e) {
-        log("🔥 CRITICAL: Unhandled exception in main loop: " + std::string(e.what()), LogLevel::ERRORS);
+        log("CRITICAL: Unhandled exception in main loop: " + std::string(e.what()), LogLevel::ERRORS);
         std::cerr << "CRITICAL: Unhandled exception: " << e.what() << std::endl;
     } catch (...) {
-        log("🔥 CRITICAL: Unknown exception in main loop", LogLevel::ERRORS);
+        log(" CRITICAL: Unknown exception in main loop", LogLevel::ERRORS);
         std::cerr << "CRITICAL: Unknown exception in main loop" << std::endl;
     }
 
@@ -2423,54 +2216,11 @@ int RunServer(int argc, char **argv) {
     
     log("Server loop exited - running flag is now false", LogLevel::INFO);
     log("Server shutdown initiated", LogLevel::INFO);
-    //    // Unregister from LDS before shutdown
-    //    memset(&cc, 0, sizeof(UA_ClientConfig));
-    //    UA_ClientConfig_setDefault(&cc);
 
-    //    cc.endpoint.securityMode = UA_MESSAGESECURITYMODE_NONE;
-    //
-    //    cc.endpoint.userIdentityTokensSize = 1;
-    //    cc.endpoint.userIdentityTokens = (UA_UserTokenPolicy *) UA_Array_new(1,
-    //    &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
-    //    UA_UserTokenPolicy_init(&cc.endpoint.userIdentityTokens[0]);
-    //    cc.endpoint.userIdentityTokens[0].tokenType = UA_USERTOKENTYPE_ANONYMOUS;
-    //    cc.endpoint.userIdentityTokens[0].policyId =
-    //    UA_String_fromChars("open62541-anonymous-policy");
-    //    UA_ByteString_clear(&cc.securityPolicyUri);
-    //    cc.endpoint.userIdentityTokens[0].securityPolicyUri =
-    //    UA_String_fromChars("http://opcfoundation.org/UA/SecurityPolicy#None");
-
-    //    for(size_t j = 0; j < cc.endpoint.userIdentityTokensSize; j++) {
-    //        UA_UserTokenPolicy *pol = &cc.endpoint.userIdentityTokens[j];
-    //        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_CLIENT, "Deregistration Client
-    //        TokenType: %d, PolicyId: %.*s, SecurityPolicyUri: %.*s",
-    //            pol->tokenType,
-    //            (int)pol->policyId.length, pol->policyId.data,
-    //            (int)pol->securityPolicyUri.length, pol->securityPolicyUri.data);
-    //    }
-
-    //    UA_StatusCode res = UA_Server_deregisterDiscovery(server, &cc, discoveryUrl);
-    //    if(res != UA_STATUSCODE_GOOD)
-    //        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_SERVER,
-    //                     "Could not unregister from discovery server. StatusCode %s",
-    //                     UA_StatusCode_name(res));
-    //    else
-    //        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Unregistered from
-    //        discovery server.");
 
     log("Cleaning up server resources", LogLevel::DEBUG);
 
-    // NOTE: Example node cleanup disabled - these don't exist in multi-tenant version
-    // UA_VariableAttributes_clear(&attr);
-    // UA_VariableAttributes_clear(&attr2);
-    // UA_VariableAttributes_clear(&attr3);
-    // UA_NodeId_clear(&myIntegerNodeId);
-    // UA_NodeId_clear(&myDoubleNodeId);
-    // UA_NodeId_clear(&myImageNodeId);
-    // UA_NodeId_clear(&minNodeId);
-    // UA_QualifiedName_clear(&myIntegerName);
-    // UA_QualifiedName_clear(&myDoubleName);
-    // UA_QualifiedName_clear(&myImageName);
+
 
     // Clean up security policies
     for(size_t i = 0; i < config->securityPoliciesSize; i++) {
@@ -2496,6 +2246,12 @@ int RunServer(int argc, char **argv) {
     // contexts and clean them up individually. For this example, the server will handle
     // most cleanup. The MethodCallbackContext structures are stored as node contexts and
     // will be cleaned up when the server is deleted.
+    
+    // Explicitly shut down SessionManager to ensure worker threads stop BEFORE server is deleted
+    // (Worker threads access UA_Server, so they must be dead before we kill the server)
+    log("Shutting down SessionManager...", LogLevel::DEBUG);
+    g_sessionManager.shutdown();
+
     log("Deleting server instance", LogLevel::DEBUG);
     UA_Server_delete(server);
 
@@ -2604,10 +2360,6 @@ int main(int argc, char **argv) {
     }
 
     // 2. Check if started as a Service (by SCM)
-    // SCM usually doesn't pass arguments to main(), but we check for our own flag just in case
-    // However, StartServiceCtrlDispatcher is what we SHOULD call if we suspect we are a service.
-    // But we can't just call it always because it blocks and fails if not service.
-    // Convention: Service binaries are just run without args or with specific args.
     
     // HEURISTIC: If --service is passed, we definitely try SCM dispatch
     bool tryService = false;

@@ -21,24 +21,108 @@ struct UA_NodeId_less_than {
     }
 };
 
-/**
- * @brief Holds all necessary information for managing an alarm associated with a process variable.
- *
- * This structure stores the NodeIds for both the process variable and its corresponding
- * alarm instance, as well as the alarm's configuration limits and current state.
- */
-struct MonitoredNodeAlarmInfo {
-    UA_NodeId processNodeId;
-    UA_NodeId alarmInstanceId;
-    double alarmHiHi;
-    double alarmHi;
-    double alarmLo;
-    double alarmLoLo;
-    double deadband;
-    std::string displayName;
-    bool acked = false; // Acknowledged state
-    bool callbackSetup = false; // Flag to track if method callback is already set up
-};
+///**
+// * @brief Holds all necessary information for managing an alarm associated with a process variable.
+// *
+// * This structure stores the NodeIds for both the process variable and its corresponding
+// * alarm instance, as well as the alarm's configuration limits and current state.
+// */
+//struct MonitoredNodeAlarmInfo {
+//    UA_NodeId processNodeId;
+//    UA_NodeId alarmInstanceId;
+//    double alarmHiHi;
+//    double alarmHi;
+//    double alarmLo;
+//    double alarmLoLo;
+//    double deadband;
+//    std::string displayName;
+//    bool acked = false; // Acknowledged state
+//    bool callbackSetup = false; // Flag to track if method callback is already set up
+//
+//    MonitoredNodeAlarmInfo() {
+//        UA_NodeId_init(&processNodeId);
+//        UA_NodeId_init(&alarmInstanceId);
+//        alarmHiHi = 0; alarmHi = 0; alarmLo = 0; alarmLoLo = 0; deadband = 0;
+//    }
+//
+//    ~MonitoredNodeAlarmInfo() {
+//        UA_NodeId_clear(&processNodeId);
+//        UA_NodeId_clear(&alarmInstanceId);
+//    }
+//
+//    // Copy Ctor
+//    MonitoredNodeAlarmInfo(const MonitoredNodeAlarmInfo& other) {
+//        UA_NodeId_copy(&other.processNodeId, &processNodeId);
+//        UA_NodeId_copy(&other.alarmInstanceId, &alarmInstanceId);
+//        alarmHiHi = other.alarmHiHi;
+//        alarmHi = other.alarmHi;
+//        alarmLo = other.alarmLo;
+//        alarmLoLo = other.alarmLoLo;
+//        deadband = other.deadband;
+//        displayName = other.displayName;
+//        acked = other.acked;
+//        callbackSetup = other.callbackSetup;
+//    }
+//
+//    // Copy Assign
+//    MonitoredNodeAlarmInfo& operator=(const MonitoredNodeAlarmInfo& other) {
+//        if(this != &other) {
+//            UA_NodeId_clear(&processNodeId);
+//            UA_NodeId_clear(&alarmInstanceId);
+//            UA_NodeId_copy(&other.processNodeId, &processNodeId);
+//            UA_NodeId_copy(&other.alarmInstanceId, &alarmInstanceId);
+//            alarmHiHi = other.alarmHiHi;
+//            alarmHi = other.alarmHi;
+//            alarmLo = other.alarmLo;
+//            alarmLoLo = other.alarmLoLo;
+//            deadband = other.deadband;
+//            displayName = other.displayName;
+//            acked = other.acked;
+//            callbackSetup = other.callbackSetup;
+//        }
+//        return *this;
+//    }
+//
+//    // Move Ctor
+//    MonitoredNodeAlarmInfo(MonitoredNodeAlarmInfo&& other) noexcept {
+//        processNodeId = other.processNodeId;
+//        alarmInstanceId = other.alarmInstanceId;
+//        UA_NodeId_init(&other.processNodeId);
+//        UA_NodeId_init(&other.alarmInstanceId);
+//
+//        alarmHiHi = other.alarmHiHi;
+//        alarmHi = other.alarmHi;
+//        alarmLo = other.alarmLo;
+//        alarmLoLo = other.alarmLoLo;
+//        deadband = other.deadband;
+//        displayName = std::move(other.displayName);
+//        acked = other.acked;
+//        callbackSetup = other.callbackSetup;
+//    }
+//
+//    // Move Assign
+//    MonitoredNodeAlarmInfo& operator=(MonitoredNodeAlarmInfo&& other) noexcept {
+//        if(this != &other) {
+//            UA_NodeId_clear(&processNodeId);
+//            UA_NodeId_clear(&alarmInstanceId);
+//            
+//            processNodeId = other.processNodeId;
+//            alarmInstanceId = other.alarmInstanceId;
+//            UA_NodeId_init(&other.processNodeId);
+//            UA_NodeId_init(&other.alarmInstanceId);
+//
+//            alarmHiHi = other.alarmHiHi;
+//            alarmHi = other.alarmHi;
+//            alarmLo = other.alarmLo;
+//            alarmLoLo = other.alarmLoLo;
+//            deadband = other.deadband;
+//            displayName = std::move(other.displayName);
+//            acked = other.acked;
+//            callbackSetup = other.callbackSetup;
+//        }
+//        return *this;
+//    }
+//};
 
 /* Map trigger topic (applicableTagName) to list of alarm keys (emitter+alarmName) */
 struct TriggerToAlarmMapping {
@@ -91,6 +175,66 @@ struct AlarmBranchInfo {
     UA_NodeId conditionNodeId;   // The main Condition NodeId (added for ConditionRefresh)
     std::string guid;             // The AEInstanceID GUID
     bool isMainBranch;            // true if this is the main branch (GUID empty/null)
+
+    AlarmBranchInfo() {
+        UA_NodeId_init(&branchNodeId);
+        UA_NodeId_init(&conditionNodeId);
+        isMainBranch = false;
+    }
+
+    ~AlarmBranchInfo() {
+        UA_NodeId_clear(&branchNodeId);
+        UA_NodeId_clear(&conditionNodeId);
+    }
+
+    // Copy Constructor (Deep Copy)
+    AlarmBranchInfo(const AlarmBranchInfo& other) {
+        UA_NodeId_copy(&other.branchNodeId, &branchNodeId);
+        UA_NodeId_copy(&other.conditionNodeId, &conditionNodeId);
+        guid = other.guid;
+        isMainBranch = other.isMainBranch;
+    }
+
+    // Copy Assignment (Deep Copy)
+    AlarmBranchInfo& operator=(const AlarmBranchInfo& other) {
+        if(this != &other) {
+            UA_NodeId_clear(&branchNodeId);
+            UA_NodeId_clear(&conditionNodeId);
+            UA_NodeId_copy(&other.branchNodeId, &branchNodeId);
+            UA_NodeId_copy(&other.conditionNodeId, &conditionNodeId);
+            guid = other.guid;
+            isMainBranch = other.isMainBranch;
+        }
+        return *this;
+    }
+
+    // Move Constructor
+    AlarmBranchInfo(AlarmBranchInfo&& other) noexcept {
+        branchNodeId = other.branchNodeId;
+        conditionNodeId = other.conditionNodeId;
+        guid = std::move(other.guid);
+        isMainBranch = other.isMainBranch;
+        
+        UA_NodeId_init(&other.branchNodeId);
+        UA_NodeId_init(&other.conditionNodeId);
+    }
+
+    // Move Assignment
+    AlarmBranchInfo& operator=(AlarmBranchInfo&& other) noexcept {
+        if(this != &other) {
+            UA_NodeId_clear(&branchNodeId);
+            UA_NodeId_clear(&conditionNodeId);
+            
+            branchNodeId = other.branchNodeId;
+            conditionNodeId = other.conditionNodeId;
+            guid = std::move(other.guid);
+            isMainBranch = other.isMainBranch;
+            
+            UA_NodeId_init(&other.branchNodeId);
+            UA_NodeId_init(&other.conditionNodeId);
+        }
+        return *this;
+    }
 };
 
 // Map: alarmKey → (GUID → BranchInfo)
@@ -218,6 +362,10 @@ UA_StatusCode setStealthValueChecked(UA_Server *server, UA_NodeId baseNode,
                             void *newValue, const UA_DataType *type);
 std::string findAlarmKeyForCondition(const UA_NodeId *alarmNodeId);
 
+void cleanupBranches(const std::string &alarmKey);
+
+std::string findGUIDForNodeId(const UA_NodeId *nodeId, const std::string &alarmKey);
+
 
 
 // --- Alarm Method Callbacks (Exposed for Multi-Tenancy) ---
@@ -256,5 +404,15 @@ UA_StatusCode customDisableCallback(UA_Server *server, const UA_NodeId *sessionI
                                   const UA_NodeId *methodId, void *methodContext,
                                   const UA_NodeId *objectId, void *objectContext, size_t inputSize,
                                   const UA_Variant *input, size_t outputSize, UA_Variant *output);
+
+// RAII Wrapper for UA_Variant to ensure cleanup
+struct ScopedVariant {
+    UA_Variant var;
+    ScopedVariant() { UA_Variant_init(&var); }
+    ~ScopedVariant() { UA_Variant_clear(&var); }
+    UA_Variant* get() { return &var; }
+    UA_Variant* operator&() { return &var; } // Helper for legacy C calls
+    // Note: Do not copy/move without deep copy logic.
+};
 
 #endif // ALARM_HANDLER_H

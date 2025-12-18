@@ -67,10 +67,10 @@ UA_StatusCode setStealthValueByPath(UA_Server *server, UA_NodeId baseNode,
         return UA_STATUSCODE_BADNOTFOUND;
     }
     
-    UA_Variant val;
-    UA_Variant_init(&val);
-    UA_Variant_setScalar(&val, newValue, type);
-    UA_StatusCode sc = UA_Server_writeValue(server, targetNode, val);
+    
+    ScopedVariant val;
+    UA_Variant_setScalarCopy(val.get(), newValue, type);
+    UA_StatusCode sc = UA_Server_writeValue(server, targetNode, val.var);
     UA_NodeId_clear(&targetNode);
     return sc;
 }
@@ -204,7 +204,7 @@ getOrCreateAlarmBranch(UA_Server *server, const UA_NodeId &conditionId,
         return UA_NodeId_copy(&branchIt->second.branchNodeId, outBranchId);
     }
 
-    // 3. Create New Virtual Branch
+    // 4. Create New Virtual Branch
     // Format: ns=1;s=Branch:<GUID>
     std::string nodeIdStr = "Branch:" + guid;
 
@@ -213,24 +213,25 @@ getOrCreateAlarmBranch(UA_Server *server, const UA_NodeId &conditionId,
 
     // Store in Map
     AlarmBranchInfo branchInfo;
-    branchInfo.branchNodeId = masterBranchId;  // Map takes ownership of this alloc
-    branchInfo.conditionNodeId = conditionId;  // Shallow copy is fine for numeric/safely
-                                               // managed IDs, but ideally copy
+    branchInfo.branchNodeId = masterBranchId;  // Transfer ownership (raw struct copy)
+    UA_NodeId_init(&masterBranchId);           // Clear local var so it doesn't own data anymore
+    
+    // Also set ConditionId
+    UA_NodeId_copy(&conditionId, &branchInfo.conditionNodeId);
+
     branchInfo.guid = guid;
     branchInfo.isMainBranch = false;
 
-    // Insert into map
-    branchMap[guid] = branchInfo;
-
-    branchMap[guid] = branchInfo;
+    // Insert into map (Use MOVE to avoid extra deep copies if possible, though compiler optimizes)
+    // Note: branchInfo has Move Constructor now.
+    branchMap[guid] = std::move(branchInfo);
 
     // UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
     //             "✓ Created virtual branch for GUID '%s' (NodeId: ns=%u;s=%s)",
     //             guid.c_str(), masterBranchId.namespaceIndex, nodeIdStr.c_str());
 
-    // 4. Return a DEEP COPY to the caller
-    // Caller is responsible for clearing outBranchId, but it won't affect our Map
-    return UA_NodeId_copy(&masterBranchId, outBranchId);
+    // 5. Return a DEEP COPY to the caller from the MAP (persistent source)
+    return UA_NodeId_copy(&branchMap[guid].branchNodeId, outBranchId);
 }
 
 
@@ -966,15 +967,13 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
 
         // Lookup SourceNode
         UA_NodeId sourceNodeId = UA_NODEID_NULL;
-        UA_Variant sourceVar;
-        UA_Variant_init(&sourceVar);
+        ScopedVariant sourceVar;
         if(UA_Server_readObjectProperty(server, conditionNodeId,
                                         UA_QUALIFIEDNAME(0, (char *)"SourceNode"),
-                                        &sourceVar) == UA_STATUSCODE_GOOD) {
-            if(UA_Variant_hasScalarType(&sourceVar, &UA_TYPES[UA_TYPES_NODEID])) {
-                UA_NodeId_copy((UA_NodeId *)sourceVar.data, &sourceNodeId);
+                                        sourceVar.get()) == UA_STATUSCODE_GOOD) {
+            if(UA_Variant_hasScalarType(sourceVar.get(), &UA_TYPES[UA_TYPES_NODEID])) {
+                UA_NodeId_copy((UA_NodeId *)sourceVar.var.data, &sourceNodeId);
             }
-            UA_Variant_clear(&sourceVar);
         }
         if(UA_NodeId_isNull(&sourceNodeId))
             UA_NodeId_copy(&conditionNodeId, &sourceNodeId);
@@ -992,12 +991,11 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
             
             if(!UA_NodeId_isNull(&enabledStateId)) {
                 UA_QualifiedName qId = UA_QUALIFIEDNAME_ALLOC(0, (char*)"Id");
-                UA_Variant enabledVar;
-                UA_StatusCode enabledRc = UA_Server_readObjectProperty(server, enabledStateId, qId, &enabledVar);
-                if(enabledRc == UA_STATUSCODE_GOOD && UA_Variant_hasScalarType(&enabledVar, &UA_TYPES[UA_TYPES_BOOLEAN])) {
-                    isEnabled = *(UA_Boolean*)enabledVar.data;
+                ScopedVariant enabledVar;
+                UA_StatusCode enabledRc = UA_Server_readObjectProperty(server, enabledStateId, qId, enabledVar.get());
+                if(enabledRc == UA_STATUSCODE_GOOD && UA_Variant_hasScalarType(enabledVar.get(), &UA_TYPES[UA_TYPES_BOOLEAN])) {
+                    isEnabled = *(UA_Boolean*)enabledVar.var.data;
                 }
-                UA_Variant_clear(&enabledVar);
             }
             
             if(!isEnabled) {
@@ -1133,97 +1131,6 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
 
         }
 
-        // ========================================================
-        // STEP 5: CALCULATE AGGREGATE STATE
-        // ========================================================
-        //bool aggActive = false;
-        //bool aggAcked = true;
-        //bool aggConfirmed = true;
-        //UA_UInt16 aggSeverity = 0;
-        //bool anyRetained = false;
-
-        //for(const auto &bp : branchStateMapIt->second) {
-        //    if(bp.second.active) {
-        //        aggActive = true;
-        //        if(bp.second.severity > aggSeverity)
-        //            aggSeverity = bp.second.severity;
-        //    }
-        //    // Branch contributes if Active OR Unacked
-        //    if(bp.second.active || !bp.second.acked) {
-        //        anyRetained = true;
-        //        if(!bp.second.acked)
-        //            aggAcked = false;
-        //        if(!bp.second.confirmed)
-        //            aggConfirmed = false;
-        //    }
-        //}
-
-        //if(!anyRetained) {
-        //    aggAcked = true;
-        //    aggConfirmed = true;
-        //    aggSeverity = 0;
-        //}
-
-        //// Retain Logic: Active OR Unacked
-        //UA_Boolean aggRetain = (aggActive || !aggAcked) ? UA_TRUE : UA_FALSE;
-
-        // ========================================================
-        // STEP 6: RESTORE AGGREGATE STATE TO MAIN CONDITION NODE (STEALTH MODE)
-        // ========================================================
-        //{
-        //    // ActiveState/Id (STEALTH MODE)
-        //    UA_Boolean valActive = aggActive ? UA_TRUE : UA_FALSE;
-        //    setStealthValueByPath(server, conditionNodeId, {"ActiveState", "Id"}, &valActive, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-        //    // ActiveState (LocalizedText) - stealth write
-        //    UA_LocalizedText activeText =
-        //        aggActive ? UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Active")
-        //                  : UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Inactive");
-        //    setStealthValueChecked(server, conditionNodeId, "ActiveState", &activeText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-        //    // AckedState/Id (STEALTH MODE)
-        //    UA_Boolean valAcked = aggAcked ? UA_TRUE : UA_FALSE;
-        //    setStealthValueByPath(server, conditionNodeId, {"AckedState", "Id"}, &valAcked, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-        //    // AckedState (LocalizedText) - stealth write
-        //    UA_LocalizedText ackedText =
-        //        aggAcked ? UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Acknowledged")
-        //                 : UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Unacknowledged");
-        //    setStealthValueChecked(server, conditionNodeId, "AckedState", &ackedText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-        //    // ConfirmedState/Id (STEALTH MODE)
-        //    UA_Boolean valConfirmed = aggConfirmed ? UA_TRUE : UA_FALSE;
-        //    setStealthValueByPath(server, conditionNodeId, {"ConfirmedState", "Id"}, &valConfirmed, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-        //    // ConfirmedState (LocalizedText) - stealth write
-        //    UA_LocalizedText cnfText =
-        //        aggConfirmed ? UA_LOCALIZEDTEXT((char *)"en", (char *)"Confirmed")
-        //                     : UA_LOCALIZEDTEXT((char *)"en", (char *)"Unconfirmed");
-        //    setStealthValueChecked(server, conditionNodeId, "ConfirmedState", &cnfText, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-        //    // Severity - stealth write
-        //    setStealthValueChecked(server, conditionNodeId, "Severity", &aggSeverity, &UA_TYPES[UA_TYPES_UINT16]);
-
-        //    // Retain - stealth write
-        //    setStealthValueChecked(server, conditionNodeId, "Retain", &aggRetain, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-        //    // Reset BranchId to NULL (Aggregate) - stealth write
-        //    UA_NodeId nullId = UA_NODEID_NULL;
-        //    setStealthValueChecked(server, conditionNodeId, "BranchId", &nullId, &UA_TYPES[UA_TYPES_NODEID]);
-        //}
-
-        //// ========================================================
-        //// STEP 7: TRIGGER AGGREGATE EVENT (Standard Pattern)
-        //// ========================================================
-        //if(aggRetain) {
-        //    UA_ByteString aggEid = UA_BYTESTRING_NULL;
-        //    UA_Server_triggerConditionEvent(server, conditionNodeId, sourceNodeId,
-        //                                    &aggEid);
-        //    UA_ByteString_clear(&aggEid);
-        //    
-        //    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-        //               "ConditionRefresh: Triggered aggregate event (BranchId=NULL)");
-        //}
 
         UA_NodeId_clear(&sourceNodeId);
     }
@@ -1257,4 +1164,84 @@ static std::string findGUIDForBranchId(const UA_NodeId *branchId, const std::str
         }
     }
     return "";
+}
+
+
+/* Find GUID for a given NodeId (branch or condition) */
+std::string findGUIDForNodeId(const UA_NodeId *nodeId, const std::string &alarmKey) {
+    // If alarmKey is provided, search in that specific alarm's branches
+    if(!alarmKey.empty()) {
+        // Check if this is a branch
+        auto branchMapIt = g_alarmBranches.find(alarmKey);
+        if(branchMapIt != g_alarmBranches.end()) {
+            for(const auto &branchPair : branchMapIt->second) {
+                if(UA_NodeId_equal(&branchPair.second.branchNodeId, nodeId)) {
+                    return branchPair.second.guid;
+                }
+            }
+        }
+        
+        // Check if this is the main condition
+        auto alarmIt = g_alarmByKey.find(alarmKey);
+        if(alarmIt != g_alarmByKey.end()) {
+            if(UA_NodeId_equal(&alarmIt->second, nodeId)) {
+                return "";  // Main branch has empty GUID
+            }
+        }
+    } else {
+        // Search across all alarms if alarmKey not provided
+        // First check all branches
+        for(const auto &alarmBranchPair : g_alarmBranches) {
+            for(const auto &branchPair : alarmBranchPair.second) {
+                if(UA_NodeId_equal(&branchPair.second.branchNodeId, nodeId)) {
+                    return branchPair.second.guid;
+                }
+            }
+        }
+        
+        // Then check all main conditions
+        for(const auto &alarmPair : g_alarmByKey) {
+            if(UA_NodeId_equal(&alarmPair.second, nodeId)) {
+                return "";  // Main branch has empty GUID
+            }
+        }
+    }
+    
+    return "";  // Not found
+}
+
+/* Cleanup inactive and acknowledged branches */
+void
+cleanupBranches(const std::string &alarmKey) {
+    auto &branchMap = g_alarmBranches[alarmKey];
+    auto &branchStateMap = g_branchStates[alarmKey];
+
+    for(auto it = branchMap.begin(); it != branchMap.end();) {
+        const std::string &guid = it->first;
+        bool remove = false;
+        auto stateIt = branchStateMap.find(guid);
+
+        if(stateIt != branchStateMap.end()) {
+            // FIX: If you want Ack & Clear behavior, remove "&& confirmed" check
+            // Otherwise, branches will stick around forever waiting for a confirm that
+            // never comes.
+            if(!stateIt->second.active && stateIt->second.acked) {
+                remove = true;
+            }
+        } else {
+            remove = true;  // Orphaned branch info
+        }
+
+        if(remove) {
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "Cleaning up branch GUID '%s' for alarm '%s'", guid.c_str(),
+                        alarmKey.c_str());
+            if(stateIt != branchStateMap.end()) {
+                branchStateMap.erase(stateIt);
+            }
+            it = branchMap.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
