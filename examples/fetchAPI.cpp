@@ -336,13 +336,9 @@ vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearer
 
 
 
-vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToken, string json_body, string target) {
+vector<AlarmConfig> ParseAlarmConfigFromJson(const json& response) {
     vector<AlarmConfig> alarms;
-    if(!bearerToken.empty()) {
-        try {
-            auto futureResponse = std::async(std::launch::async, getResponse, host, port,
-                                             bearerToken, json_body, target);
-        json response = futureResponse.get();
+    try {
 
         // Check for 'data' field (actual API response format)
         if(response.contains("data") && response["data"].is_array()) {
@@ -510,8 +506,20 @@ vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToke
             log("Error in ParseAlarmConfig: " + std::string(e.what()), LogLevel::ERRORS);
             // Return empty vector on error rather than crashing
         }
-    }
     return alarms;
+}
+
+vector<AlarmConfig> ParseAlarmConfig(string host, string port, string bearerToken, string json_body, string target) {
+    if(bearerToken.empty()) return {};
+    try {
+        auto futureResponse = std::async(std::launch::async, getResponse, host, port,
+                                         bearerToken, json_body, target);
+        json response = futureResponse.get();
+        return ParseAlarmConfigFromJson(response);
+    } catch(const std::exception &e) {
+        log("Error in ParseAlarmConfig: " + std::string(e.what()), LogLevel::ERRORS);
+        return {};
+    }
 }
 
 
@@ -574,71 +582,74 @@ ParseOrgConfig(string host, string port, string bearerToken, string json_body,
 }
 
 
-UserProfile ParseUserProfile(string host, string port, string bearerToken, 
-                            string json_body, string target) {
+UserProfile ParseUserProfileFromJson(const json& response) {
     UserProfile profile; // Default empty profile
 
+    // Check for 'data' field (actual API response format)
+    if(response.contains("data") && response["data"].is_array() && !response["data"].empty()) {
+        const auto &item = response["data"][0]; // Get first user profile
+        
+        try {
+            profile.userId = item.value("userId", 0);
+            profile.displayName = item.value("displayName", "");
+            
+            // Helper lambda to convert number or string to string
+            auto getAsString = [&item](const std::string& key) -> std::string {
+                if(!item.contains(key)) return "";
+                if(item[key].is_number()) return std::to_string(item[key].get<int>());
+                if(item[key].is_string()) return item[key].get<std::string>();
+                return "";
+            };
+            
+            profile.districtId = getAsString("districtId");
+            profile.stateId = getAsString("stateId");
+            profile.countryId = getAsString("countryId");
+            profile.emailId = item.value("emailId", "");
+            profile.defaultLangaugeId = getAsString("defaultLangaugeId");
+            profile.defaultLangauge = item.value("defaultLangauge", "");
+            profile.defaultLangaugeCode = item.value("defaultLangaugeCode", "");
+            profile.currentLangaugeId = getAsString("currentLangaugeId");
+            profile.currentLangauge = item.value("currentLangauge", "");
+            profile.currentLangaugeCode = item.value("currentLangaugeCode", "");
+            profile.defaultOrgId = getAsString("defaultOrgId");
+            profile.defaultOrgName = item.value("defaultOrgName", "");
+            profile.currentOrgId = getAsString("currentOrgId");
+            profile.currentOrgName = item.value("currentOrgName", "");
+            profile.currentOrgProfileId = item.value("currentOrgProfileId", "");
+            profile.currentOrgProductName = item.value("currentOrgProductName", "");
+            profile.currentOrgCode = item.value("currentOrgCode", "");
+            profile.currentOrganisationType = item.value("currentOrganisationType", "");
+            profile.currentOrgLogo = item.value("currentOrgLogo", "");
+            
+            log("✓ Parsed user profile: " + profile.displayName + 
+                " (OrgID: " + profile.currentOrgId + ")", LogLevel::DEBUG);
+        } catch(const std::exception &e) {
+            log("Error parsing user profile item: " + std::string(e.what()),
+                LogLevel::ERRORS);
+        }
+    }
+    else {
+        log("ERROR: No 'data' field found in user profile response or data is empty!",
+            LogLevel::ERRORS);
+    }
+    return profile;
+}
+
+UserProfile ParseUserProfile(string host, string port, string bearerToken, 
+                            string json_body, string target) {
     if(!bearerToken.empty()) {
         try {
             auto futureResponse = std::async(std::launch::async, getResponse,
                                              host, port,
                                              bearerToken, json_body, target);
             json response = futureResponse.get();
+            return ParseUserProfileFromJson(response);
 
-            // Check for 'data' field (actual API response format)
-            if(response.contains("data") && response["data"].is_array() && !response["data"].empty()) {
-                const auto &item = response["data"][0]; // Get first user profile
-                
-                try {
-                    profile.userId = item.value("userId", 0);
-                    profile.displayName = item.value("displayName", "");
-                    
-                    // Helper lambda to convert number or string to string
-                    auto getAsString = [&item](const std::string& key) -> std::string {
-                        if(!item.contains(key)) return "";
-                        if(item[key].is_number()) return std::to_string(item[key].get<int>());
-                        if(item[key].is_string()) return item[key].get<std::string>();
-                        return "";
-                    };
-                    
-                    profile.districtId = getAsString("districtId");
-                    profile.stateId = getAsString("stateId");
-                    profile.countryId = getAsString("countryId");
-                    profile.emailId = item.value("emailId", "");
-                    profile.defaultLangaugeId = getAsString("defaultLangaugeId");
-                    profile.defaultLangauge = item.value("defaultLangauge", "");
-                    profile.defaultLangaugeCode = item.value("defaultLangaugeCode", "");
-                    profile.currentLangaugeId = getAsString("currentLangaugeId");
-                    profile.currentLangauge = item.value("currentLangauge", "");
-                    profile.currentLangaugeCode = item.value("currentLangaugeCode", "");
-                    profile.defaultOrgId = getAsString("defaultOrgId");
-                    profile.defaultOrgName = item.value("defaultOrgName", "");
-                    profile.currentOrgId = getAsString("currentOrgId");
-                    profile.currentOrgName = item.value("currentOrgName", "");
-                    profile.currentOrgProfileId = item.value("currentOrgProfileId", "");
-                    profile.currentOrgProductName = item.value("currentOrgProductName", "");
-                    profile.currentOrgCode = item.value("currentOrgCode", "");
-                    profile.currentOrganisationType = item.value("currentOrganisationType", "");
-                    profile.currentOrgLogo = item.value("currentOrgLogo", "");
-                    
-                    log("✓ Parsed user profile: " + profile.displayName + 
-                        " (OrgID: " + profile.currentOrgId + ")", LogLevel::DEBUG);
-                } catch(const std::exception &e) {
-                    log("Error parsing user profile item: " + std::string(e.what()),
-                        LogLevel::ERRORS);
-                }
-            }
-            else {
-                log("ERROR: No 'data' field found in user profile response or data is empty!",
-                    LogLevel::ERRORS);
-                // log("Response: " + response.dump(), LogLevel::DEBUG);
-            }
         } catch(const std::exception &e) {
             log("Error in ParseUserProfile: " + std::string(e.what()), LogLevel::ERRORS);
         }
     }
-    
-    return profile;
+    return UserProfile(); 
 }
 
 // Assumes `json` is nlohmann::json and types ServerConfig, orgMappings, log, LogLevel exist.

@@ -39,6 +39,7 @@
 #include "AccessControl.h"
 #include "ServerConfig.h"
 #include "ServiceUtils.h"
+#include "RedisClient.h"
 
 #include <async_mqtt/all.hpp>
 #include <async_mqtt/asio_bind/predefined_layer/mqtts.hpp>
@@ -59,25 +60,27 @@
 #include <direct.h>  // For _getcwd
 #endif
 
-// Service Globals
-SERVICE_STATUS g_ServiceStatus;
-SERVICE_STATUS_HANDLE g_StatusHandle;
-
 using namespace std;
 namespace as = boost::asio;
 namespace am = async_mqtt;
 namespace beast = boost::beast;
 using tcp = boost::asio::ip::tcp;
-UA_Boolean running = true;
 
-
+// ============================================================================
 // ------------------GLOBALS----------------------------------------//
+// ============================================================================
+ UA_Boolean running = true;
+
+// Service Globals
+SERVICE_STATUS g_ServiceStatus;
+SERVICE_STATUS_HANDLE g_StatusHandle;
 
 // MQTT Subscription Queue Globals
 std::mutex g_sub_mutex;
-std::vector<std::string> g_subscription_queue;
-std::vector<std::string> g_unsubscription_queue;
-std::set<std::string> g_subscribed_topics;
+std::deque<std::string> g_subscription_queue;
+std::deque<std::string> g_unsubscription_queue;
+std::unordered_set<std::string> g_pending_subscriptions; // Set for O(1) queue lookups
+std::unordered_set<std::string> g_subscribed_topics;
 std::unique_ptr<boost::asio::steady_timer> g_sub_timer;
 
 // Global NodeMap (Topic -> NodeId) for Generic Telemetry
@@ -86,9 +89,7 @@ std::mutex g_nodeMap_mutex;
 std::mutex g_topicMap_mutex;
 std::recursive_mutex g_server_mutex;  // Protects UA_Server API access
 
-// ============================================================================
 // MULTI-TENANCY: Global Session Manager
-// ============================================================================
 SessionManager g_sessionManager;
 
 // Store API credentials and org list globally for worker threads and auth
@@ -100,12 +101,305 @@ static std::string g_authPassword;  // From appsettings.json Authorization secti
 static std::vector<OrgConfig> g_organizations;  // List of all organizations
 static UA_Server *g_server = nullptr;
 
-//-----------------------END---------------------------------------//
+// Define user credentials
+static UA_UsernamePasswordLogin usernamePasswordLogin[2] = {
+    {UA_STRING_STATIC("user1"), UA_STRING_STATIC("password1")},
+    {UA_STRING_STATIC("user2"), UA_STRING_STATIC("password2")}};
+
+// Topic Info Map for Generic Telemetry
+unordered_map<string, TopicInfo> topicMap;
+// ============================================================================
+//-----------------------GLOBALS END---------------------------------------//
+// ============================================================================
+// 
+// ============================================================================
+//-----------------------CallBacks----------------------------//
+// ============================================================================
+// Your custom logger callback
+static void
+myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg,
+      va_list args) {
+
+    try {
+        std::string text;
+
+        // SAFEGUARD: Only use printf formatting for specific Core messages we need to
+        // expand. For everything else, print the raw message to avoid CRT Assertions on
+        // invalid specifiers (e.g. "%N").
+        if(strchr(msg, '%') != nullptr &&
+           strstr(msg, "Adding Condition failed") != nullptr) {
+
+            char buffer[1024];
+// Use _vsnprintf_s on Windows if possible, or standard vsnprintf
+#ifdef _WIN32
+#endif
+            text = std::string(buffer);
+        } else {
+            // Default: strictly literal (safe)
+            text = msg;
+        }
+
+        // Filter out specific noisy logs
+        if(text.find("AddNode: Node could not add") != std::string::npos) {
+            return;
+        }
+        if(text.find("Deleting the MonitoredItem") != std::string::npos) {
+            return;
+        }
+
+        switch(level) {
+            case UA_LOGLEVEL_FATAL:
+                log(text, LogLevel::FATAL);
+                break;
+            case UA_LOGLEVEL_ERROR:
+                log(text, LogLevel::ERRORS);
+                break;
+            case UA_LOGLEVEL_WARNING:
+                log(text, LogLevel::WARNING);
+                break;
+            case UA_LOGLEVEL_INFO:
+                log(text, LogLevel::INFO);
+                break;
+            case UA_LOGLEVEL_DEBUG:
+                // log(text, LogLevel::DEBUG);
+                break;
+            default:
+                break;
+        }
+    } catch(...) {
+        // Swallow all exceptions to avoid unwinding across C boundary
+    }
+}
 
 
+static UA_StatusCode
+myLoginCallback(const UA_String *username, const UA_ByteString *password,
+                size_t usernamePasswordLoginSize,
+                const UA_UsernamePasswordLogin *usernamePasswordLogin,
+                void **sessionContext, void *loginContext) {
+    // Safely convert username to string, avoiding problematic format specifiers
+    std::string usernameStr;
+    if(username && username->data && username->length > 0) {
+        // Ensure we don't exceed buffer bounds
+        size_t maxLen = std::min(username->length, (size_t)255);
+        usernameStr.assign((char *)username->data, maxLen);
+    } else {
+        usernameStr = "unknown";
+    }
 
+    for(size_t i = 0; i < usernamePasswordLoginSize; i++) {
+        if(UA_String_equal(username, &usernamePasswordLogin[i].username) &&
+           UA_ByteString_equal(password, &usernamePasswordLogin[i].password)) {
+            // Grant admin access to user1
+            if(UA_String_equal(username, &usernamePasswordLogin[0].username)) {
+                *sessionContext = (void *)1;  // Mark as admin
+                log("Admin user login successful: " + usernameStr, LogLevel::INFO);
+            } else {
+                log("Regular user login successful: " + usernameStr, LogLevel::INFO);
+            }
+            return UA_STATUSCODE_GOOD;
+        }
+    }
+
+    log("Login failed for user: " + usernameStr, LogLevel::ERRORS);
+    UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Login failed for user: %s",
+                   usernameStr.c_str());
+    return UA_STATUSCODE_BADUSERACCESSDENIED;
+}
+
+// ============================================================================
+// MULTI-TENANCY: Custom Access Control Session Activation
+// ============================================================================
+// This callback is invoked when a new session is activated (client connects).
+// We extract the user's credentials, authenticate via API, get their orgId,
+// and route them to the appropriate worker thread.
+// ============================================================================
+static UA_StatusCode
+customActivateSession(UA_Server *server, UA_AccessControl *ac,
+                      const UA_EndpointDescription *endpointDescription,
+                      const UA_ByteString *secureChannelRemoteCertificate,
+                      const UA_NodeId *sessionId,
+                      const UA_ExtensionObject *userIdentityToken,
+                      void **sessionContext) {
+
+    // ========================================================================
+    // STEP 1: Extract Username and Password
+    // ========================================================================
+    std::string username;
+    std::string password;
+    bool isAnonymous = true;
+
+    if(userIdentityToken && userIdentityToken->encoding == UA_EXTENSIONOBJECT_DECODED) {
+        if(userIdentityToken->content.decoded.type ==
+           &UA_TYPES[UA_TYPES_USERNAMEIDENTITYTOKEN]) {
+            UA_UserNameIdentityToken *token =
+                (UA_UserNameIdentityToken *)userIdentityToken->content.decoded.data;
+
+            if(token->userName.data && token->userName.length > 0) {
+                username =
+                    std::string((char *)token->userName.data, token->userName.length);
+                isAnonymous = false;
+            }
+
+            if(token->password.data && token->password.length > 0) {
+                password =
+                    std::string((char *)token->password.data, token->password.length);
+            }
+        }
+    }
+
+    // Handle anonymous login - DISABLED
+    if(isAnonymous) {
+        log("❌ Anonymous login detected and rejected", LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    } else {
+        log("  User: " + username, LogLevel::INFO);
+    }
+
+    if(username.empty() || password.empty()) {
+        log("❌ Missing credentials", LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+
+    // Encrypt password for API authentication (ONLY for user credentials, not
+    // appsettings)
+    std::string finalPassword = password;
+    if(!isAnonymous) {
+        finalPassword = GetEncryptedString("", password, 0);
+        log("DEBUG: Encrypted Password for user '" + username + "': " + finalPassword,
+            LogLevel::INFO);
+    }
+
+    // ========================================================================
+    // STEP 2: Get Bearer Token
+    // ========================================================================
+    json tokenResponse;
+    try {
+        tokenResponse = getBearerToken(g_apiHost, g_apiPort, username, finalPassword);
+    } catch(const std::exception &e) {
+        log("❌ Bearer token request failed: " + std::string(e.what()), LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+
+    if(!tokenResponse.contains("access_token")) {
+        log("❌ No access_token in response", LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+
+    std::string bearerToken = tokenResponse["access_token"].get<std::string>();
+    log("✓ Bearer token acquired", LogLevel::DEBUG);
+
+    // ========================================================================
+    // STEP 3: Get User Profile to Extract OrgID
+    // ========================================================================
+    UserProfile profile;
+    try {
+        std::string json_body = "{}";
+        std::string cacheKey = "USER_PROFILE_" + username;
+        nlohmann::ordered_json profileJson;
+        bool cacheHit = false;
+
+        if(true) { 
+             auto start_time = std::chrono::steady_clock::now();
+             auto cachedVal = g_redisClient.get(cacheKey);
+             auto end_time = std::chrono::steady_clock::now();
+             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+             if(cachedVal) {
+                 try {
+                     profileJson = nlohmann::ordered_json::parse(*cachedVal);
+                     profile = ParseUserProfileFromJson(profileJson);
+                     cacheHit = true;
+                     log("⚡ Redis Cache HIT for UserProfile (User: " + username + ") - Fetched in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
+                 } catch(const std::exception& e) {
+                      log("⚠️ Redis Cache Parse Error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
+                 }
+             } else {
+                 if(g_redisClient.isConnected())
+                    log("📉 Redis Cache MISS for UserProfile (User: " + username + ") - Checked in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
+             }
+        }
+
+        if(!cacheHit) {
+             auto futureResponse = std::async(std::launch::async, getResponse,
+                                             g_apiHost, g_apiPort, bearerToken, json_body, "/api/GetUserProfile");
+             
+             // We can wait responsive or just block here as this is connection phase
+             profileJson = futureResponse.get();
+             
+             // Store in Redis (TTL 10 mins)
+             g_redisClient.set(cacheKey, profileJson.dump(), 600);
+             
+             profile = ParseUserProfileFromJson(profileJson);
+        }
+
+    } catch(const std::exception &e) {
+        log("❌ User profile request failed: " + std::string(e.what()), LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+
+    if(profile.currentOrgId.empty()) {
+        log("❌ No currentOrgId in user profile", LogLevel::ERRORS);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+
+    log("✓ User profile: " + profile.displayName + " (OrgID: " + profile.currentOrgId +
+            ", Org: " + profile.currentOrgName + ")",
+        LogLevel::INFO);
+
+    // ========================================================================
+    // STEP 4: Find Matching Organization Config
+    // ========================================================================
+    OrgConfig *targetOrg = nullptr;
+
+    for(auto &org : g_organizations) {
+
+        if(std::to_string(org.orgId) == profile.currentOrgId) {
+            targetOrg = &org;
+            break;
+        }
+    }
+
+    if(!targetOrg) {
+        log("❌ Organization not found for OrgID: " + profile.currentOrgId,
+            LogLevel::ERRORS);
+        log("  Available orgs: " + std::to_string(g_organizations.size()),
+            LogLevel::DEBUG);
+        return UA_STATUSCODE_BADUSERACCESSDENIED;
+    }
+
+    // ========================================================================
+    // STEP 5: Create or Join Worker Thread for This Org
+    // ========================================================================
+    bool registered = g_sessionManager.registerSession(
+        *sessionId, targetOrg->shortCode, server,
+        bearerToken,  // Use user's token, not server's admin token
+        g_apiHost, g_apiPort);
+
+    if(!registered) {
+        log("❌ Failed to register session for org: " + targetOrg->shortCode,
+            LogLevel::ERRORS);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    log("✅ Session activated for user '" + username + "' → Org '" +
+            targetOrg->shortCode + "' (Active sessions: " +
+            std::to_string(g_sessionManager.getActiveSessionCount()) + ")",
+        LogLevel::INFO);
+
+    // TODO: Store user profile for future RBAC implementation
+    // Can add to sessionContext: *sessionContext = new UserProfile(profile);
+
+    return UA_STATUSCODE_GOOD;
+}
+
+// ============================================================================
+//----------------------- CallBacks END----------------------------//
+// ============================================================================
+
+// ============================================================================
 //----------------------HELPER------------------//
-
+// ============================================================================
 // Helper to spawn a child server instance with configuration passed via Stdin
 void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config, const std::string& bearerToken, bool headless, HANDLE hJob) {
     // 0. Get Absolute Path of Self (Robust against CWD changes)
@@ -201,11 +495,14 @@ void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config
     log("✓ Spawned Child Instance for '" + config.name + "' (PID: " + std::to_string(pi.dwProcessId) + ")", LogLevel::INFO);
 
     // 7. Assign to Job Object (Auto-termination on parent exit)
+    // DISABLED per user request: Child should survive parent exit
+    /* 
     if (hJob != NULL) {
         if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
             log("SpawnChild: AssignProcessToJobObject failed (" + std::to_string(GetLastError()) + ")", LogLevel::ERRORS);
         }
     }
+    */
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
@@ -232,290 +529,8 @@ extractShortCodeFromEndpoint(const UA_String *endpointUrl) {
 
     return "";  // No path component found
 }
-//----------------------END------------------//
 
 
-
-
-
-/*
- * Session Open Callback - DISABLED
- * NOTE: UA_Server_getSessionParameter doesn't exist in open62541 v1.3
- * Session management will be implemented via lazy initialization instead
- */
-// ============================================================================
-// MULTI-TENANCY: Custom Access Control Session Activation
-// ============================================================================
-// This callback is invoked when a new session is activated (client connects).
-// We extract the user's credentials, authenticate via API, get their orgId,
-// and route them to the appropriate worker thread.
-// ============================================================================
-static UA_StatusCode 
-customActivateSession(UA_Server *server,
-                     UA_AccessControl *ac,
-                     const UA_EndpointDescription *endpointDescription,
-                     const UA_ByteString *secureChannelRemoteCertificate,
-                     const UA_NodeId *sessionId,
-                     const UA_ExtensionObject *userIdentityToken,
-                     void **sessionContext) {
-    
-    log("🔑 [ACCESS CONTROL] customActivateSession called!", LogLevel::INFO);
-    
-    // ========================================================================
-    // STEP 1: Extract Username and Password
-    // ========================================================================
-    std::string username;
-    std::string password;
-    bool isAnonymous = true;
-    
-    if(userIdentityToken && userIdentityToken->encoding == UA_EXTENSIONOBJECT_DECODED) {
-        if(userIdentityToken->content.decoded.type == &UA_TYPES[UA_TYPES_USERNAMEIDENTITYTOKEN]) {
-            UA_UserNameIdentityToken *token = 
-                (UA_UserNameIdentityToken*)userIdentityToken->content.decoded.data;
-            
-            if(token->userName.data && token->userName.length > 0) {
-                username = std::string((char*)token->userName.data, token->userName.length);
-                isAnonymous = false;
-            }
-            
-            if(token->password.data && token->password.length > 0) {
-                password = std::string((char*)token->password.data, token->password.length);
-            }
-        }
-    }
-    
-    // Handle anonymous login - DISABLED
-    if(isAnonymous) {
-        log("❌ Anonymous login detected and rejected", LogLevel::ERRORS);
-        return UA_STATUSCODE_BADUSERACCESSDENIED;
-    } else {
-        log("  User: " + username, LogLevel::INFO);
-    }
-    
-    if(username.empty() || password.empty()) {
-        log("❌ Missing credentials", LogLevel::ERRORS);
-        return UA_STATUSCODE_BADUSERACCESSDENIED;
-    }
-
-    // Encrypt password for API authentication (ONLY for user credentials, not appsettings)
-    std::string finalPassword = password;
-    if(!isAnonymous) {
-        finalPassword = GetEncryptedString("", password, 0);
-        log("DEBUG: Encrypted Password for user '" + username + "': " + finalPassword, LogLevel::INFO);
-    }
-    
-    // ========================================================================
-    // STEP 2: Get Bearer Token
-    // ========================================================================
-    json tokenResponse;
-    try {
-        tokenResponse = getBearerToken(g_apiHost, g_apiPort, username, finalPassword);
-    } catch(const std::exception &e) {
-        log("❌ Bearer token request failed: " + std::string(e.what()), LogLevel::ERRORS);
-        return UA_STATUSCODE_BADUSERACCESSDENIED;
-    }
-    
-    if(!tokenResponse.contains("access_token")) {
-        log("❌ No access_token in response", LogLevel::ERRORS);
-        return UA_STATUSCODE_BADUSERACCESSDENIED;
-    }
-    
-    std::string bearerToken = tokenResponse["access_token"].get<std::string>();
-    log("✓ Bearer token acquired", LogLevel::DEBUG);
-    
-    // ========================================================================
-    // STEP 3: Get User Profile to Extract OrgID
-    // ========================================================================
-    UserProfile profile;
-    try {
-        std::string json_body = "{}"; // Empty payload
-        profile = ParseUserProfile(g_apiHost, g_apiPort, 
-                                  bearerToken, json_body, "/api/GetUserProfile");
-    } catch(const std::exception &e) {
-        log("❌ User profile request failed: " + std::string(e.what()), LogLevel::ERRORS);
-        return UA_STATUSCODE_BADUSERACCESSDENIED;
-    }
-    
-    if(profile.currentOrgId.empty()) {
-        log("❌ No currentOrgId in user profile", LogLevel::ERRORS);
-        return UA_STATUSCODE_BADUSERACCESSDENIED;
-    }
-    
-    log("✓ User profile: " + profile.displayName + " (OrgID: " + profile.currentOrgId + 
-        ", Org: " + profile.currentOrgName + ")", LogLevel::INFO);
-    
-    // ========================================================================
-    // STEP 4: Find Matching Organization Config
-    // ========================================================================
-    OrgConfig* targetOrg = nullptr;
-    
-    for(auto &org : g_organizations) {
-        // Fix: Compare profile.currentOrgId with org.orgId (the business ID), NOT org.id (the mapping primary key)
-        if(std::to_string(org.orgId) == profile.currentOrgId) {
-            targetOrg = &org;
-            break;
-        }
-    }
-    
-    if(!targetOrg) {
-        log("❌ Organization not found for OrgID: " + profile.currentOrgId, LogLevel::ERRORS);
-        log("  Available orgs: " + std::to_string(g_organizations.size()), LogLevel::DEBUG);
-        return UA_STATUSCODE_BADUSERACCESSDENIED;
-    }
-    
-    log("✓ Matched to organization: " + targetOrg->shortCode + 
-        " (ID: " + std::to_string(targetOrg->id) + ")", LogLevel::INFO);
-    
-    // ========================================================================
-    // STEP 5: Create or Join Worker Thread for This Org
-    // ========================================================================
-    bool registered = g_sessionManager.registerSession(
-        *sessionId,
-        targetOrg->shortCode,
-        server,
-        bearerToken,  // Use user's token, not server's admin token
-        g_apiHost,
-        g_apiPort
-    );
-    
-    if(!registered) {
-        log("❌ Failed to register session for org: " + targetOrg->shortCode, LogLevel::ERRORS);
-        return UA_STATUSCODE_BADINTERNALERROR;
-    }
-    
-    log("✅ Session activated for user '" + username + "' → Org '" + targetOrg->shortCode + 
-        "' (Active sessions: " + std::to_string(g_sessionManager.getActiveSessionCount()) + ")",
-        LogLevel::INFO);
-    
-    // TODO: Store user profile for future RBAC implementation
-    // Can add to sessionContext: *sessionContext = new UserProfile(profile);
-    
-    return UA_STATUSCODE_GOOD;
-}
-
-// ============================================================================
-// MULTI-TENANCY: Custom Session Close Callback
-// ============================================================================
-//  Signature matches open62541 v1.4.11 accesscontrol.h line 55-56
-// ============================================================================
-static void
-customCloseSession(UA_Server *server,
-                  UA_AccessControl *ac,
-                  const UA_NodeId *sessionId,
-                  void *sessionContext) {
-    
-    log("🔓 Session closing...", LogLevel::INFO);
-    
-    // Unregister session and cleanup worker thread
-    g_sessionManager.unregisterSession(*sessionId);
-    
-    log("  ✓ Session closed (Active sessions: " + 
-        std::to_string(g_sessionManager.getActiveSessionCount()) + ")", LogLevel::INFO);
-}
-
-// ============================================================================
-// Original session callbacks (COMMENTED OUT - using Access Control instead)
-// ===========================================================================
-
-// Define user credentials
-static UA_UsernamePasswordLogin usernamePasswordLogin[2] = {
-    {UA_STRING_STATIC("user1"), UA_STRING_STATIC("password1")},
-    {UA_STRING_STATIC("user2"), UA_STRING_STATIC("password2")}};
-
-
-
-// Your custom logger callback
-static void
-myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg,
-      va_list args) {
-
-    // Early optimization: Ignore DEBUG logs completely 
-    if(level == UA_LOGLEVEL_DEBUG) return;
-
-    try {
-        std::string text;
-        
-        // SAFEGUARD: Only use printf formatting for specific Core messages we need to expand.
-        // For everything else, print the raw message to avoid CRT Assertions on invalid specifiers (e.g. "%N").
-        if(strchr(msg, '%') != nullptr && 
-           strstr(msg, "Adding Condition failed") != nullptr) {
-            
-            char buffer[1024];
-            // Use _vsnprintf_s on Windows if possible, or standard vsnprintf
-            #ifdef _WIN32
-            #endif
-            text = std::string(buffer);
-        } else {
-            // Default: strictly literal (safe)
-            text = msg;
-        }
-
-        // Filter out specific noisy logs
-        if (text.find("AddNode: Node could not add") != std::string::npos) {
-             return;
-        }
-        if (text.find("Deleting the MonitoredItem") != std::string::npos) {
-             return;
-        }
-        
-        switch(level) {
-            case UA_LOGLEVEL_FATAL:
-                log(text, LogLevel::FATAL);
-                break;
-            case UA_LOGLEVEL_ERROR:
-                log(text, LogLevel::ERRORS);
-                break;
-            case UA_LOGLEVEL_WARNING:
-                log(text, LogLevel::WARNING);
-                break;
-            case UA_LOGLEVEL_INFO:
-                log(text, LogLevel::INFO);
-                break;
-            default:
-                break;
-        }
-    } catch(...) {
-        // Swallow all exceptions to avoid unwinding across C boundary
-    }
-}
-
-// Custom logger plugin
-static UA_Logger myLogger = {myLog, nullptr, nullptr};
-
-static UA_StatusCode
-myLoginCallback(const UA_String *username, const UA_ByteString *password,
-                size_t usernamePasswordLoginSize,
-                const UA_UsernamePasswordLogin *usernamePasswordLogin,
-                void **sessionContext, void *loginContext) {
-    // Safely convert username to string, avoiding problematic format specifiers
-    std::string usernameStr;
-    if(username && username->data && username->length > 0) {
-        // Ensure we don't exceed buffer bounds
-        size_t maxLen = std::min(username->length, (size_t)255);
-        usernameStr.assign((char *)username->data, maxLen);
-    } else {
-        usernameStr = "unknown";
-    }
-
-    for(size_t i = 0; i < usernamePasswordLoginSize; i++) {
-        if(UA_String_equal(username, &usernamePasswordLogin[i].username) &&
-           UA_ByteString_equal(password, &usernamePasswordLogin[i].password)) {
-            // Grant admin access to user1
-            if(UA_String_equal(username, &usernamePasswordLogin[0].username)) {
-                *sessionContext = (void *)1;  // Mark as admin
-                log("Admin user login successful: " + usernameStr, LogLevel::INFO);
-            } else {
-                log("Regular user login successful: " + usernameStr, LogLevel::INFO);
-            }
-            return UA_STATUSCODE_GOOD;
-        }
-    }
-
-    log("Login failed for user: " + usernameStr, LogLevel::ERRORS);
-    UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Login failed for user: %s",
-                   usernameStr.c_str());
-    return UA_STATUSCODE_BADUSERACCESSDENIED;
-}
 
 static void
 stopHandler(int sign) {
@@ -606,9 +621,7 @@ loadCertsFromDirectory(const char *dirPath, UA_ByteString **certs) {
 }
 #endif
 
-// TopicInfo struct moved to AandC.h to be shared with SessionWorker
 
-unordered_map<string, TopicInfo> topicMap;
 
 vector<string>
 split(const string &s, char delimiter) {
@@ -640,6 +653,64 @@ getOrCreateFolder(UA_Server *server, const string &path, const string &name,
     return nodeId;
 }
 
+
+/* Helper to format NodeId as string (e.g., "ns=1;i=12345") */
+static std::string
+formatNodeId(const UA_NodeId *nodeId) {
+    if(!nodeId || UA_NodeId_isNull(nodeId))
+        return "";
+    char buf[256];
+    if(nodeId->identifierType == UA_NODEIDTYPE_NUMERIC) {
+        snprintf(buf, sizeof(buf), "ns=%u;i=%u", nodeId->namespaceIndex,
+                 nodeId->identifier.numeric);
+    } else if(nodeId->identifierType == UA_NODEIDTYPE_STRING) {
+        std::string str((char *)nodeId->identifier.string.data,
+                        nodeId->identifier.string.length);
+        snprintf(buf, sizeof(buf), "ns=%u;s=%s", nodeId->namespaceIndex, str.c_str());
+    } else if(nodeId->identifierType == UA_NODEIDTYPE_GUID) {
+        snprintf(buf, sizeof(buf), "ns=%u;g=...", nodeId->namespaceIndex);
+    } else if(nodeId->identifierType == UA_NODEIDTYPE_BYTESTRING) {
+        snprintf(buf, sizeof(buf), "ns=%u;b=...", nodeId->namespaceIndex);
+    } else {
+        return "";
+    }
+    return std::string(buf);
+}
+
+// ============================================================================
+// MULTI-TENANCY: Custom Session Close Callback
+// ============================================================================
+
+static void
+customCloseSession(UA_Server *server, UA_AccessControl *ac, const UA_NodeId *sessionId,
+                   void *sessionContext) {
+
+    log("🔓 Session closing...", LogLevel::INFO);
+
+    // Unregister session and cleanup worker thread
+    g_sessionManager.unregisterSession(*sessionId);
+
+    log("  ✓ Session closed (Active sessions: " +
+            std::to_string(g_sessionManager.getActiveSessionCount()) + ")",
+        LogLevel::INFO);
+}
+
+
+// ============================================================================
+//---------------------- HELPER END------------------//
+// ============================================================================
+
+
+
+
+
+
+// Custom logger plugin
+static UA_Logger myLogger = {myLog, nullptr, nullptr};
+
+
+
+//---------------- MQTT PUBLISHER GLOBALS AND HELPERS ---------------- //
 as::io_context ioc;
 using client_t = am::client<am::protocol_version::v5, am::protocol::mqtt>;
 client_t amcl{ioc.get_executor()};
@@ -702,45 +773,6 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
 // --------------------------------------------------------------------------------------------
 
 
-
-// Define a structure to hold method callback context
-// struct MethodCallbackContext {
-//     UA_NodeId ackedStateNodeId;
-//     MonitoredNodeAlarmInfo *alarmInfo;
-// };
-
-/* Lightweight context for on-the-fly alarms to publish MQTT on Ack/Confirm */
-
-/* Helper to format NodeId as string (e.g., "ns=1;i=12345") */
-static std::string
-formatNodeId(const UA_NodeId *nodeId) {
-    if(!nodeId || UA_NodeId_isNull(nodeId))
-        return "";
-    char buf[256];
-    if(nodeId->identifierType == UA_NODEIDTYPE_NUMERIC) {
-        snprintf(buf, sizeof(buf), "ns=%u;i=%u", nodeId->namespaceIndex,
-                 nodeId->identifier.numeric);
-    } else if(nodeId->identifierType == UA_NODEIDTYPE_STRING) {
-        std::string str((char *)nodeId->identifier.string.data,
-                        nodeId->identifier.string.length);
-        snprintf(buf, sizeof(buf), "ns=%u;s=%s", nodeId->namespaceIndex, str.c_str());
-    } else if(nodeId->identifierType == UA_NODEIDTYPE_GUID) {
-        snprintf(buf, sizeof(buf), "ns=%u;g=...", nodeId->namespaceIndex);
-    } else if(nodeId->identifierType == UA_NODEIDTYPE_BYTESTRING) {
-        snprintf(buf, sizeof(buf), "ns=%u;b=...", nodeId->namespaceIndex);
-    } else {
-        return "";
-    }
-    return std::string(buf);
-}
-
-
-
-
-
-
-
-
 // Write callback for OPC UA node value changes
 void
 writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
@@ -799,30 +831,7 @@ writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
         }
 
         // Generate ISO 8601 Timestamp with 100ns precision (High Resolution)
-        {
-            //auto now = std::chrono::system_clock::now();
-            //std::time_t t = std::chrono::system_clock::to_time_t(now);
-            //std::tm tm_buf;
-            //#if defined(_WIN32)
-            //    localtime_s(&tm_buf, &t);
-            //#else
-            //    localtime_r(&tm_buf, &t);
-            //#endif
-            //
-            //// Calculate fractional seconds (100ns precision)
-            //auto duration = now.time_since_epoch();
-            //auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
-            //auto fractional = duration - seconds;
-            //long long fractional_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(fractional).count();
-
-            //char tsBuf[64];
-            //std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
-            //
-            //// Append fractional (7 digits) and Offset (+05:30)
-            //char finalBuf[128];
-            //// fractional_ns is nanoseconds (9 digits), we want 100ns (7 digits)
-            //snprintf(finalBuf, sizeof(finalBuf), "%s.%07lld+05:30", tsBuf, fractional_ns / 100);
-            
+        {            
             auto now = getPreciseTimestamp();
 
             dataPoint["TimeStamp"] = std::string(now);
@@ -873,45 +882,37 @@ std::string getConditionEventId(UA_Server *server, UA_NodeId alarmId) {
 }
 
 
-
-/* ============================================================================
- * HELPER: Perform Disable (OPC UA Compliant)
- * ============================================================================
- * When alarm is disabled via MQTT, this function:
- * - Clears all branches from memory (g_branchStates)
- * - Sets ActiveState/Retain to false
- * - Keeps EnabledState as already set by caller
- * - Clears BranchId
- * - Triggers final disable event for client notification
- */
-
-
 // ============================================================================
 // MQTT Subscription Serialization
 // ============================================================================
 // We must serialize subscription requests to avoid concurrent writes to the socket
 // and potentially overloading the client or hitting race conditions.
-// Forward declarations
-void process_queue_signal();
+
+void process_queue_signal();// Forward declaration
 
 void queue_subscription(const std::string &topic) {
     if(topic.empty()) return;
     
     std::lock_guard<std::mutex> lock(g_sub_mutex);
 
+    // OPTIMIZATION: Check pending unsubscription
+    auto jt = std::find(g_unsubscription_queue.begin(), g_unsubscription_queue.end(), topic);
+    if(jt != g_unsubscription_queue.end()) {
+        g_unsubscription_queue.erase(jt);
+        g_subscribed_topics.insert(topic);
+        return;
+    }
+
     // Check if already subscribed to avoid unnecessary queueing
     if(g_subscribed_topics.find(topic) != g_subscribed_topics.end()) {
-        // log("DEBUG: Already subscribed to '" + topic + "'", LogLevel::INFO);
         return;
     }
     
-    // Check if already in queue to avoid duplicates
-    if(std::find(g_subscription_queue.begin(), g_subscription_queue.end(), topic) != g_subscription_queue.end()) {
-        // log("DEBUG: Already queued '" + topic + "'", LogLevel::INFO);
-        return;
+    // Check if already in queue (O(1))
+    // If not pending, insert into set and push to queue.
+    if(g_pending_subscriptions.insert(topic).second) {
+         g_subscription_queue.push_back(topic);
     }
-    
-    g_subscription_queue.push_back(topic);
     
     // Trigger processing by signalling the main loop
     process_queue_signal();
@@ -920,28 +921,34 @@ void queue_subscription(const std::string &topic) {
 
 // Helper to subscribe to a single topic dynamically
 void GlobalMQTT_Subscribe(const std::string &topic) {
-    // FIXED: Removed connection check to allow offline queuing
+   
     queue_subscription(topic);
 }
-
 // Helper to subscribe to manual batch
 void GlobalMQTT_SubscribeBatch(const std::vector<std::string> &topics) {
     if(topics.empty()) return;
     
     std::lock_guard<std::mutex> lock(g_sub_mutex);
     for(const auto& topic : topics) {
+        // OPTIMIZATION: Check if topic is currently pending unsubscription
+        // If so, just cancel the unsubscription and mark it as subscribed again.
+        // This prevents the "Unsubscribe -> Subscribe" churn during session restart.
+        auto unsubIt = std::find(g_unsubscription_queue.begin(), g_unsubscription_queue.end(), topic);
+        if(unsubIt != g_unsubscription_queue.end()) {
+             g_unsubscription_queue.erase(unsubIt);
+             g_subscribed_topics.insert(topic);
+             continue; // Skip adding to subscription queue
+        }
+
+        // OPTIMIZATION (O(1)): Check if already pending subscription
+        if(g_pending_subscriptions.contains(topic)) {
+            continue;
+        }
+
         if(g_subscribed_topics.find(topic) == g_subscribed_topics.end()) {
-             // Only add if not already tracked
-             // Deduplicate against queue?
-             // queue_subscription handles queue dedup but we bypass it here for batch insertion
-             // to avoid N lock acquisitions.
-             
-             // Check queue manually? No, just push back. perform_subscriptions handles duplicates gracefully?
-             // Actually, queue_subscription logic checks queue presence.
-             // We should replicate that or just accept some duplicates (perform_subscriptions will coalesce?)
-             
-             // Simplest: Just push all. Subscribing twice is harmless (idempotent).
+             // Not subscribed and not pending -> Add to queue
              g_subscription_queue.push_back(topic);
+             g_pending_subscriptions.insert(topic);
         }
     }
     
@@ -986,12 +993,49 @@ void queue_unsubscription(const std::string &topic) {
 
 // Helper to unsubscribe from manual batch
 // Optimizes locking by taking lock once for all topics
+// Helper to unsubscribe from manual batch
+// Optimizes locking by taking lock once for all topics
 void GlobalMQTT_UnsubscribeBatch(const std::vector<std::string> &topics) {
     if(topics.empty()) return;
 
+    std::lock_guard<std::mutex> lock(g_sub_mutex);
+    
+    // We use a temporary vector to collect topics that actually need an UNSUBSCRIBE packet
+    // i.e., they were NOT just cancelled from the subscription queue
+    std::vector<std::string> real_unsubs;
+    real_unsubs.reserve(topics.size());
+
     for(const auto& topic : topics) {
-        queue_unsubscription(topic);
+        if(topic.empty()) continue;
+
+        // 1. Check SUBSCRIPTION QUEUE (Cancellation Optimization)
+        // If it's waiting to be subscribed, just remove it.
+        // O(1) Optimization: Check pending set
+        if(g_pending_subscriptions.erase(topic)) {
+            // We removed it from the authoritative set.
+            // It remains in the deque (Zombie), but perform_subscriptions will ignore it.
+            continue;
+        }
+
+        // 2. Check SUBSCRIBED SET
+        auto it = g_subscribed_topics.find(topic);
+        if(it != g_subscribed_topics.end()) {
+            // It IS subscribed. We must send UNSUBSCRIBE.
+            // Check if already in unsubscription queue to prevent dupes
+            if(std::find(g_unsubscription_queue.begin(), g_unsubscription_queue.end(), topic) == g_unsubscription_queue.end()) {
+                 g_unsubscription_queue.push_back(topic);
+                 // Remove from local tracking immediately
+                 g_subscribed_topics.erase(it);
+            }
+        } 
+        
+        // 3. What if it's "In Flight"? (Not in Queue, Not in Set)
+        // We can't easily detect this. We skip it.
+        // If it eventually connects, it will be a "Zombie" subscription.
+        // Ideally we would track "In Flight".
     }
+    
+    process_queue_signal();
 }
 
 // Helper to unsubscribe from a single topic dynamically
@@ -1019,111 +1063,133 @@ void process_queue_signal() {
 
 // Subscribe logic moves inside the loop controller
 as::awaitable<void> perform_subscriptions() {
-    // log("DEBUG: perform_subscriptions called", LogLevel::INFO);
+    // Safety: Do not attempt to send packets if not connected
+    if(!g_mqtt_connected.load()) {
+        co_return; // Exit coroutine immediately
+    }
     
-    // 1. Process Unsubscriptions First
+    constexpr size_t MAX_BATCH = 2000;
+
+    /* ============================================================
+     * 1. Process UNSUBSCRIPTIONS first
+     * ============================================================ */
     std::vector<std::string> unsub_batch;
+    unsub_batch.reserve(MAX_BATCH * 2);
+
     {
         std::lock_guard<std::mutex> lock(g_sub_mutex);
         size_t count = 0;
-        while(!g_unsubscription_queue.empty() && count < 50) {
-            unsub_batch.push_back(g_unsubscription_queue.front());
-            g_unsubscription_queue.erase(g_unsubscription_queue.begin());
-            count++;
+
+        while(!g_unsubscription_queue.empty() && count < MAX_BATCH) {
+            const std::string topic = std::move(g_unsubscription_queue.front());
+            g_unsubscription_queue.pop_front();
+
+            // Only unsubscribe topics we actually subscribed to
+            if(g_subscribed_topics.erase(topic)) {
+                unsub_batch.emplace_back(topic);
+            }
+
+            const std::string event_topic = topic + "/Event";
+            if(g_subscribed_topics.erase(event_topic)) {
+                unsub_batch.emplace_back(event_topic);
+            }
+
+            ++count;
         }
     }
-    
+
     if(!unsub_batch.empty()) {
         try {
-             // For Unsubscribe, we also need to include the /Event topics if they were alarm triggers
-             // But wait, the SessionWorker only knows the base topic. 
-             // We tracked 'topic' and 'topic/Event' in global set ONLY if we added them.
-             // But g_subscribed_topics only stores strings.
-             // If we subscribed to 'topic' and 'topic/Event', unsubscription usually comes with just 'topic' from the SessionWorker list.
-             // We need to mirror the logic: if topic was in triggerMap, we unsub 'topic/Event' too.
-             // PROBLEM: We cleaned up triggerMap BEFORE calling unsubscribe in SessionWorker.
-             // So we don't know if it was an alarm trigger anymore.
-             
-             // CORRECTION: SessionWorker removes from triggerMap AND calls unsubscribe.
-             // Ideally we should just unsubscribe from exactly what limits we want.
-             // If we just unsub 'topic', 'topic/Event' keeps flowing. This is bad.
-             
-             // PROPOSAL: Always try to unsubscribe 'topic/Event' as well just in case?
-             // Or rely on the fact that if we aren't tracking it, who cares? 
-             // Broker cares.
-             // Let's being heuristic: Unsubscribe both 'topic' and 'topic/Event' to be safe. 
-             // The broker will ignore if not subscribed.
-             
-             // Convert strings to async_mqtt topic type
-             std::vector<am::topic_sharename> final_unsub_list;
-             final_unsub_list.reserve(unsub_batch.size() * 2);
+            std::vector<am::topic_sharename> final_unsub;
+            final_unsub.reserve(unsub_batch.size());
 
-             for(const auto& t : unsub_batch) {
-                 final_unsub_list.emplace_back(t);
-                 final_unsub_list.emplace_back(t + "/Event"); 
-             }
-             
-             auto unsuback_opt = co_await amcl.async_unsubscribe(
+            for(const auto &t : unsub_batch) {
+                final_unsub.emplace_back(t);
+            }
+
+            auto unsuback = co_await amcl.async_unsubscribe(
                 am::v5::unsubscribe_packet{*amcl.acquire_unique_packet_id(),
-                                         am::force_move(final_unsub_list)},
+                                           am::force_move(final_unsub)},
                 as::use_awaitable);
-                
-             if(unsuback_opt) {
-                log("✓ Unsubscribed from batch of " + std::to_string(unsub_batch.size()) + " topics (incl. Events)", LogLevel::INFO);
-             }
-             
-        } catch(const std::exception& e) {
-             log("ERROR: Unsubscription batch failed: " + std::string(e.what()), LogLevel::ERRORS);
+
+            if(unsuback) {
+                log("✓ Unsubscribed from " + std::to_string(unsub_batch.size()) +
+                        " topics",
+                    LogLevel::INFO);
+            }
+
+        } catch(const std::exception &e) {
+            log("ERROR: Unsubscription batch failed: " + std::string(e.what()),
+                LogLevel::ERRORS);
         }
     }
 
-    // 2. Process Subscriptions
-    std::vector<std::string> batch;
+
+    /* ============================================================
+     * 2. Process SUBSCRIPTIONS
+     * ============================================================ */
+    std::vector<std::string> sub_batch;
+    sub_batch.reserve(MAX_BATCH);
+
     {
         std::lock_guard<std::mutex> lock(g_sub_mutex);
         size_t count = 0;
-        while(!g_subscription_queue.empty() && count < 50) {
-            batch.push_back(g_subscription_queue.front());
-            g_subscription_queue.erase(g_subscription_queue.begin());
-            count++;
+
+        while(!g_subscription_queue.empty() && count < MAX_BATCH) {
+            std::string topic = std::move(g_subscription_queue.front());
+            g_subscription_queue.pop_front();
+            
+            // O(1) Check: Is it still pending?
+            if(g_pending_subscriptions.erase(topic) > 0) {
+                 sub_batch.emplace_back(std::move(topic));
+                 ++count;
+            }
+            // Else: It was cancelled (removed from set), so we drop it (Zombie).
         }
     }
 
-    if(batch.empty()) {
-        if(unsub_batch.empty()) {
-             // log("DEBUG: perform_subscriptions called but both batches empty", LogLevel::INFO);
-        }
+    if(sub_batch.empty()) {
         co_return;
     }
 
-    std::vector<am::topic_subopts> sub_entry;
+    std::vector<am::topic_subopts> sub_entries;
+    sub_entries.reserve(sub_batch.size() * 2);
+
     {
         std::lock_guard<std::mutex> alarmLock(g_alarmMutex);
-        for(const auto& topic : batch) {
-            sub_entry.push_back({topic, am::qos::at_most_once}); // Generic / Base Telemetry
 
-            // Only subscribe to /Event if this topic is a registered Alarm Trigger
-            if(g_triggerToAlarmMap.find(topic) != g_triggerToAlarmMap.end()) {
-                sub_entry.push_back({topic + "/Event", am::qos::at_most_once});
-                log("DEBUG: Preparing ALARM subscription for '" + topic + "/Event'", LogLevel::INFO);
+        for(const auto &topic : sub_batch) {
+            sub_entries.emplace_back(topic, am::qos::at_most_once);
+
+            // Subscribe to /Event ONLY if this topic is an alarm trigger
+            if(g_triggerToAlarmMap.contains(topic)) {
+                sub_entries.emplace_back(topic + "/Event", am::qos::at_most_once);
             }
         }
     }
 
     try {
-        // Safe to call async_subscribe here because async_recv is NOT running in parallel
-        auto suback_opt = co_await amcl.async_subscribe(
+        auto suback = co_await amcl.async_subscribe(
             am::v5::subscribe_packet{*amcl.acquire_unique_packet_id(),
-                                     am::force_move(sub_entry)},
+                                     am::force_move(sub_entries)},
             as::use_awaitable);
-        
-        if(suback_opt) {
+
+        if(suback) {
             std::lock_guard<std::mutex> lock(g_sub_mutex);
-            for(const auto& topic : batch) g_subscribed_topics.insert(topic);
-            log("✓ Subscribed to batch of " + std::to_string(batch.size()) + " topics", LogLevel::INFO);
+            for(const auto &topic : sub_batch) {
+                g_subscribed_topics.insert(topic);
+                if(g_triggerToAlarmMap.contains(topic)) {
+                    g_subscribed_topics.insert(topic + "/Event");
+                }
+            }
+
+            log("✓ Subscribed to " + std::to_string(sub_batch.size()) + " topics",
+                LogLevel::INFO);
         }
-    } catch(const std::exception& e) {
-        log("ERROR: Subscription batch failed: " + std::string(e.what()), LogLevel::ERRORS);
+
+    } catch(const std::exception &e) {
+        log("ERROR: Subscription batch failed: " + std::string(e.what()),
+            LogLevel::ERRORS);
     }
 }
 
@@ -1135,6 +1201,10 @@ void start_mqtt_client(UA_Server *server) {
             log("DEBUG: MQTT Client Coroutine Started!", LogLevel::INFO);
             // Reconnection loop
             while(running) {
+                // FORCE RESET CLIENT to clear any "packet_not_allowed" or stale state
+                // This resolves the infinite error loop 388 on reconnect.
+                amcl = client_t{ioc.get_executor()};
+                
                 try {
                
                     
@@ -1291,7 +1361,7 @@ void start_mqtt_client(UA_Server *server) {
                                                 // Extract Retain
                                                 bool retain = alarm.value("Retain", false);
                                                 
-                                                log("DEBUG: Data Extracted. Active=" + std::to_string(active) + ", Checking " + std::to_string(mappings.size()) + " mappings...", LogLevel::INFO);
+                                                // log("DEBUG: Data Extracted. Active=" + std::to_string(active) + ", Checking " + std::to_string(mappings.size()) + " mappings...", LogLevel::INFO);
                                                     
                                                 // Iterate through all alarms mapped to this trigger
                                                 {
@@ -1300,17 +1370,17 @@ void start_mqtt_client(UA_Server *server) {
                                                     for(const auto &mapping : mappings) {
                                                         // Filter by AETypeID
                                                         if(mapping.alarmId != AETypeID) {
-                                                            log("DEBUG: SKIP Mapping ID=" + std::to_string(mapping.alarmId) + " != Payload ID=" + std::to_string(AETypeID), LogLevel::INFO);
+                                                            // log("DEBUG: SKIP Mapping ID=" + std::to_string(mapping.alarmId) + " != Payload ID=" + std::to_string(AETypeID), LogLevel::INFO);
                                                             continue;
                                                         }
                                                         
                                                         auto alarmIt = g_alarmByKey.find(mapping.alarmKey);
                                                         if(alarmIt == g_alarmByKey.end()) {
-                                                            log("DEBUG: SKIP Mapping - AlarmKey not found in g_alarmByKey: " + mapping.alarmKey, LogLevel::INFO);
+                                                            // log("DEBUG: SKIP Mapping - AlarmKey not found in g_alarmByKey: " + mapping.alarmKey, LogLevel::INFO);
                                                             continue;
                                                         }
                                                     
-                                                    log("DEBUG: MATCH Mapping OK. Processing AlarmKey=" + mapping.alarmKey, LogLevel::INFO);
+                                                    // log("DEBUG: MATCH Mapping OK. Processing AlarmKey=" + mapping.alarmKey, LogLevel::INFO);
                                                     
                                                     UA_NodeId conditionId = alarmIt->second;
                                                     
@@ -1466,9 +1536,15 @@ void start_mqtt_client(UA_Server *server) {
                                                         // Get source node
                                                         std::string emitterName = mapping.alarmKey.substr(0, mapping.alarmKey.find("-"));
                                                         UA_NodeId sourceNode = alarmId; // fallback
-                                                        auto nodeIt = nodeMap.find(emitterName);
-                                                        if(nodeIt != nodeMap.end()) {
-                                                            sourceNode = nodeIt->second;
+                                                        
+                                                        // CRITICAL FIX: Lock nodeMap before accessing it!
+                                                        // SessionWorker might be clearing this map concurrently.
+                                                        {
+                                                            std::lock_guard<std::mutex> mapLock(g_nodeMap_mutex);
+                                                            auto nodeIt = nodeMap.find(emitterName);
+                                                            if(nodeIt != nodeMap.end()) {
+                                                                sourceNode = nodeIt->second;
+                                                            }
                                                         }
                                                         
                                                         // TRIGGER BRANCH EVENT
@@ -1655,6 +1731,19 @@ void start_mqtt_client(UA_Server *server) {
 
 // Migrated logic from main()
 int RunServer(int argc, char **argv) {
+    // Generate Unique Instance ID for Redis Isolation
+    auto now = std::chrono::system_clock::now().time_since_epoch().count();
+    DWORD pid = GetCurrentProcessId();
+    std::stringstream ss;
+    ss << "OPC_UA:" << std::hex << now << "_" << pid;
+    std::string uniquePrefix = ss.str();
+
+    // Initialize Redis Cache
+    // Host: 216.48.184.131, Port: 6379, Pass: xeeredis@techd, DB: 0
+    // Prefix: OPC_UA:<TimestampHex>_<PID>
+    log("Redis Cache Prefix: " + uniquePrefix, LogLevel::INFO);
+    g_redisClient.init("216.48.184.131", 6379, "xeeredis@techd", 0, uniquePrefix);
+
     // Determine if running as service (via arguments or context)
     bool isService = false;
     for(int i=0; i<argc; i++) {
@@ -2183,7 +2272,21 @@ int RunServer(int argc, char **argv) {
 
     try {
         while(running) {
-            UA_Server_run_iterate(server, true);
+            UA_UInt16 timeout = 0;
+            {
+                // Lock server mutex to prevent concurrency issues with worker threads (Address Space)
+                // and MQTT threads (Alarm updates)
+                std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+                
+                // Use non-blocking iteration (waitInternal=false) to release lock frequently
+                timeout = UA_Server_run_iterate(server, false);
+            }
+
+            // Sleep to prevent 100% CPU, but remain responsive (max 50ms)
+            if(timeout > 50) timeout = 50; 
+            if(timeout > 0) {
+                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+            }
             
             // FRAGMENTATION CONTROL: Release unused heap memory to OS periodically
             // This is the Windows equivalent of malloc_trim(0)
@@ -2219,6 +2322,9 @@ int RunServer(int argc, char **argv) {
 
 
     log("Cleaning up server resources", LogLevel::DEBUG);
+
+    // Clear Redis Cache (OPC_UA prefix)
+    g_redisClient.clearCache();
 
 
 

@@ -63,6 +63,9 @@ std::vector<ServerInfoO> ParseServerHierarchy(std::string host, std::string port
 
 std::vector<AlarmConfig> ParseAlarmConfig(std::string host, std::string port, std::string bearerToken, std::string json_body, std::string target);
 
+std::vector<AlarmConfig> ParseAlarmConfigFromJson(const nlohmann::ordered_json& response);
+UserProfile ParseUserProfileFromJson(const nlohmann::ordered_json& response);
+
 std::vector<OrgConfig> ParseOrgConfig(std::string host, std::string port, std::string bearerToken, std::string json_body, std::string target);
 
 UserProfile ParseUserProfile(std::string host, std::string port, std::string bearerToken, 

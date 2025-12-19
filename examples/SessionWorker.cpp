@@ -19,11 +19,28 @@ extern void GlobalMQTT_UnsubscribeBatch(const std::vector<std::string> &topics);
 
 extern std::map<std::string, UA_NodeId> nodeMap;
 extern std::mutex g_nodeMap_mutex;
+extern std::mutex g_alarmMutex;
+extern std::recursive_mutex g_server_mutex;
+
+// Extern declarations for MQTT Globals (Required for batch filtering in SessionWorker)
+#include <deque>
+#include <unordered_set>
+extern std::mutex g_sub_mutex;
+extern std::deque<std::string> g_subscription_queue;
+extern std::unordered_set<std::string> g_pending_subscriptions; // Set for O(1) queue lookups
+extern std::unordered_set<std::string> g_subscribed_topics;
+extern std::deque<std::string> g_unsubscription_queue;
 
 // External callback from server.cpp
 extern void writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
               const UA_NodeId *nodeId, void *nodeContext, const UA_NumericRange *range,
               const UA_DataValue *data);
+
+
+// ============================================================================
+// GLOBAL API CACHE (In-Memory)
+// ============================================================================
+#include "RedisClient.h"
 
 
 // ============================================================================
@@ -144,11 +161,51 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
             }
         })";
         
-        auto futureResponse =
-            std::async(std::launch::async, getResponse,
-                                        apiHost, apiPort, bearerToken,
-                                        topicJsonBody, "/api/GetTopicList");
-        json topicResponse = futureResponse.get();
+        json topicResponse;
+        bool cacheHit = false;
+        std::string cacheKey = "TOPIC_LIST_" + std::to_string(ctx->orgId);
+
+        if(true) { // Always check cache if enabled via RedisClient connection
+             auto start_time = std::chrono::steady_clock::now();
+             auto cachedVal = g_redisClient.get(cacheKey);
+             auto end_time = std::chrono::steady_clock::now();
+             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+             if(cachedVal) {
+                 try {
+                     topicResponse = json::parse(*cachedVal);
+                     cacheHit = true;
+                     log("⚡ Redis Cache HIT for Topics (OrgID: " + std::to_string(ctx->orgId) + ") - Fetched in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
+                 } catch(const std::exception& e) {
+                     log("⚠️ Redis Cache Parse Error: " + std::string(e.what()), LogLevel::WARNING);
+                 }
+             } else {
+                 if(g_redisClient.isConnected())
+                    log("📉 Redis Cache MISS for Topics (OrgID: " + std::to_string(ctx->orgId) + ") - Checked in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
+             }
+        }
+
+        if(!cacheHit) {
+            auto futureResponse =
+                std::async(std::launch::async, getResponse,
+                                            apiHost, apiPort, bearerToken,
+                                            topicJsonBody, "/api/GetTopicList");
+            
+            // Responsive wait for API response
+            while(futureResponse.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+                if(ctx->shouldStop.load()) {
+                    log("🛑 Worker stop signal received during Topic Fetch. Aborting...", LogLevel::WARNING);
+                    throw std::runtime_error("Session cancelled by user");
+                }
+            }
+            topicResponse = futureResponse.get();
+            
+            // Store in Redis (TTL 10 mins = 600s)
+            g_redisClient.set(cacheKey, topicResponse.dump(), 600);
+        }
+
+        // Check again immediately after getting result
+        if(ctx->shouldStop.load()) throw std::runtime_error("Session cancelled by user");
         
         // ====================================================================
         // STEP 3: Store org-specific topics
@@ -177,6 +234,9 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
         // ====================================================================
         log("📦 Creating address space for " + std::to_string(topicResponse["data"].size()) + 
             " topics...", LogLevel::INFO);
+        
+        { // LOCK SERVER MUTEX: Protect Address Space Creation from MQTT Thread
+            std::unique_lock<std::recursive_mutex> lock(g_server_mutex);
         
         // ====================================================================
         // Create organization-specific root folder in Objects
@@ -216,6 +276,24 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
         int nodesCreated = 0;
         
         for(const auto& item : topicResponse["data"]) {
+            nodesCreated++;
+            if(nodesCreated % 100 == 0) {
+                 // Yield lock to allow other threads (e.g. Monitoring/MQTT) to run
+                 lock.unlock();
+                 std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Brief sleep to ensure fair scheduling
+                 lock.lock();
+                 
+                 if(nodesCreated % 500 == 0) {
+                     log("... Processed " + std::to_string(nodesCreated) + " / " + std::to_string(topicResponse["data"].size()) + " topics (Yielded Lock)", LogLevel::DEBUG);
+                 }
+            }
+
+            // Check for cancellation
+            if(ctx->shouldStop.load()) {
+                log("🛑 Worker stop signal received during Address Space Creation. Aborting...", LogLevel::WARNING);
+                throw std::runtime_error("Session cancelled by user");
+            }
+
             if(!item.contains("namespace") || !item.contains("tagId")) {
                 continue;
             }
@@ -386,10 +464,39 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
             " ('" + ctx->namespaceUri + "')", LogLevel::INFO);
             
         // 📡 BATCH SUBSCRIBE: Now that all nodes are created, perform subscription
-        if(!ctx->topics.empty()) {
-            log("📡 Batch subscribing to " + std::to_string(ctx->topics.size()) + " topics...", LogLevel::INFO);
-            GlobalMQTT_SubscribeBatch(ctx->topics);
+        if(ctx->shouldStop.load()) throw std::runtime_error("Session cancelled before subscription");
+
+std::vector<std::string> topicsToSubscribe;
+        topicsToSubscribe.reserve(ctx->topics.size());
+
+        {
+            std::lock_guard<std::mutex> lock(g_sub_mutex);
+            for(const auto &topic : ctx->topics) {
+                // Skip if already globally subscribed
+                if(g_subscribed_topics.contains(topic)) {
+                    continue;
+                }
+
+                // Skip if already queued for subscription
+                // O(1) Check using Pending Set (Fixes CPU Spike)
+                if(g_pending_subscriptions.contains(topic)) {
+                    continue;
+                }
+
+                topicsToSubscribe.emplace_back(topic);
+            }
         }
+
+        if(!topicsToSubscribe.empty()) {
+            log("📡 Batch subscribing to " + std::to_string(topicsToSubscribe.size()) +
+                    " new topics (filtered from " + std::to_string(ctx->topics.size()) +
+                    ")",
+                LogLevel::INFO);
+
+            GlobalMQTT_SubscribeBatch(topicsToSubscribe);
+        }
+
+        } // UNLOCK SERVER MUTEX
 
         // ====================================================================
         // STEP 4: Fetch org-specific alarms
@@ -405,9 +512,50 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
             "orgId": )" + std::to_string(ctx->orgId) + R"(
         })";
         
-        std::vector<AlarmConfig> alarms = ParseAlarmConfig(apiHost, apiPort, bearerToken,
-                                                           alarmJsonBody,
-                                                           "/api/GetAlarmsConfigDetailList");
+        std::vector<AlarmConfig> alarms;
+        bool alarmCacheHit = false;
+        std::string alarmCacheKey = "ALARMS_" + std::to_string(ctx->orgId);
+
+        if(true) { // Always check cache if enabled via RedisClient connection
+             auto start_time = std::chrono::steady_clock::now();
+             auto cachedVal = g_redisClient.get(alarmCacheKey);
+             auto end_time = std::chrono::steady_clock::now();
+             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+             if(cachedVal) {
+                 try {
+                     alarms = ParseAlarmConfigFromJson(json::parse(*cachedVal));
+                     alarmCacheHit = true;
+                     log("⚡ Redis Cache HIT for Alarms (OrgID: " + std::to_string(ctx->orgId) + ") - Fetched in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
+                 } catch(const std::exception& e) {
+                      log("⚠️ Redis Cache Parse Error for Alarms: " + std::string(e.what()), LogLevel::WARNING);
+                 }
+             } else {
+                 if(g_redisClient.isConnected())
+                    log("📉 Redis Cache MISS for Alarms (OrgID: " + std::to_string(ctx->orgId) + ") - Checked in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
+             }
+        }
+
+        if(!alarmCacheHit) {
+             auto futureResponse =
+                std::async(std::launch::async, getResponse,
+                                            apiHost, apiPort, bearerToken,
+                                            alarmJsonBody, "/api/GetAlarmsConfigDetailList");
+            
+            // Responsive wait
+            while(futureResponse.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+                if(ctx->shouldStop.load()) {
+                    log("🛑 Worker stop signal received during Alarm Fetch. Aborting...", LogLevel::WARNING);
+                    throw std::runtime_error("Session cancelled by user");
+                }
+            }
+            json alarmResponse = futureResponse.get();
+            
+            // Store in Redis
+            g_redisClient.set(alarmCacheKey, alarmResponse.dump(), 600);
+            
+            alarms = ParseAlarmConfigFromJson(alarmResponse);
+        }
         
         log("✓ Fetched " + std::to_string(alarms.size()) + " alarms for org '" + 
             ctx->shortCode + "' (OrgID: " + std::to_string(ctx->orgId) + ")", 
@@ -418,9 +566,27 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
         // ====================================================================
         log("📋 Creating alarm conditions in namespace " + std::to_string(ctx->namespaceIndex) + "...", LogLevel::INFO);
         
+        { // LOCK SERVER MUTEX: Protect Alarm Creation from MQTT Thread
+            std::unique_lock<std::recursive_mutex> lock(g_server_mutex);
+        
         int alarmsCreated = 0;
         for(const auto& alarm : alarms) {
+            // Check for cancellation
+            if(ctx->shouldStop.load()) {
+                log("🛑 Worker stop signal received during Alarm Creation. Aborting...", LogLevel::WARNING);
+                throw std::runtime_error("Session cancelled by user");
+            }
+
             if(!alarm.alarmEmitters.has_value()) continue;
+            
+            alarmsCreated++;
+            if(alarmsCreated % 50 == 0) {
+                 // Yield lock to allow other threads to run
+                 lock.unlock();
+                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                 lock.lock();
+                 log("... Processed " + std::to_string(alarmsCreated) + " / " + std::to_string(alarms.size()) + " alarms (Yielded Lock)", LogLevel::DEBUG);
+            }
             
             for(const auto& emitter : alarm.alarmEmitters.value()) {
                 // Sanitize emitter name (remove trailing slash)
@@ -457,7 +623,7 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                 UA_Byte eventNotifier = 0x01; 
                 UA_StatusCode evtRc = UA_Server_writeEventNotifier(server, sourceNode, eventNotifier);
                 if(evtRc != UA_STATUSCODE_GOOD) {
-                    log("❌ Failed to set EventNotifier on source node " + emitter.emitterNodeName + ": " + UA_StatusCode_name(evtRc), LogLevel::ERRORS);
+                    log("❌ Failed to set EventNotifier on source node " + emitter.emitterNodeName + ": " + UA_StatusCode_name(evtRc), LogLevel::INFO);
                 } else {
                     log("✓ EventNotifier set on source node " + emitter.emitterNodeName, LogLevel::INFO);
                 }
@@ -564,7 +730,26 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
 
                          // via logic in perform_subscriptions (server.cpp) IF the topic is in the map.
                          log("DEBUG: Subscribing to Emitter Topic (Alarm Prepared): " + topic, LogLevel::INFO);
-                         GlobalMQTT_Subscribe(topic);
+                         // FIX: Replaced direct subscribe with batched + deduped logic
+                         {
+                            std::lock_guard<std::mutex> lock(g_sub_mutex);
+
+                            // Cancel pending unsubscribe if present
+                            auto it = std::find(g_unsubscription_queue.begin(),
+                                                g_unsubscription_queue.end(),
+                                                topic);
+                            if(it != g_unsubscription_queue.end()) {
+                                g_unsubscription_queue.erase(it);
+                                g_subscribed_topics.insert(topic);
+                                log("DEBUG: Cancelled pending unsub for emitter: " + topic, LogLevel::INFO);
+                            } else if(!g_subscribed_topics.contains(topic)) {
+                                // O(1) Check using Pending Set
+                                if(g_pending_subscriptions.insert(topic).second) {
+                                     g_subscription_queue.push_back(topic);
+                                }
+                            }
+                         }
+
                          ctx->subscribedEmitters.push_back(topic);
                     } else {
                          log("WARNING: Emitter (ID: " + std::to_string(emitter.id) + 
@@ -575,13 +760,24 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
                     ctx->alarmMap[alarmKey] = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, alarmKey.c_str());
                     alarmsCreated++;
                 } else {
-                    log("❌ Failed to create alarm '" + alarm.name + "': " + UA_StatusCode_name(sc), LogLevel::ERRORS);
+                    // FIX: Explicitly convert C-string to std::string to avoid pointer arithmetic issues
+                    // or potential char vs string addition confusion.
+                    // Also HEX print code to be sure.
+                    std::string errName = (alarm.name.empty() ? "Unknown" : alarm.name);
+                    const char* scName = UA_StatusCode_name(sc);
+                    std::string scStr = (scName ? std::string(scName) : "UnknownStatusCode");
+                    
+                    std::stringstream ss;
+                    ss << "❌ Failed to create alarm '" << errName << "': " << scStr << " (0x" << std::hex << sc << ")";
+                    log(ss.str(), LogLevel::ERRORS);
                 }
             }
         }
         
         log("✓ Created " + std::to_string(alarmsCreated) + " alarm conditions", LogLevel::INFO);
         
+        } // UNLOCK SERVER MUTEX
+
         // ====================================================================
         // STEP 5: Main worker loop - keep thread alive until session closes
         // ====================================================================
@@ -612,14 +808,16 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
 
     // 1. Unsubscribe from MQTT Topics
         if(!ctx->topics.empty()) {
-            log("🧹 Batch unsubscribing from " + std::to_string(ctx->topics.size()) + " topics...", LogLevel::INFO);
-            GlobalMQTT_UnsubscribeBatch(ctx->topics);
+            log("🧹 Batch unsubscribing from " + std::to_string(ctx->topics.size()) + " topics... [SKIPPED to persist]", LogLevel::INFO);
+            // DISABLED by user request: "only unsubscribe when server is closed"
+            // GlobalMQTT_UnsubscribeBatch(ctx->topics);
         }
         log("DEBUG: MQTT Unsubscribe complete. Clearing local maps...", LogLevel::DEBUG);
 
         // 2. Clear Alarm Map (Local)
-        ctx->alarmMap.clear();
-        log("DEBUG: Local Alarm Map cleared.", LogLevel::DEBUG);
+        // MOVED: alarmMap clearing must happen AFTER removing from global g_alarmByKey
+        // ctx->alarmMap.clear(); 
+        // log("DEBUG: Local Alarm Map cleared.", LogLevel::DEBUG);
         
         // 3. Remove from Global Maps (if we added them)
     // Also unsubscribe from Emitter topics used in alarms?! 
@@ -636,8 +834,15 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
     // Answer: Yes, UA_NODEID_STRING_ALLOC allocates memory for the identifier.
     
     // 2. Clear Context Maps (Nodes)
-    // MOVED: nodeMap clearing is now done later to ensure UA_Server_deleteNode is called first.
-    // ctx->nodeMap.clear(); // REMOVED PREMATURE CLEAR
+    // First, remove these alarms from the GLOBAL alarm map to prevent MQTT thread access
+    {
+        std::lock_guard<std::mutex> alarmLock(g_alarmMutex);
+        for(auto& pair : ctx->alarmMap) {
+             // Remove from global map
+             g_alarmByKey.erase(pair.first);
+        }
+    }
+    log("🧹 Removed " + std::to_string(ctx->alarmMap.size()) + " alarms from global lookup.", LogLevel::INFO);
 
     for(auto& pair : ctx->alarmMap) {
          UA_NodeId_clear(&pair.second);
@@ -645,36 +850,67 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
     ctx->alarmMap.clear();
 
     // 3. Remove from Global Maps (if we added them)
-    // We added to 'nodeMap' (global) and 'g_alarmByKey' and 'topicMap'.
+    std::vector<UA_NodeId> nodesToDelete;
     {
+        // DISABLED by user request: "this g_nodeMap_mutex is creating problems" / freeze
+        // AND "do not unsubscribe anything" => implies we should persist the mappings too.
+        // If we clear nodeMap, MQTT writes will fail (node not found) even if we stay subscribed.
+        // So we MUST SKIP this to truly persist.
+        
+        /*
         std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
+        log("🧹 Locking g_nodeMap_mutex to clear " + std::to_string(ctx->topics.size()) + " topics...", LogLevel::DEBUG);
+        size_t count = 0;
         for(const auto& topic : ctx->topics) {
              auto it = nodeMap.find(topic);
              if(it != nodeMap.end()) {
-                 // CRITICAL FIX: Delete the node from the SERVER address space!
-                 // Just clearing the NodeId struct leaks the actual node in the server.
-                 UA_Server_deleteNode(server, it->second, true); // true = delete references
-
                  UA_NodeId_clear(&it->second);
                  nodeMap.erase(it);
              }
+             if(++count % 500 == 0) {
+                 log("... Cleared " + std::to_string(count) + " / " + std::to_string(ctx->topics.size()), LogLevel::DEBUG);
+             }
         }
-    }
-
-    // Also delete the Organization Root Folder (Recursively cleans up if children were missed)
-    if(!UA_NodeId_isNull(&orgRootFolder)) {
-        log("🧹 Deleting Org Root Folder from server...", LogLevel::INFO);
-        UA_Server_deleteNode(server, orgRootFolder, true);
-        UA_NodeId_clear(&orgRootFolder);
+        log("🧹 g_nodeMap_mutex released.", LogLevel::DEBUG);
+        */
+        log("🧹 Skipping NodeMap cleanup to persist data flow and avoid freeze.", LogLevel::INFO);
     }
     
+    // safe deletion outside map lock (Optimized: Rely on RootFolder delete)
+    // log("🧹 Clearing " + std::to_string(nodesToDelete.size()) + " nodes from global map...", LogLevel::INFO);
+    nodesToDelete.clear();
+
+    // Also delete the Organization Root Folder (Recursively cleans up ALL children)
+    //if(!UA_NodeId_isNull(&orgRootFolder)) {
+    //    log("🧹 Deleting Org Root Folder from server (Recursive)...", LogLevel::INFO);
+    //    
+    //    // LOCK SERVER MUTEX:
+    //    // Protect against concurrent logic (e.g. MQTT writes) that touch the address space.
+    //    // open62541 internal structures are not thread-safe if accessing same nodes.
+    //    {
+    //        std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+    //        // SKIPPING DELETION TO PREVENT FREEZE
+    //        // UA_Server_deleteNode(server, orgRootFolder, true); 
+    //        log("⚠️ SKIPPED Deleting Org Root Folder (Manual Override)", LogLevel::WARNING);
+    //    }
+    //    
+    //    UA_NodeId_clear(&orgRootFolder);
+    //}
+    
     // Safety: Iterate local nodeMap and try to delete any remaining nodes
-    // (In case they weren't in global map or under root folder)
-    for(auto& pair : ctx->nodeMap) {
-        // Ignore error if already deleted via hierarchy or global map
-        UA_Server_deleteNode(server, pair.second, true);
-        UA_NodeId_clear(&pair.second);
-    }
+    // (Only if not already deleted)
+    //int remainingDeleted = 0;
+    //for(auto& pair : ctx->nodeMap) {
+        // Check if node still exists before trying to delete (cheap check? no, just try delete)
+        // Does this cause error? Yes, BadNodeIdUnknown.
+        // Is it slow? Yes, 3000 fails is slow.
+        // Strategy: Assume ctx->nodeMap contents were largely children of orgRootFolder.
+        // But we must clean up UA_NodeId structs.
+        // We can just clear the structs.
+    //    UA_NodeId_clear(&pair.second);
+    //}
+    log("🧹 Local NodeMap cleared.", LogLevel::INFO);
+
     ctx->nodeMap.clear();
 
     // REMOVED from topicMap (Generic Telemetry)
@@ -685,39 +921,41 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
         }
     }
 
-    // 4. Cleanup Global Alarm Maps (Prevent Leaks)
-    {
-        // Cleanup g_alarmByKey
-        // Note: g_alarmByKey values are allocated strings. We must clear them.
-        // We use ctx->alarmMap keys to identify which ones we own/created.
-        for(const auto& pair : ctx->alarmMap) {
-            auto it = g_alarmByKey.find(pair.first);
-            if(it != g_alarmByKey.end()) {
-                UA_NodeId_clear(&it->second); // Clear the global NodeId copy
-                g_alarmByKey.erase(it);
-            }
-        }
-    }
 
     // 5. Cleanup Emitter Subscriptions and Trigger Mappings
     if(!ctx->subscribedEmitters.empty()) {
-        log("🧹 Unsubscribing from " + std::to_string(ctx->subscribedEmitters.size()) + " emitter topics...", LogLevel::INFO);
+        log("🧹 Unsubscribing from " + std::to_string(ctx->subscribedEmitters.size()) + " emitter topics... [SKIPPED to persist]", LogLevel::INFO);
         // Unsubscribe from MQTT
-        GlobalMQTT_UnsubscribeBatch(ctx->subscribedEmitters);
+        // DISABLED by user request: "only unsubscribe when server is closed"
+        // GlobalMQTT_UnsubscribeBatch(ctx->subscribedEmitters);
         
         // Cleanup g_triggerToAlarmMap
+        // Cleanup g_triggerToAlarmMap
+        // OPTIMIZATION: Instead of iterating all subscribed emitters and searching the map,
+        // we can just efficiently remove using the known trigger topics if possible.
+        // However, g_triggerToAlarmMap is keyed by Topic.
+        
         std::lock_guard<std::mutex> lock(g_alarmMutex);
+        // Better Approach: Iterate the global map only for topics we know we subscribed to
         for(const auto& topic : ctx->subscribedEmitters) {
             auto mapIt = g_triggerToAlarmMap.find(topic);
             if(mapIt != g_triggerToAlarmMap.end()) {
-                 // Remove entries associated with our alarms
                  auto& list = mapIt->second;
-                 // Remove if alarmKey exists in our local alarmMap
-                 auto originalSize = list.size();
-                 list.erase(std::remove_if(list.begin(), list.end(), 
-                     [&](const TriggerToAlarmMapping& m) {
-                         return ctx->alarmMap.find(m.alarmKey) != ctx->alarmMap.end();
-                     }), list.end());
+                 // Remove entries where the alarmKey belongs to this session
+                 // Since we know the alarms, we could check against ctx->alarmMap
+                 // Logic: remove_if alarmKey is in ctx->alarmMap
+                 
+                 // If list is small, this is fast. If list is huge (many sessions on same topic), this is linear.
+                 // Given the "freezing", maybe the list IS huge?
+                 // Or maybe thousands of topics?
+                 
+                 // If we are deleting the session, we know ALL alarms in ctx->alarmMap are gone.
+                 if(!list.empty()) {
+                     list.erase(std::remove_if(list.begin(), list.end(), 
+                         [&](const TriggerToAlarmMapping& m) {
+                             return ctx->alarmMap.count(m.alarmKey) > 0;
+                         }), list.end());
+                 }
                  
                  if(list.empty()) {
                      g_triggerToAlarmMap.erase(mapIt);
@@ -728,6 +966,6 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
     
     // Ideally ctx should track 'myAlarmKeys'.
     
-    UA_NodeId_clear(&orgRootFolder);
+    //UA_NodeId_clear(&orgRootFolder);
     log("✓ Cleanup complete for org '" + ctx->shortCode + "'", LogLevel::INFO);
 }

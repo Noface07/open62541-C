@@ -110,7 +110,7 @@ bool SessionManager::registerSession(const UA_NodeId& sessionId,
     ctx->sessionKey = sessionKey;
     ctx->shortCode = shortCode;
     ctx->orgId = orgConfig->orgId;
-    ctx->namespaceUri = "anexee:" + orgConfig->shortCode;
+    ctx->namespaceUri = "Anexee:" + orgConfig->shortCode;
     ctx->shouldStop.store(false);
     
     log("🧵 Creating dedicated worker thread for org '" + shortCode + "' (OrgID: " + 

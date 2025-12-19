@@ -162,6 +162,7 @@ set(CLIENT_LIB_SOURCES
     fetchAPI.cpp
     Encryption.cpp
     Monitoring.cpp
+    RedisClient.cpp
 )
 
 # --- Define the 'client' executable ---

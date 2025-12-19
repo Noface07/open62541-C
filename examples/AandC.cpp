@@ -58,9 +58,14 @@ UA_NodeId findNodeByPath(UA_Server *server, UA_NodeId startNode, const std::vect
     return current;
 }
 
+extern std::recursive_mutex g_server_mutex; // Extern declaration
+
 UA_StatusCode setStealthValueByPath(UA_Server *server, UA_NodeId baseNode, 
                                  std::vector<const char*> path, 
                                  void *newValue, const UA_DataType *type) {
+    // Protect against concurrent deletion (SessionWorker)
+    std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+
     UA_NodeId targetNode = findNodeByPath(server, baseNode, path);
     if(UA_NodeId_isNull(&targetNode)) {
         UA_NodeId_clear(&targetNode);
