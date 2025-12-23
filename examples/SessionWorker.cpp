@@ -20,7 +20,6 @@ extern void GlobalMQTT_UnsubscribeBatch(const std::vector<std::string> &topics);
 extern std::map<std::string, UA_NodeId> nodeMap;
 extern std::mutex g_nodeMap_mutex;
 extern std::mutex g_alarmMutex;
-extern std::recursive_mutex g_server_mutex;
 
 // Extern declarations for MQTT Globals (Required for batch filtering in SessionWorker)
 #include <deque>
@@ -35,6 +34,21 @@ extern std::deque<std::string> g_unsubscription_queue;
 extern void writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
               const UA_NodeId *nodeId, void *nodeContext, const UA_NumericRange *range,
               const UA_DataValue *data);
+
+// ============================================================================
+// STRUCTURAL CONCURRENCY: Job Queue API
+// ============================================================================
+#include <functional>
+enum class ServerJobType {
+    AddNamespace,
+    AddNodes,
+    AddAlarms,
+    WriteValue,
+    SetEventNotifier,
+    Custom
+};
+extern void enqueueServerJob(const std::function<void(UA_Server*)>& fn, ServerJobType type = ServerJobType::Custom);
+// ============================================================================
 
 
 // ============================================================================
@@ -112,9 +126,13 @@ static UA_NodeId getOrCreateFolder(UA_Server* server,
  * Dedicated worker thread for a single session
  * Creates org-specific address space and manages resources
  */
-void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
+// Safe lifecycle management via shared_ptr
+void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                         const std::string& bearerToken,
                         const std::string& apiHost, const std::string& apiPort) {
+    
+    // Set thread name for debugging
+    std::string threadName = "Worker_" + ctx->shortCode; // Corrected to be syntactically valid
     
     log("🚀 [THREAD START] Worker thread started for org '" + ctx->shortCode + 
         "' (OrgID: " + std::to_string(ctx->orgId) + ", Namespace: " + 
@@ -124,18 +142,9 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
     
     try {
         // ====================================================================
-        // STEP 1: Register dynamic namespace
+        // STEP 1: Register dynamic namespace (Already done in SessionManager)
         // ====================================================================
-        log("📝 Registering namespace for org '" + ctx->shortCode + "'...", LogLevel::DEBUG);
-        ctx->namespaceIndex = UA_Server_addNamespace(server, ctx->namespaceUri.c_str());
-        
-        if(ctx->namespaceIndex == 0) {
-            log("❌ Failed to register namespace for org '" + ctx->shortCode + "'", 
-                LogLevel::ERRORS);
-            return;
-        }
-        
-        log("✓ Namespace '" + ctx->namespaceUri + "' registered at index " + 
+        log("✓ Namespace '" + ctx->namespaceUri + "' confirmed at index " + 
             std::to_string(ctx->namespaceIndex), LogLevel::INFO);
         
         // ====================================================================
@@ -230,243 +239,309 @@ void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
         }
         
         // ====================================================================
-        // STEP 3: Create Address Space for Topics
+        // STEP 3: Create Address Space for Topics (Via Job Queue)
         // ====================================================================
-        log("📦 Creating address space for " + std::to_string(topicResponse["data"].size()) + 
-            " topics...", LogLevel::INFO);
-        
-        { // LOCK SERVER MUTEX: Protect Address Space Creation from MQTT Thread
-            std::unique_lock<std::recursive_mutex> lock(g_server_mutex);
-        
         // ====================================================================
-        // Create organization-specific root folder in Objects
+        // STEP 3: Create Address Space for Topics (Via Job Queue - BATCHED)
         // ====================================================================
-        UA_ObjectAttributes rootObjAttr = UA_ObjectAttributes_default;
-        rootObjAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", ctx->shortCode.c_str());
-        rootObjAttr.description = UA_LOCALIZEDTEXT_ALLOC("en-US", 
-                                    ("Root folder for organization: " + ctx->shortCode).c_str());
-        
-        orgRootFolder = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, 
-                                    ("OrgRoot_" + ctx->shortCode).c_str());
-        
-        UA_QualifiedName rootName = UA_QUALIFIEDNAME_ALLOC(ctx->namespaceIndex, ctx->shortCode.c_str());
-        UA_StatusCode rc = UA_Server_addObjectNode(
-            server, orgRootFolder,
-            UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
-            UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES),
-            rootName,
-            UA_NODEID_NUMERIC(0, UA_NS0ID_FOLDERTYPE),
-            rootObjAttr, NULL, NULL);
-        
-        UA_QualifiedName_clear(&rootName);
-        
-        if(rc != UA_STATUSCODE_GOOD && rc != UA_STATUSCODE_BADNODEIDEXISTS) {
-            log("❌ Failed to create root folder for org '" + ctx->shortCode + "'", 
-                LogLevel::ERRORS);
-            orgRootFolder = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER); // Fallback
-        } else {
-            log("✓ Created root folder '" + ctx->shortCode + "' in namespace " + 
-                std::to_string(ctx->namespaceIndex), LogLevel::INFO);
-        }
-        UA_ObjectAttributes_clear(&rootObjAttr);
-        
-        std::map<std::string, UA_NodeId> folderMap;
-        // std::map<std::string, UA_NodeId> nodeMap; // Removed local map, using ctx->nodeMap
-        
-        int nodesCreated = 0;
-        
-        for(const auto& item : topicResponse["data"]) {
-            nodesCreated++;
-            if(nodesCreated % 100 == 0) {
-                 // Yield lock to allow other threads (e.g. Monitoring/MQTT) to run
-                 lock.unlock();
-                 std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Brief sleep to ensure fair scheduling
-                 lock.lock();
-                 
-                 if(nodesCreated % 500 == 0) {
-                     log("... Processed " + std::to_string(nodesCreated) + " / " + std::to_string(topicResponse["data"].size()) + " topics (Yielded Lock)", LogLevel::DEBUG);
-                 }
-            }
+        size_t totalTopics = topicResponse["data"].size();
+        log("📦 Enqueuing Address Space Creation for " + std::to_string(totalTopics) + 
+            " topics (Batched)...", LogLevel::INFO);
 
-            // Check for cancellation
-            if(ctx->shouldStop.load()) {
-                log("🛑 Worker stop signal received during Address Space Creation. Aborting...", LogLevel::WARNING);
-                throw std::runtime_error("Session cancelled by user");
-            }
-
-            if(!item.contains("namespace") || !item.contains("tagId")) {
-                continue;
-            }
+        // Pre-create Root Folder in a separate single job to ensure it exists for subsequent batches
+        std::shared_ptr<SessionContext> rootJobCtx = ctx;
+        enqueueServerJob([rootJobCtx](UA_Server* server) {
+            UA_ObjectAttributes rootObjAttr = UA_ObjectAttributes_default;
+            rootObjAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", rootJobCtx->shortCode.c_str());
+            rootObjAttr.description = UA_LOCALIZEDTEXT_ALLOC("en-US", 
+                                        ("Root folder for organization: " + rootJobCtx->shortCode).c_str());
             
-            std::string ns = item["namespace"].get<std::string>();
-            auto parts = split(ns, '/');
+            UA_NodeId orgRootFolder = UA_NODEID_STRING_ALLOC(rootJobCtx->namespaceIndex, 
+                                        ("OrgRoot_" + rootJobCtx->shortCode).c_str());
             
-            if(parts.empty()) continue;
+            UA_QualifiedName rootName = UA_QUALIFIEDNAME_ALLOC(rootJobCtx->namespaceIndex, rootJobCtx->shortCode.c_str());
             
-            // Build folder hierarchy UNDER the org root folder
-            std::string currentPath;
-            UA_NodeId parent = orgRootFolder; // Start from org-specific root!
-            
-            for(size_t i = 0; i < parts.size() - 1; i++) {
-                if(!currentPath.empty()) currentPath += "/";
-                currentPath += parts[i];
-                
-                parent = getOrCreateFolder(server, currentPath, parts[i], 
-                                          parent, ctx->namespaceIndex, folderMap, ctx->nodeMap);
-            }
-            
-            // Create variable node for the topic IN THE ORG'S NAMESPACE
-            UA_VariableAttributes attr = UA_VariableAttributes_default;
-            UA_Int32 value = 0;
-            UA_Variant_setScalarCopy(&attr.value, &value, &UA_TYPES[UA_TYPES_INT32]);
-            
-            attr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", parts.back().c_str());
-            if(item.contains("name")) {
-                attr.description = UA_LOCALIZEDTEXT_ALLOC("en-US", 
-                                    item["name"].get<std::string>().c_str());
-            }
-            attr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
-            
-            // Create node ID using tagId IN ORG'S NAMESPACE
-            int tagId = item["tagId"].get<int>();
-            UA_NodeId nodeId = UA_NODEID_NUMERIC(ctx->namespaceIndex, tagId);
-            
-            UA_QualifiedName nodeName = UA_QUALIFIEDNAME_ALLOC(ctx->namespaceIndex, parts.back().c_str());
-            rc = UA_Server_addVariableNode(
-                server, nodeId, parent,
+            // Try to add, ignore if exists
+            UA_StatusCode rc = UA_Server_addObjectNode(
+                server, orgRootFolder,
+                UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
                 UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES),
-                nodeName,
-                UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
-                attr, NULL, NULL);
-            
-            UA_QualifiedName_clear(&nodeName);
+                rootName,
+                UA_NODEID_NUMERIC(0, UA_NS0ID_FOLDERTYPE),
+                rootObjAttr, NULL, NULL);
+                
+             UA_QualifiedName_clear(&rootName);
+             UA_ObjectAttributes_clear(&rootObjAttr);
+             UA_NodeId_clear(&orgRootFolder);
+        }, ServerJobType::AddNodes);
 
-            if(rc == UA_STATUSCODE_GOOD) {
-                // Attach Write Callback for MQTT Publishing
-                UA_ValueCallback callback;
-                callback.onRead = NULL;
-                callback.onWrite = writeCallback;
-                UA_Server_setVariableNode_valueCallback(server, nodeId, callback);
-            }
-            UA_VariableAttributes_clear(&attr);
-            
-            if(rc == UA_STATUSCODE_GOOD || rc == UA_STATUSCODE_BADNODEIDEXISTS) {
-                ctx->nodeMap[ns] = nodeId;
-                {
-                    std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
-                    nodeMap[ns] = nodeId;
-                }
-                
-                // Populate Global TopicMap for Generic Telemetry (Write Callback)
-                {
-                    std::lock_guard<std::mutex> lock(g_topicMap_mutex);
-                    TopicInfo info;
-                    info.tagId = tagId;
-                    if(item.contains("name")) info.name = item["name"].get<std::string>();
-                    if(item.contains("tagType")) info.tagType = item["tagType"].get<std::string>();
-                    if(item.contains("rangeMin")) info.rangeMin = item["rangeMin"].get<double>();
-                    else info.rangeMin = 0.0;
-                    if(item.contains("rangeMax")) info.rangeMax = item["rangeMax"].get<double>();
-                    else info.rangeMax = 0.0;
-                    
-                    topicMap[ns] = info;
-                }
-                // 📡 Dynamic Subscribe
-                // Optimization: ctx->topics is already populated in Step 3 (Lines 161-166)
-                // We do NOT need to scan and add it again here. This removes an O(N^2) bottleneck.
-                /* 
-                if(std::find(ctx->topics.begin(), ctx->topics.end(), ns) == ctx->topics.end()) {
-                    ctx->topics.push_back(ns);
-                } 
-                */ 
 
-                nodesCreated++;
-                
-                // Add EURange property if available
-                if(item.contains("rangeMin") && item.contains("rangeMax")) {
-                    UA_Range range;
-                    range.low = item["rangeMin"].get<double>();
-                    range.high = item["rangeMax"].get<double>();
-                    
-                    UA_Variant rangeVariant;
-                    UA_Variant_setScalarCopy(&rangeVariant, &range, &UA_TYPES[UA_TYPES_RANGE]);
-                    
-                    UA_VariableAttributes rangeAttr = UA_VariableAttributes_default;
-                    rangeAttr.value = rangeVariant;
-                    rangeAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EURange");
-                    
-                    UA_NodeId rangeNodeId = UA_NODEID_NUMERIC(ctx->namespaceIndex, tagId * 1000 + 1);
-                    
-                    UA_QualifiedName rangeName = UA_QUALIFIEDNAME_ALLOC(0, "EURange");
-                    
-                    UA_Server_addVariableNode(
-                        server, rangeNodeId, nodeId,
-                        UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
-                        rangeName,
-                        UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
-                        rangeAttr, NULL, NULL);
-                    
-                    UA_QualifiedName_clear(&rangeName);
-                    UA_VariableAttributes_clear(&rangeAttr);
-                }
-                
-                // Add alarm limits if available
-                if(item.contains("alarmHiHi")) {
-                    UA_Double alarmHiHi = item["alarmHiHi"].get<double>();
-                    UA_Variant alarmVariant;
-                    UA_Variant_setScalarCopy(&alarmVariant, &alarmHiHi, &UA_TYPES[UA_TYPES_DOUBLE]);
-                    
-                    UA_VariableAttributes alarmAttr = UA_VariableAttributes_default;
-                    alarmAttr.value = alarmVariant;
-                    alarmAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "AlarmHiHi");
-                    
-                    UA_NodeId alarmNodeId = UA_NODEID_NUMERIC(ctx->namespaceIndex, tagId * 1000 + 2);
-                    UA_QualifiedName alarmName = UA_QUALIFIEDNAME_ALLOC(0, "AlarmHiHi");
-                    UA_Server_addVariableNode(
-                        server, alarmNodeId, nodeId,
-                        UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
-                        alarmName,
-                        UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
-                        alarmAttr, NULL, NULL);
+        // Batch Processing
+        const size_t BATCH_SIZE = 50;
+        std::vector<json> currentBatch;
+        currentBatch.reserve(BATCH_SIZE);
+
+        for(const auto& item : topicResponse["data"]) {
+             currentBatch.push_back(item);
+             
+             if(currentBatch.size() >= BATCH_SIZE) {
+                 // Enqueue Batch
+                 std::shared_ptr<SessionContext> jobCtx = ctx;
+                 std::vector<json> jobBatch = std::move(currentBatch); // Move batch to avoid copy
+                 
+                 enqueueServerJob([jobCtx, jobBatch](UA_Server* server) {
+                     if(jobCtx->shouldStop.load()) return;
+                     
+                     // Reconstruct Root NodeId (It exists now)
+                     UA_NodeId orgRootFolder = UA_NODEID_STRING_ALLOC(jobCtx->namespaceIndex, 
+                                                ("OrgRoot_" + jobCtx->shortCode).c_str());
+                                                
+                     std::map<std::string, UA_NodeId> folderMap; // Local cache for this batch
+                     
+                     for(const auto& item : jobBatch) {
+                         // ... (Process Item Logic) ...
+                        if(!item.contains("namespace") || !item.contains("tagId")) continue;
                         
-                    UA_QualifiedName_clear(&alarmName);
-                    UA_VariableAttributes_clear(&alarmAttr);
-                }
+                        std::string ns = item["namespace"].get<std::string>();
+                        auto parts = split(ns, '/');
+                        if(parts.empty()) continue;
+                        
+                        // Recursively create folders
+                        std::string currentPath;
+                        UA_NodeId parent = orgRootFolder;
+                        
+                        for(size_t i = 0; i < parts.size() - 1; i++) {
+                            if(!currentPath.empty()) currentPath += "/";
+                            currentPath += parts[i];
+                            parent = getOrCreateFolder(server, currentPath, parts[i], 
+                                                    parent, jobCtx->namespaceIndex, folderMap, jobCtx->nodeMap);
+                        }
+                        
+                        // Create Variable
+                        UA_VariableAttributes attr = UA_VariableAttributes_default;
+                        UA_Int32 value = 0;
+                        UA_Variant_setScalarCopy(&attr.value, &value, &UA_TYPES[UA_TYPES_INT32]);
+                        attr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", parts.back().c_str());
+                        if(item.contains("name")) {
+                            attr.description = UA_LOCALIZEDTEXT_ALLOC("en-US", item["name"].get<std::string>().c_str());
+                        }
+                        attr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
+                        
+                        int tagId = item["tagId"].get<int>();
+                        UA_NodeId nodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId);
+                        UA_QualifiedName nodeName = UA_QUALIFIEDNAME_ALLOC(jobCtx->namespaceIndex, parts.back().c_str());
+                        
+                        UA_StatusCode rc = UA_Server_addVariableNode(server, nodeId, parent,
+                            UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES),
+                            nodeName, UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+                            attr, NULL, NULL);
+                        
+                        UA_QualifiedName_clear(&nodeName);
+                        if(rc == UA_STATUSCODE_GOOD) {
+                            UA_ValueCallback callback;
+                            callback.onRead = NULL;
+                            callback.onWrite = writeCallback;
+                            UA_Server_setVariableNode_valueCallback(server, nodeId, callback);
+                        }
+                        UA_VariableAttributes_clear(&attr);
+                        
+                        if(rc == UA_STATUSCODE_GOOD || rc == UA_STATUSCODE_BADNODEIDEXISTS) {
+                            // Update Local Map (Thread-safe: Only Server Thread writes, sequential jobs read)
+                            jobCtx->nodeMap[ns] = nodeId; 
+                            
+                            // Update Global Map (Protected, used by Generic Telemetry)
+                            {
+                                std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
+                                nodeMap[ns] = nodeId; 
+                            }
+                            
+                            // Add EURange property if available
+                            if(item.contains("rangeMin") && item.contains("rangeMax")) {
+                                UA_Range range;
+                                range.low = item["rangeMin"].get<double>();
+                                range.high = item["rangeMax"].get<double>();
+                                
+                                UA_Variant rangeVariant;
+                                UA_Variant_setScalarCopy(&rangeVariant, &range, &UA_TYPES[UA_TYPES_RANGE]);
+                                
+                                UA_VariableAttributes rangeAttr = UA_VariableAttributes_default;
+                                rangeAttr.value = rangeVariant;
+                                rangeAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EURange");
+                                
+                                UA_NodeId rangeNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 1);
+                                UA_QualifiedName rangeName = UA_QUALIFIEDNAME_ALLOC(0, "EURange");
+                                
+                                UA_Server_addVariableNode(
+                                    server, rangeNodeId, nodeId,
+                                    UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                                    rangeName,
+                                    UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
+                                    rangeAttr, NULL, NULL);
+                                
+                                UA_QualifiedName_clear(&rangeName);
+                                UA_VariableAttributes_clear(&rangeAttr);
+                            }
+                            
+                            // Add alarm limits if available
+                            if(item.contains("alarmHiHi")) {
+                                UA_Double alarmHiHi = item["alarmHiHi"].get<double>();
+                                UA_Variant alarmVariant;
+                                UA_Variant_setScalarCopy(&alarmVariant, &alarmHiHi, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                
+                                UA_VariableAttributes alarmAttr = UA_VariableAttributes_default;
+                                alarmAttr.value = alarmVariant;
+                                alarmAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "AlarmHiHi");
+                                
+                                UA_NodeId alarmNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 2);
+                                UA_QualifiedName alarmName = UA_QUALIFIEDNAME_ALLOC(0, "AlarmHiHi");
+                                UA_Server_addVariableNode(
+                                    server, alarmNodeId, nodeId,
+                                    UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                                    alarmName,
+                                    UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
+                                    alarmAttr, NULL, NULL);
+                                    
+                                UA_QualifiedName_clear(&alarmName);
+                                UA_VariableAttributes_clear(&alarmAttr);
+                            }
+                            
+                            // Add engineering unit if available
+                            if(item.contains("measurmentUnitType")) {
+                                UA_String unit = UA_STRING_ALLOC(item["measurmentUnitType"].get<std::string>().c_str());
+                                UA_Variant unitVariant;
+                                UA_Variant_setScalarCopy(&unitVariant, &unit, &UA_TYPES[UA_TYPES_STRING]);
+                                
+                                UA_VariableAttributes unitAttr = UA_VariableAttributes_default;
+                                unitAttr.value = unitVariant;
+                                unitAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EngineeringUnit");
+                                
+                                UA_NodeId unitNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 6);
+                                UA_QualifiedName unitName = UA_QUALIFIEDNAME_ALLOC(0, "EngineeringUnit");
+                                UA_Server_addVariableNode(
+                                    server, unitNodeId, nodeId,
+                                    UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                                    unitName,
+                                    UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
+                                    unitAttr, NULL, NULL);
+                                
+                                UA_QualifiedName_clear(&unitName);
+                                UA_String_clear(&unit);
+                                UA_VariableAttributes_clear(&unitAttr);
+                            }
+                        }
+                     }
+                     
+                     UA_NodeId_clear(&orgRootFolder);
+                 }, ServerJobType::AddNodes);
+                 
+                 currentBatch.clear();
+             }
+        }
+        
+        // Enqueue remaining
+        if(!currentBatch.empty()) {
+             std::shared_ptr<SessionContext> jobCtx = ctx;
+             std::vector<json> jobBatch = currentBatch;
+             enqueueServerJob([jobCtx, jobBatch](UA_Server* server) {
+                 if(jobCtx->shouldStop.load()) return;
+                 UA_NodeId orgRootFolder = UA_NODEID_STRING_ALLOC(jobCtx->namespaceIndex, ("OrgRoot_" + jobCtx->shortCode).c_str());
+                 std::map<std::string, UA_NodeId> folderMap;
+                 for(const auto& item : jobBatch) {
+                        if(!item.contains("namespace") || !item.contains("tagId")) continue;
+                        std::string ns = item["namespace"].get<std::string>();
+                        auto parts = split(ns, '/');
+                        if(parts.empty()) continue;
+                        std::string currentPath;
+                        UA_NodeId parent = orgRootFolder;
+                        for(size_t i = 0; i < parts.size() - 1; i++) {
+                            if(!currentPath.empty()) currentPath += "/";
+                            currentPath += parts[i];
+                            parent = getOrCreateFolder(server, currentPath, parts[i], parent, jobCtx->namespaceIndex, folderMap, jobCtx->nodeMap);
+                        }
+                        UA_VariableAttributes attr = UA_VariableAttributes_default;
+                        UA_Int32 value = 0;
+                        UA_Variant_setScalarCopy(&attr.value, &value, &UA_TYPES[UA_TYPES_INT32]);
+                        attr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", parts.back().c_str());
+                        if(item.contains("name")) attr.description = UA_LOCALIZEDTEXT_ALLOC("en-US", item["name"].get<std::string>().c_str());
+                        attr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
+                        int tagId = item["tagId"].get<int>();
+                        UA_NodeId nodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId);
+                        UA_QualifiedName nodeName = UA_QUALIFIEDNAME_ALLOC(jobCtx->namespaceIndex, parts.back().c_str());
+                        UA_StatusCode rc = UA_Server_addVariableNode(server, nodeId, parent, UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), nodeName, UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE), attr, NULL, NULL);
+                        UA_QualifiedName_clear(&nodeName);
+                        if(rc == UA_STATUSCODE_GOOD) {
+                            UA_ValueCallback callback;
+                            callback.onRead = NULL;
+                            callback.onWrite = writeCallback;
+                            UA_Server_setVariableNode_valueCallback(server, nodeId, callback);
+                        }
+                        UA_VariableAttributes_clear(&attr);
+                        if(rc == UA_STATUSCODE_GOOD || rc == UA_STATUSCODE_BADNODEIDEXISTS) {
+                            {
+                                std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
+                                jobCtx->nodeMap[ns] = nodeId; 
+                                nodeMap[ns] = nodeId; 
+                            }
+                            if(item.contains("rangeMin") && item.contains("rangeMax")) {
+                                UA_Range range; range.low = item["rangeMin"].get<double>(); range.high = item["rangeMax"].get<double>();
+                                UA_Variant rangeVariant; UA_Variant_setScalarCopy(&rangeVariant, &range, &UA_TYPES[UA_TYPES_RANGE]);
+                                UA_VariableAttributes rangeAttr = UA_VariableAttributes_default; rangeAttr.value = rangeVariant; rangeAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EURange");
+                                UA_NodeId rangeNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 1);
+                                UA_QualifiedName rangeName = UA_QUALIFIEDNAME_ALLOC(0, "EURange");
+                                UA_Server_addVariableNode(server, rangeNodeId, nodeId, UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY), rangeName, UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE), rangeAttr, NULL, NULL);
+                                UA_QualifiedName_clear(&rangeName); UA_VariableAttributes_clear(&rangeAttr);
+                            }
+                            if(item.contains("alarmHiHi")) {
+                                UA_Double alarmHiHi = item["alarmHiHi"].get<double>();
+                                UA_Variant alarmVariant; UA_Variant_setScalarCopy(&alarmVariant, &alarmHiHi, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                UA_VariableAttributes alarmAttr = UA_VariableAttributes_default; alarmAttr.value = alarmVariant; alarmAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "AlarmHiHi");
+                                UA_NodeId alarmNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 2);
+                                UA_QualifiedName alarmName = UA_QUALIFIEDNAME_ALLOC(0, "AlarmHiHi");
+                                UA_Server_addVariableNode(server, alarmNodeId, nodeId, UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY), alarmName, UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE), alarmAttr, NULL, NULL);
+                                UA_QualifiedName_clear(&alarmName); UA_VariableAttributes_clear(&alarmAttr);
+                            }
+                            if(item.contains("measurmentUnitType")) {
+                                UA_String unit = UA_STRING_ALLOC(item["measurmentUnitType"].get<std::string>().c_str());
+                                UA_Variant unitVariant; UA_Variant_setScalarCopy(&unitVariant, &unit, &UA_TYPES[UA_TYPES_STRING]);
+                                UA_VariableAttributes unitAttr = UA_VariableAttributes_default; unitAttr.value = unitVariant; unitAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EngineeringUnit");
+                                UA_NodeId unitNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 6);
+                                UA_QualifiedName unitName = UA_QUALIFIEDNAME_ALLOC(0, "EngineeringUnit");
+                                UA_Server_addVariableNode(server, unitNodeId, nodeId, UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY), unitName, UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE), unitAttr, NULL, NULL);
+                                UA_QualifiedName_clear(&unitName); UA_String_clear(&unit); UA_VariableAttributes_clear(&unitAttr);
+                            }
+                        }
+                 }
+                 UA_NodeId_clear(&orgRootFolder);
+             }, ServerJobType::AddNodes);
+        } 
+
+        // Populate Global TopicMap for Generic Telemetry (Write Callback)
+        {
+            std::lock_guard<std::mutex> lock(g_topicMap_mutex);
+            for(const auto& item : topicResponse["data"]) {
+                if(!item.contains("namespace") || !item.contains("tagId")) continue;
                 
-                // Add engineering unit if available
-                if(item.contains("measurmentUnitType")) {
-                    UA_String unit = UA_STRING_ALLOC(item["measurmentUnitType"].get<std::string>().c_str());
-                    UA_Variant unitVariant;
-                    UA_Variant_setScalarCopy(&unitVariant, &unit, &UA_TYPES[UA_TYPES_STRING]);
-                    
-                    UA_VariableAttributes unitAttr = UA_VariableAttributes_default;
-                    unitAttr.value = unitVariant;
-                    unitAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EngineeringUnit");
-                    
-                    UA_NodeId unitNodeId = UA_NODEID_NUMERIC(ctx->namespaceIndex, tagId * 1000 + 6);
-                    UA_QualifiedName unitName = UA_QUALIFIEDNAME_ALLOC(0, "EngineeringUnit");
-                    UA_Server_addVariableNode(
-                        server, unitNodeId, nodeId,
-                        UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
-                        unitName,
-                        UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
-                        unitAttr, NULL, NULL);
-                    
-                    UA_QualifiedName_clear(&unitName);
-                    UA_String_clear(&unit);
-                    UA_VariableAttributes_clear(&unitAttr);
-                }
+                std::string ns = item["namespace"].get<std::string>();
+                int tagId = item["tagId"].get<int>();
+                
+                TopicInfo info; // Use TopicInfo
+                info.tagId = tagId;
+                info.tagType = item.contains("tagType") ? item["tagType"].get<std::string>() : "Double";
+                info.rangeMin = item.contains("rangeMin") ? item["rangeMin"].get<double>() : 0.0;
+                info.rangeMax = item.contains("rangeMax") ? item["rangeMax"].get<double>() : 0.0;
+                
+                // Using global topicMap directly
+                topicMap[ns] = info;
             }
         }
         
-        log("✓ Created " + std::to_string(nodesCreated) + " variable nodes for org '" + 
-            ctx->shortCode + "' in namespace " + std::to_string(ctx->namespaceIndex) + 
-            " ('" + ctx->namespaceUri + "')", LogLevel::INFO);
+        // Log completion (approximate, since job is async)
+        log("✓ Submitted Address Space Creation Job for " + ctx->shortCode, LogLevel::INFO);
             
         // 📡 BATCH SUBSCRIBE: Now that all nodes are created, perform subscription
         if(ctx->shouldStop.load()) throw std::runtime_error("Session cancelled before subscription");
 
-std::vector<std::string> topicsToSubscribe;
+        std::vector<std::string> topicsToSubscribe;
         topicsToSubscribe.reserve(ctx->topics.size());
 
         {
@@ -496,7 +571,7 @@ std::vector<std::string> topicsToSubscribe;
             GlobalMQTT_SubscribeBatch(topicsToSubscribe);
         }
 
-        } // UNLOCK SERVER MUTEX
+        // } // UNLOCK SERVER MUTEX - REMOVED STRAY BRACE
 
         // ====================================================================
         // STEP 4: Fetch org-specific alarms
@@ -562,221 +637,318 @@ std::vector<std::string> topicsToSubscribe;
             LogLevel::INFO);
         
         // ====================================================================
-        // STEP 5: Create Alarm Conditions
+        // STEP 5: Create Alarm Conditions (Via Job Queue - BATCHED)
         // ====================================================================
-        log("📋 Creating alarm conditions in namespace " + std::to_string(ctx->namespaceIndex) + "...", LogLevel::INFO);
+        log("📋 Enqueuing Alarm Creation for " + std::to_string(alarms.size()) + " alarm configs (Batched)...", LogLevel::INFO);
         
-        { // LOCK SERVER MUTEX: Protect Alarm Creation from MQTT Thread
-            std::unique_lock<std::recursive_mutex> lock(g_server_mutex);
-        
-        int alarmsCreated = 0;
+        const size_t ALARM_BATCH_SIZE = 20;
+        std::vector<AlarmConfig> currentAlarmBatch;
+        currentAlarmBatch.reserve(ALARM_BATCH_SIZE);
+
         for(const auto& alarm : alarms) {
-            // Check for cancellation
-            if(ctx->shouldStop.load()) {
-                log("🛑 Worker stop signal received during Alarm Creation. Aborting...", LogLevel::WARNING);
-                throw std::runtime_error("Session cancelled by user");
-            }
-
-            if(!alarm.alarmEmitters.has_value()) continue;
+            currentAlarmBatch.push_back(alarm);
             
-            alarmsCreated++;
-            if(alarmsCreated % 50 == 0) {
-                 // Yield lock to allow other threads to run
-                 lock.unlock();
-                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                 lock.lock();
-                 log("... Processed " + std::to_string(alarmsCreated) + " / " + std::to_string(alarms.size()) + " alarms (Yielded Lock)", LogLevel::DEBUG);
-            }
-            
-            for(const auto& emitter : alarm.alarmEmitters.value()) {
-                // Sanitize emitter name (remove trailing slash)
-                std::string searchKey = emitter.emitterNodeName;
-                if(!searchKey.empty() && searchKey.back() == '/') {
-                    searchKey.pop_back();
-                }
+            if(currentAlarmBatch.size() >= ALARM_BATCH_SIZE) {
+                 // Enqueue Batch
+                 std::shared_ptr<SessionContext> alarmJobCtx = ctx;
+                 std::vector<AlarmConfig> jobAlarms = std::move(currentAlarmBatch);
+                 
+                enqueueServerJob([alarmJobCtx, jobAlarms](UA_Server* server) {
+                    if(alarmJobCtx->shouldStop.load()) return;
+                    
+                    int alarmsCreated = 0;
+                    for(const auto& alarm : jobAlarms) {
+                        if(alarmJobCtx->shouldStop.load()) {
+                             log("🛑 Job: Worker stop signal received during Alarm Creation. Aborting...", LogLevel::WARNING);
+                             return;
+                        }
 
-                // Find emitter node in org's nodeMap
-                auto it = ctx->nodeMap.find(searchKey);
-                if(it == ctx->nodeMap.end()) {
-                    log("⚠️ No node found for emitter: " + emitter.emitterNodeName, LogLevel::ERRORS);
-                    
-                    // DEBUG: Dump first 10 keys in map to see what IS there
-                    int limit = 0;
-                    log("--- Dumping Available NodeMap keys (First 10) ---", LogLevel::INFO);
-                    for(const auto& pair : ctx->nodeMap) {
-                        log("Key: '" + pair.first + "'", LogLevel::INFO);
-                        if(++limit >= 10) break;
-                    }
-                    log("--- End Dump ---", LogLevel::INFO);
-                    
-                    continue;
-                }
-                
-                UA_NodeId sourceNode = it->second;
-                std::string alarmKey = emitter.emitterNodeName + "-" + alarm.name;
-                
-                // Deterministic NodeId (String) for Multi-Tenancy
-                UA_NodeId requestedNodeId = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, alarmKey.c_str());
-                
-                // Set EventNotifier on emitter BEFORE creating condition
-                // This ensures the A&C subsystem registers this node as a valid ConditionSource
-                UA_Byte eventNotifier = 0x01; 
-                UA_StatusCode evtRc = UA_Server_writeEventNotifier(server, sourceNode, eventNotifier);
-                if(evtRc != UA_STATUSCODE_GOOD) {
-                    log("❌ Failed to set EventNotifier on source node " + emitter.emitterNodeName + ": " + UA_StatusCode_name(evtRc), LogLevel::INFO);
-                } else {
-                    log("✓ EventNotifier set on source node " + emitter.emitterNodeName, LogLevel::INFO);
-                }
-
-                // Create condition in org's namespace
-                UA_NodeId alarmId = UA_NODEID_NULL;
-                UA_StatusCode sc = UA_Server_createCondition(
-                    server, requestedNodeId,
-                    UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE),
-                    UA_QUALIFIEDNAME(ctx->namespaceIndex, (char*)alarm.name.c_str()), 
-                    sourceNode,
-                    UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
-                    &alarmId
-                );
-                
-                UA_NodeId_clear(&requestedNodeId); // Clear our copy
-                
-                if(sc == UA_STATUSCODE_BADNODEIDEXISTS) {
-                     // Alarm already exists (created by another session for this org)
-                     // Reconstruct NodeId for local map
-                     alarmId = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, alarmKey.c_str());
-                     ctx->alarmMap[alarmKey] = alarmId;
-                     continue; 
-                }
-                
-                if(sc == UA_STATUSCODE_GOOD) {
-                    // Initialize alarm state (STEALTH MODE)
-                    UA_Boolean enabled = alarm.enable ? UA_TRUE : UA_FALSE;
-                    setStealthValueByPath(server, alarmId, {"EnabledState", "Id"}, &enabled, &UA_TYPES[UA_TYPES_BOOLEAN]);
-                    
-                    UA_Boolean inactive = UA_FALSE;
-                    setStealthValueByPath(server, alarmId, {"ActiveState", "Id"}, &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]);
-                    setStealthValueChecked(server, alarmId, "ActiveState", &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]);
-                    setStealthValueByPath(server, alarmId, {"AckedState", "Id"}, &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]);
-                    setStealthValueChecked(server, alarmId, "Retain", &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]);
-                    
-                    UA_UInt16 initialSeverity = 0;
-                    setStealthValueChecked(server, alarmId, "Severity", &initialSeverity, &UA_TYPES[UA_TYPES_UINT16]);
-                    
-                    UA_LocalizedText initialMsg = UA_LOCALIZEDTEXT((char*)"en-US", (char*)"Alarm initialized (inactive)");
-                    setStealthValueChecked(server, alarmId, "Message", &initialMsg, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-                    
-
-                    // Verify NodeClass of created alarm
-                    UA_NodeClass nodeClass;
-                    UA_Server_readNodeClass(server, alarmId, &nodeClass);
-                    log("ℹ️ Created alarm '" + alarm.name + "' NodeClass: " + std::to_string(nodeClass) + " (1=Object, 2=Variable)", LogLevel::INFO);
-                    
-                    // Register method callbacks
-                    UA_NodeId methodId;
-                    methodId = findChildNodeIdAnyNS(server, alarmId, "Acknowledge");
-                    if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customAcknowledgeCallback);
-                    
-                    methodId = findChildNodeIdAnyNS(server, alarmId, "Confirm");
-                    if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customConfirmCallback);
-                    
-                    methodId = findChildNodeIdAnyNS(server, alarmId, "AddComment");
-                    if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customAddCommentCallback);
-                    
-                    methodId = findChildNodeIdAnyNS(server, alarmId, "Enable");
-                    if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customEnableCallback);
-                    
-                    methodId = findChildNodeIdAnyNS(server, alarmId, "Disable");
-                    if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customDisableCallback);
-                    
-                    // Populate g_triggerToAlarmMap (Thread Safe)
-                    // Populate g_triggerToAlarmMap using Emitter Topic (User Requirement)
-                    std::string topic = searchKey; // Use sanitised emitter name
-                    
-                    if(!topic.empty()) {
-                         if(alarm.alarmTriggers.has_value()) {
-                             std::lock_guard<std::mutex> lock(g_alarmMutex);
-                             for(const auto& trigger : alarm.alarmTriggers.value()) {
-                                  TriggerToAlarmMapping mapping;
-                                  mapping.triggerTopic = topic;
-                                  mapping.alarmKey = alarmKey;
-                                  mapping.triggerId = trigger.id;
-                                  mapping.alarmId = alarm.id;
-                                  mapping.alarmInstanceId = 0;
-                                  
-                              bool exists = false;
-                              auto& list = g_triggerToAlarmMap[topic];
-                              for(const auto& m : list) {
-                                  if(m.alarmKey == alarmKey && m.triggerId == trigger.id) {
-                                      exists = true;
-                                      break;
-                                  }
-                              }
-                              if(!exists) {
-                                  g_triggerToAlarmMap[topic].push_back(mapping);
-                              }
-
-                             }
-                             // Populate global lookup map
-                             // Allocate a fresh NodeId to ensure validity (avoid dangling pointers from createCondition outputs)
-                             UA_NodeId safeAlarmId = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, alarmKey.c_str());
-                             // Check for existing key to avoid leak
-                             if(g_alarmByKey.find(alarmKey) != g_alarmByKey.end()) {
-                                 UA_NodeId_clear(&g_alarmByKey[alarmKey]);
-                             }
-                             g_alarmByKey[alarmKey] = safeAlarmId;
-                         }
-
-
-                         // via logic in perform_subscriptions (server.cpp) IF the topic is in the map.
-                         log("DEBUG: Subscribing to Emitter Topic (Alarm Prepared): " + topic, LogLevel::INFO);
-                         // FIX: Replaced direct subscribe with batched + deduped logic
-                         {
-                            std::lock_guard<std::mutex> lock(g_sub_mutex);
-
-                            // Cancel pending unsubscribe if present
-                            auto it = std::find(g_unsubscription_queue.begin(),
-                                                g_unsubscription_queue.end(),
-                                                topic);
-                            if(it != g_unsubscription_queue.end()) {
-                                g_unsubscription_queue.erase(it);
-                                g_subscribed_topics.insert(topic);
-                                log("DEBUG: Cancelled pending unsub for emitter: " + topic, LogLevel::INFO);
-                            } else if(!g_subscribed_topics.contains(topic)) {
-                                // O(1) Check using Pending Set
-                                if(g_pending_subscriptions.insert(topic).second) {
-                                     g_subscription_queue.push_back(topic);
-                                }
+                        if(!alarm.alarmEmitters.has_value()) continue;
+                        
+                        alarmsCreated++;
+                        
+                        for(const auto& emitter : alarm.alarmEmitters.value()) {
+                            // Sanitize emitter name
+                            std::string searchKey = emitter.emitterNodeName;
+                            if(!searchKey.empty() && searchKey.back() == '/') {
+                                searchKey.pop_back();
                             }
-                         }
 
-                         ctx->subscribedEmitters.push_back(topic);
-                    } else {
-                         log("WARNING: Emitter (ID: " + std::to_string(emitter.id) + 
-                             ") has EMPTY emitterNodeName! MQTT subscription skipped.", LogLevel::ERRORS);
+                            // Find emitter node
+                            UA_NodeId sourceNode = UA_NODEID_NULL;
+                            if(alarmJobCtx->nodeMap.count(searchKey)) { // Check local map
+                                sourceNode = alarmJobCtx->nodeMap[searchKey];
+                            } else {
+                                std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
+                                if(nodeMap.count(searchKey)) sourceNode = nodeMap[searchKey];
+                            }
+                            
+                            if(UA_NodeId_isNull(&sourceNode)) {
+                                continue;
+                            }
+
+                            std::string alarmKey = emitter.emitterNodeName + "-" + alarm.name;
+                            
+                            // Deterministic NodeId (String)
+                            UA_NodeId requestedNodeId = UA_NODEID_STRING_ALLOC(alarmJobCtx->namespaceIndex, alarmKey.c_str());
+                            
+                            // Set EventNotifier
+                            UA_Byte eventNotifier = 0x01; 
+                            UA_Server_writeEventNotifier(server, sourceNode, eventNotifier);
+
+                            // Create condition
+                            UA_NodeId alarmId = UA_NODEID_NULL;
+                            UA_StatusCode sc = UA_Server_createCondition(
+                                server, requestedNodeId,
+                                UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE),
+                                UA_QUALIFIEDNAME_ALLOC(alarmJobCtx->namespaceIndex, alarm.name.c_str()), 
+                                sourceNode,
+                                UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                                &alarmId
+                            );
+                            
+                            UA_NodeId_clear(&requestedNodeId);
+                            
+                            if(sc == UA_STATUSCODE_BADNODEIDEXISTS) {
+                                 alarmId = UA_NODEID_STRING_ALLOC(alarmJobCtx->namespaceIndex, alarmKey.c_str());
+                            } else if(sc == UA_STATUSCODE_GOOD) {
+                                // Initialize alarm state
+                                UA_Boolean enabled = alarm.enable ? UA_TRUE : UA_FALSE;
+                                setStealthValueByPath(server, alarmId, {"EnabledState", "Id"}, &enabled, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                                UA_Boolean inactive = UA_FALSE;
+                                setStealthValueByPath(server, alarmId, {"ActiveState", "Id"}, &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                                setStealthValueByPath(server, alarmId, {"AckedState", "Id"}, &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                                setStealthValueChecked(server, alarmId, "Severity", &inactive, &UA_TYPES[UA_TYPES_UINT16]); // 0 severity
+                                // Methods
+                                UA_NodeId methodId = findChildNodeIdAnyNS(server, alarmId, "Acknowledge");
+                                if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customAcknowledgeCallback);
+                                methodId = findChildNodeIdAnyNS(server, alarmId, "Confirm");
+                                if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customConfirmCallback);
+                                methodId = findChildNodeIdAnyNS(server, alarmId, "AddComment");
+                                if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customAddCommentCallback);
+                                methodId = findChildNodeIdAnyNS(server, alarmId, "Enable");
+                                if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customEnableCallback);
+                                methodId = findChildNodeIdAnyNS(server, alarmId, "Disable");
+                                if(!UA_NodeId_isNull(&methodId)) UA_Server_setMethodNodeCallback(server, methodId, customDisableCallback);
+                            }
+                            
+                            // Populate Maps
+                            if(!UA_NodeId_isNull(&alarmId)) {
+                                // 1. Local Map
+                                // 1. Local Map (Deep Copy)
+                                UA_NodeId mapCopy;
+                                UA_NodeId_copy(&alarmId, &mapCopy);
+                                alarmJobCtx->alarmMap[alarmKey] = mapCopy;
+                                
+                                // Vector to collect subscriptions for THIS alarm
+                                std::vector<std::string> pendingEventSubs; 
+
+                                // 2. Global Maps (Protected)
+                                {
+                                    std::lock_guard<std::mutex> lock(g_alarmMutex);
+                                    
+                                    UA_NodeId globalId;
+                                    UA_NodeId_copy(&alarmId, &globalId);
+                                    
+                                    if(g_alarmByKey.count(alarmKey)) {
+                                         UA_NodeId_clear(&g_alarmByKey[alarmKey]);
+                                    }
+                                    g_alarmByKey[alarmKey] = globalId;
+
+                                    // Populate g_triggerToAlarmMap with EMITTER Topic (e.g. TDSPL/JPR)
+                                    // This allows alarms to be triggered by the device that emits them.
+                                    std::string emitterTopic = searchKey; 
+                                    if(!emitterTopic.empty()) {
+                                         TriggerToAlarmMapping mapping;
+                                         mapping.triggerTopic = emitterTopic;
+                                         mapping.alarmKey = alarmKey;
+                                         mapping.alarmId = alarm.id;
+                                         mapping.alarmInstanceId = 0;
+                                         mapping.triggerId = 0; // Default if no specific trigger
+
+                                         // Use the first trigger ID if available, just in case
+                                         if(alarm.alarmTriggers.has_value() && !alarm.alarmTriggers.value().empty()) {
+                                              mapping.triggerId = alarm.alarmTriggers.value()[0].id;
+                                         }
+                                         
+                                         // Deduplicate
+                                         bool exists = false;
+                                         for(const auto& m : g_triggerToAlarmMap[mapping.triggerTopic]) {
+                                             if(m.alarmKey == mapping.alarmKey && m.alarmId == mapping.alarmId) { exists = true; break; }
+                                         }
+                                         if(!exists) {
+                                            g_triggerToAlarmMap[mapping.triggerTopic].push_back(mapping);
+                                            log("DEBUG: Mapped Emitter '" + mapping.triggerTopic + "' -> Alarm " + std::to_string(mapping.alarmId), LogLevel::INFO);
+                                         }
+                                    }
+
+                                    // Populate g_triggerToAlarmMap with EXPLICIT TRIGGER Topics
+                                    if(alarm.alarmTriggers.has_value()) {
+                                        for(const auto& trigger : alarm.alarmTriggers.value()) {
+                                            if(trigger.topic.empty() || trigger.topic == emitterTopic) continue; // Skip empty or if already mapped as emitter
+
+                                            TriggerToAlarmMapping mapping;
+                                            mapping.triggerTopic = trigger.topic; // The actual trigger topic!
+                                            mapping.alarmKey = alarmKey;
+                                            mapping.alarmId = alarm.id;
+                                            mapping.alarmInstanceId = 0;
+                                            mapping.triggerId = trigger.id;
+                                            
+                                            // Deduplicate
+                                            bool exists = false;
+                                            for(const auto& m : g_triggerToAlarmMap[mapping.triggerTopic]) {
+                                                 if(m.alarmKey == mapping.alarmKey && m.alarmId == mapping.alarmId) { exists = true; break; }
+                                            }
+                                            if(!exists) {
+                                                g_triggerToAlarmMap[mapping.triggerTopic].push_back(mapping);
+                                            }
+                                        }
+                                    }
+                                } // End Lock Scope
+
+                                // ------------------------------------------------------------------
+                                // 3. Subscribe to /Event topics (Safe outside lock)
+                                // ------------------------------------------------------------------
+                                std::string emitterTopic = searchKey;
+                                if(!emitterTopic.empty()) {
+                                    pendingEventSubs.push_back(emitterTopic + "/Event");
+                                }
+                                if(alarm.alarmTriggers.has_value()) {
+                                    for(const auto& trigger : alarm.alarmTriggers.value()) {
+                                        if(!trigger.topic.empty()) {
+                                            pendingEventSubs.push_back(trigger.topic + "/Event");
+                                        }
+                                    }
+                                }
+                                
+                                if(!pendingEventSubs.empty()) {
+                                    GlobalMQTT_SubscribeBatch(pendingEventSubs);
+                                }
+                                
+                                UA_NodeId_clear(&alarmId);
+                            }
+                        }
                     }
+                }, ServerJobType::AddAlarms);
 
-                    // Store in map
-                    ctx->alarmMap[alarmKey] = UA_NODEID_STRING_ALLOC(ctx->namespaceIndex, alarmKey.c_str());
-                    alarmsCreated++;
-                } else {
-                    // FIX: Explicitly convert C-string to std::string to avoid pointer arithmetic issues
-                    // or potential char vs string addition confusion.
-                    // Also HEX print code to be sure.
-                    std::string errName = (alarm.name.empty() ? "Unknown" : alarm.name);
-                    const char* scName = UA_StatusCode_name(sc);
-                    std::string scStr = (scName ? std::string(scName) : "UnknownStatusCode");
-                    
-                    std::stringstream ss;
-                    ss << "❌ Failed to create alarm '" << errName << "': " << scStr << " (0x" << std::hex << sc << ")";
-                    log(ss.str(), LogLevel::ERRORS);
-                }
+                currentAlarmBatch.clear();
             }
         }
         
-        log("✓ Created " + std::to_string(alarmsCreated) + " alarm conditions", LogLevel::INFO);
-        
-        } // UNLOCK SERVER MUTEX
+        // Enqueue remaining
+        if(!currentAlarmBatch.empty()) {
+             std::shared_ptr<SessionContext> alarmJobCtx = ctx;
+             std::vector<AlarmConfig> jobAlarms = std::move(currentAlarmBatch);
+             enqueueServerJob([alarmJobCtx, jobAlarms](UA_Server* server) {
+                  if(alarmJobCtx->shouldStop.load()) return;
+                  for(const auto& alarm : jobAlarms) {
+                        if(!alarm.alarmEmitters.has_value()) continue;
+                        for(const auto& emitter : alarm.alarmEmitters.value()) {
+                            std::string searchKey = emitter.emitterNodeName;
+                            if(!searchKey.empty() && searchKey.back() == '/') searchKey.pop_back();
+                            UA_NodeId sourceNode = UA_NODEID_NULL;
+                            if(alarmJobCtx->nodeMap.count(searchKey)) sourceNode = alarmJobCtx->nodeMap[searchKey];
+                            else { std::lock_guard<std::mutex> lock(g_nodeMap_mutex); if(nodeMap.count(searchKey)) sourceNode = nodeMap[searchKey]; }
+                            if(UA_NodeId_isNull(&sourceNode)) continue;
+                            std::string alarmKey = emitter.emitterNodeName + "-" + alarm.name;
+                            UA_NodeId requestedNodeId = UA_NODEID_STRING_ALLOC(alarmJobCtx->namespaceIndex, alarmKey.c_str());
+                            UA_Byte eventNotifier = 0x01; UA_Server_writeEventNotifier(server, sourceNode, eventNotifier);
+                            UA_NodeId alarmId = UA_NODEID_NULL;
+                            UA_StatusCode sc = UA_Server_createCondition(server, requestedNodeId, UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE), UA_QUALIFIEDNAME_ALLOC(alarmJobCtx->namespaceIndex, alarm.name.c_str()), sourceNode, UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT), &alarmId);
+                            UA_NodeId_clear(&requestedNodeId);
+                            if(sc == UA_STATUSCODE_BADNODEIDEXISTS) alarmId = UA_NODEID_STRING_ALLOC(alarmJobCtx->namespaceIndex, alarmKey.c_str());
+                            else if(sc == UA_STATUSCODE_GOOD) {
+                                UA_Boolean enabled = alarm.enable ? UA_TRUE : UA_FALSE; setStealthValueByPath(server, alarmId, {"EnabledState", "Id"}, &enabled, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                                UA_Boolean inactive = UA_FALSE; setStealthValueByPath(server, alarmId, {"ActiveState", "Id"}, &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]); setStealthValueByPath(server, alarmId, {"AckedState", "Id"}, &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]); setStealthValueChecked(server, alarmId, "Severity", &inactive, &UA_TYPES[UA_TYPES_UINT16]);
+                                UA_NodeId mId = findChildNodeIdAnyNS(server, alarmId, "Acknowledge"); if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customAcknowledgeCallback);
+                                mId = findChildNodeIdAnyNS(server, alarmId, "Confirm"); if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customConfirmCallback);
+                                mId = findChildNodeIdAnyNS(server, alarmId, "AddComment"); if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customAddCommentCallback);
+                                mId = findChildNodeIdAnyNS(server, alarmId, "Enable"); if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customEnableCallback);
+                                mId = findChildNodeIdAnyNS(server, alarmId, "Disable"); if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customDisableCallback);
+                            }
+                            if(!UA_NodeId_isNull(&alarmId)) {
+                                UA_NodeId mapCopy;
+                                UA_NodeId_copy(&alarmId, &mapCopy);
+                                alarmJobCtx->alarmMap[alarmKey] = mapCopy;
+                                
+                                // Vector to collect subscriptions for THIS alarm
+                                std::vector<std::string> pendingEventSubs; 
+
+                                // 2. Global Maps (Protected)
+                                {
+                                    std::lock_guard<std::mutex> lock(g_alarmMutex);
+                                    UA_NodeId globalId; UA_NodeId_copy(&alarmId, &globalId);
+                                    if(g_alarmByKey.count(alarmKey)) UA_NodeId_clear(&g_alarmByKey[alarmKey]);
+                                    g_alarmByKey[alarmKey] = globalId;
+
+                                    std::string emitterTopic = searchKey;
+                                    if(!emitterTopic.empty()) {
+                                         TriggerToAlarmMapping mapping;
+                                         mapping.triggerTopic = emitterTopic;
+                                         mapping.alarmKey = alarmKey;
+                                         mapping.alarmId = alarm.id;
+                                         mapping.alarmInstanceId = 0;
+                                         mapping.triggerId = 0; 
+
+                                         if(alarm.alarmTriggers.has_value() && !alarm.alarmTriggers.value().empty()) {
+                                              mapping.triggerId = alarm.alarmTriggers.value()[0].id;
+                                         }
+                                         
+                                         bool exists = false;
+                                         for(const auto& m : g_triggerToAlarmMap[mapping.triggerTopic]) {
+                                             if(m.alarmKey == mapping.alarmKey && m.alarmId == mapping.alarmId) { exists = true; break; }
+                                         }
+                                         if(!exists) {
+                                            g_triggerToAlarmMap[mapping.triggerTopic].push_back(mapping);
+                                            log("DEBUG: Mapped Emitter '" + mapping.triggerTopic + "' -> Alarm " + std::to_string(mapping.alarmId), LogLevel::INFO);
+                                         }
+                                    }
+
+                                    if(alarm.alarmTriggers.has_value()) {
+                                        for(const auto& trigger : alarm.alarmTriggers.value()) {
+                                            if(trigger.topic.empty() || trigger.topic == emitterTopic) continue;
+
+                                            TriggerToAlarmMapping mapping;
+                                            mapping.triggerTopic = trigger.topic; 
+                                            mapping.alarmKey = alarmKey;
+                                            mapping.alarmId = alarm.id;
+                                            mapping.alarmInstanceId = 0;
+                                            mapping.triggerId = trigger.id;
+                                            
+                                            bool exists = false;
+                                            for(const auto& m : g_triggerToAlarmMap[mapping.triggerTopic]) {
+                                                 if(m.alarmKey == mapping.alarmKey && m.alarmId == mapping.alarmId) { exists = true; break; }
+                                            }
+                                            if(!exists) {
+                                                g_triggerToAlarmMap[mapping.triggerTopic].push_back(mapping);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 3. Subscribe to /Event topics
+                                std::string emitterTopic = searchKey;
+                                if(!emitterTopic.empty()) {
+                                    pendingEventSubs.push_back(emitterTopic + "/Event");
+                                }
+                                if(alarm.alarmTriggers.has_value()) {
+                                    for(const auto& trigger : alarm.alarmTriggers.value()) {
+                                        if(!trigger.topic.empty()) {
+                                            pendingEventSubs.push_back(trigger.topic + "/Event");
+                                        }
+                                    }
+                                }
+                                
+                                if(!pendingEventSubs.empty()) {
+                                    GlobalMQTT_SubscribeBatch(pendingEventSubs);
+                                }
+                                
+                                UA_NodeId_clear(&alarmId);
+                            }
+                        }
+                  }
+             }, ServerJobType::AddAlarms);
+        }
 
         // ====================================================================
         // STEP 5: Main worker loop - keep thread alive until session closes
@@ -804,168 +976,9 @@ std::vector<std::string> topicsToSubscribe;
     // ====================================================================
     // RESOURCE CLEANUP (Prevent Memory Leaks)
     // ====================================================================
-    log("🧹 Cleaning up resources for org '" + ctx->shortCode + "'", LogLevel::INFO);
-
-    // 1. Unsubscribe from MQTT Topics
-        if(!ctx->topics.empty()) {
-            log("🧹 Batch unsubscribing from " + std::to_string(ctx->topics.size()) + " topics... [SKIPPED to persist]", LogLevel::INFO);
-            // DISABLED by user request: "only unsubscribe when server is closed"
-            // GlobalMQTT_UnsubscribeBatch(ctx->topics);
-        }
-        log("DEBUG: MQTT Unsubscribe complete. Clearing local maps...", LogLevel::DEBUG);
-
-        // 2. Clear Alarm Map (Local)
-        // MOVED: alarmMap clearing must happen AFTER removing from global g_alarmByKey
-        // ctx->alarmMap.clear(); 
-        // log("DEBUG: Local Alarm Map cleared.", LogLevel::DEBUG);
-        
-        // 3. Remove from Global Maps (if we added them)
-    // Also unsubscribe from Emitter topics used in alarms?! 
-    // Those are dynamic. We should track them or rely on g_triggerToAlarmMap check?
-    // Current implementation only tracks 'topics' (generic telemetry).
-    // Alarm triggers (emitters) are effectively leaked subscriptions if unique.
-    // Ideally we should track them in ctx context too.
+    log("🧹 Cleanup will be handled by SessionContext destructor.", LogLevel::INFO);
     
-    // 2. Clear Context Maps (Nodes)
-    // ctx->nodeMap and ctx->alarmMap contain UA_NodeIds.
-    // Since we allocated them (UA_NODEID_STRING_ALLOC etc), we should verify if they need clearing.
-    // The UA_NodeId struct simply holds a pointer. The Server/AddressSpace owns the node content, 
-    // but the NodeId struct in our map might own a string copy.
-    // Answer: Yes, UA_NODEID_STRING_ALLOC allocates memory for the identifier.
-    
-    // 2. Clear Context Maps (Nodes)
-    // First, remove these alarms from the GLOBAL alarm map to prevent MQTT thread access
-    {
-        std::lock_guard<std::mutex> alarmLock(g_alarmMutex);
-        for(auto& pair : ctx->alarmMap) {
-             // Remove from global map
-             g_alarmByKey.erase(pair.first);
-        }
-    }
-    log("🧹 Removed " + std::to_string(ctx->alarmMap.size()) + " alarms from global lookup.", LogLevel::INFO);
-
-    for(auto& pair : ctx->alarmMap) {
-         UA_NodeId_clear(&pair.second);
-    }
-    ctx->alarmMap.clear();
-
-    // 3. Remove from Global Maps (if we added them)
-    std::vector<UA_NodeId> nodesToDelete;
-    {
-        // DISABLED by user request: "this g_nodeMap_mutex is creating problems" / freeze
-        // AND "do not unsubscribe anything" => implies we should persist the mappings too.
-        // If we clear nodeMap, MQTT writes will fail (node not found) even if we stay subscribed.
-        // So we MUST SKIP this to truly persist.
-        
-        /*
-        std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
-        log("🧹 Locking g_nodeMap_mutex to clear " + std::to_string(ctx->topics.size()) + " topics...", LogLevel::DEBUG);
-        size_t count = 0;
-        for(const auto& topic : ctx->topics) {
-             auto it = nodeMap.find(topic);
-             if(it != nodeMap.end()) {
-                 UA_NodeId_clear(&it->second);
-                 nodeMap.erase(it);
-             }
-             if(++count % 500 == 0) {
-                 log("... Cleared " + std::to_string(count) + " / " + std::to_string(ctx->topics.size()), LogLevel::DEBUG);
-             }
-        }
-        log("🧹 g_nodeMap_mutex released.", LogLevel::DEBUG);
-        */
-        log("🧹 Skipping NodeMap cleanup to persist data flow and avoid freeze.", LogLevel::INFO);
-    }
-    
-    // safe deletion outside map lock (Optimized: Rely on RootFolder delete)
-    // log("🧹 Clearing " + std::to_string(nodesToDelete.size()) + " nodes from global map...", LogLevel::INFO);
-    nodesToDelete.clear();
-
-    // Also delete the Organization Root Folder (Recursively cleans up ALL children)
-    //if(!UA_NodeId_isNull(&orgRootFolder)) {
-    //    log("🧹 Deleting Org Root Folder from server (Recursive)...", LogLevel::INFO);
-    //    
-    //    // LOCK SERVER MUTEX:
-    //    // Protect against concurrent logic (e.g. MQTT writes) that touch the address space.
-    //    // open62541 internal structures are not thread-safe if accessing same nodes.
-    //    {
-    //        std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
-    //        // SKIPPING DELETION TO PREVENT FREEZE
-    //        // UA_Server_deleteNode(server, orgRootFolder, true); 
-    //        log("⚠️ SKIPPED Deleting Org Root Folder (Manual Override)", LogLevel::WARNING);
-    //    }
-    //    
-    //    UA_NodeId_clear(&orgRootFolder);
-    //}
-    
-    // Safety: Iterate local nodeMap and try to delete any remaining nodes
-    // (Only if not already deleted)
-    //int remainingDeleted = 0;
-    //for(auto& pair : ctx->nodeMap) {
-        // Check if node still exists before trying to delete (cheap check? no, just try delete)
-        // Does this cause error? Yes, BadNodeIdUnknown.
-        // Is it slow? Yes, 3000 fails is slow.
-        // Strategy: Assume ctx->nodeMap contents were largely children of orgRootFolder.
-        // But we must clean up UA_NodeId structs.
-        // We can just clear the structs.
-    //    UA_NodeId_clear(&pair.second);
-    //}
-    log("🧹 Local NodeMap cleared.", LogLevel::INFO);
-
-    ctx->nodeMap.clear();
-
-    // REMOVED from topicMap (Generic Telemetry)
-    {
-        std::lock_guard<std::mutex> lock(g_topicMap_mutex);
-        for(const auto& topic : ctx->topics) {
-            topicMap.erase(topic);
-        }
-    }
-
-
-    // 5. Cleanup Emitter Subscriptions and Trigger Mappings
-    if(!ctx->subscribedEmitters.empty()) {
-        log("🧹 Unsubscribing from " + std::to_string(ctx->subscribedEmitters.size()) + " emitter topics... [SKIPPED to persist]", LogLevel::INFO);
-        // Unsubscribe from MQTT
-        // DISABLED by user request: "only unsubscribe when server is closed"
-        // GlobalMQTT_UnsubscribeBatch(ctx->subscribedEmitters);
-        
-        // Cleanup g_triggerToAlarmMap
-        // Cleanup g_triggerToAlarmMap
-        // OPTIMIZATION: Instead of iterating all subscribed emitters and searching the map,
-        // we can just efficiently remove using the known trigger topics if possible.
-        // However, g_triggerToAlarmMap is keyed by Topic.
-        
-        std::lock_guard<std::mutex> lock(g_alarmMutex);
-        // Better Approach: Iterate the global map only for topics we know we subscribed to
-        for(const auto& topic : ctx->subscribedEmitters) {
-            auto mapIt = g_triggerToAlarmMap.find(topic);
-            if(mapIt != g_triggerToAlarmMap.end()) {
-                 auto& list = mapIt->second;
-                 // Remove entries where the alarmKey belongs to this session
-                 // Since we know the alarms, we could check against ctx->alarmMap
-                 // Logic: remove_if alarmKey is in ctx->alarmMap
-                 
-                 // If list is small, this is fast. If list is huge (many sessions on same topic), this is linear.
-                 // Given the "freezing", maybe the list IS huge?
-                 // Or maybe thousands of topics?
-                 
-                 // If we are deleting the session, we know ALL alarms in ctx->alarmMap are gone.
-                 if(!list.empty()) {
-                     list.erase(std::remove_if(list.begin(), list.end(), 
-                         [&](const TriggerToAlarmMapping& m) {
-                             return ctx->alarmMap.count(m.alarmKey) > 0;
-                         }), list.end());
-                 }
-                 
-                 if(list.empty()) {
-                     g_triggerToAlarmMap.erase(mapIt);
-                 }
-            }
-        }
-    }
-    
-    // Ideally ctx should track 'myAlarmKeys'.
-    
-    //UA_NodeId_clear(&orgRootFolder);
-    log("✓ Cleanup complete for org '" + ctx->shortCode + "'", LogLevel::INFO);
+    // Note: Actual cleanup of nodeMap, alarmMap, and global keys happens 
+    // when the SessionContext shared_ptr refCount drops to zero.
 }
+

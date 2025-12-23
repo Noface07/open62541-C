@@ -5,7 +5,8 @@
 #include <iomanip>
 
 // Forward declaration of worker thread function
-void sessionWorkerThread(SessionContext* ctx, UA_Server* server,
+// Forward declaration of worker thread function
+void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                         const std::string& bearerToken,
                         const std::string& apiHost, const std::string& apiPort);
 
@@ -106,18 +107,24 @@ bool SessionManager::registerSession(const UA_NodeId& sessionId,
     std::string sessionKey = formatNodeId(&sessionId);
     
     // Create session context
-    auto ctx = std::make_unique<SessionContext>();
+    auto ctx = std::make_shared<SessionContext>();
     ctx->sessionKey = sessionKey;
     ctx->shortCode = shortCode;
     ctx->orgId = orgConfig->orgId;
     ctx->namespaceUri = "Anexee:" + orgConfig->shortCode;
     ctx->shouldStop.store(false);
     
+    // Synchronously register namespace to avoid race conditions with Access Control
+    // This ensures ctx->namespaceIndex can be resolved immediately by CheckAccess
+    ctx->namespaceIndex = UA_Server_addNamespace(server, ctx->namespaceUri.c_str());
+    log("✓ Registered namespace '" + ctx->namespaceUri + "' at index " + std::to_string(ctx->namespaceIndex), LogLevel::INFO);
+    
     log("🧵 Creating dedicated worker thread for org '" + shortCode + "' (OrgID: " + 
         std::to_string(orgConfig->orgId) + ")", LogLevel::INFO);
     
     // Spawn dedicated worker thread
-    ctx->workerThread = std::thread(sessionWorkerThread, ctx.get(), server,
+    // Keep a weak_ptr or just pass shared_ptr (worker holds reference)
+    ctx->workerThread = std::thread(sessionWorkerThread, ctx, server,
                                     bearerToken, apiHost, apiPort);
     
     // Store context
@@ -138,7 +145,7 @@ bool SessionManager::registerSession(const UA_NodeId& sessionId,
 // Unregister session and cleanup
 // Unregister session and cleanup
 void SessionManager::unregisterSession(const UA_NodeId& sessionId) {
-    std::unique_ptr<SessionContext> ctx_ptr;
+    std::shared_ptr<SessionContext> ctx_ptr;
     std::string shortCode;
 
     {
@@ -182,14 +189,18 @@ void SessionManager::unregisterSession(const UA_NodeId& sessionId) {
     }
 }
 
-// Get session context (thread-safe read)
-SessionContext* SessionManager::getSession(const UA_NodeId& sessionId) {
+// Get session context (thread-safe, shared ownership)
+std::shared_ptr<SessionContext> SessionManager::getSession(const UA_NodeId& sessionId) {
     std::lock_guard<std::mutex> lock(managerMutex);
     
     std::string sessionKey = formatNodeId(&sessionId);
     auto it = sessions.find(sessionKey);
     
-    return (it != sessions.end()) ? it->second.get() : nullptr;
+    if(it != sessions.end()) {
+        return it->second;
+    }
+    
+    return nullptr;
 }
 
 // Get active session count
@@ -205,4 +216,42 @@ bool SessionManager::isValidShortCode(const std::string& shortCode) const {
         if(org.shortCode == shortCode) return true;
     }
     return false;
+}
+
+// ============================================================================
+// SessionContext Implementation (Cleanup)
+// ============================================================================
+extern std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
+extern std::mutex g_alarmMutex;
+
+SessionContext::~SessionContext() {
+    // 1. Stop worker if running
+    shouldStop = true;
+    cv.notify_all();
+    if (workerThread.joinable()) {
+        try {
+            workerThread.join();
+        } catch(...) {}
+    }
+
+    // 2. Remove Alarms from Global Map (Thread-Safe)
+    if(!alarmMap.empty()) {
+        std::lock_guard<std::mutex> lock(g_alarmMutex);
+        for(const auto& pair : alarmMap) {
+            // Only remove if it exists (safe check)
+            // DISABLED: User requested to keep address space persistent across reconnections
+            // g_alarmByKey.erase(pair.first); 
+        }
+    }
+
+    // 3. Clear Local Maps (Memory Cleanup)
+    for(auto& pair : alarmMap) {
+        UA_NodeId_clear(&pair.second);
+    }
+    alarmMap.clear();
+
+    for(auto& pair : nodeMap) {
+        UA_NodeId_clear(&pair.second);
+    }
+    nodeMap.clear();
 }

@@ -23,6 +23,9 @@ struct OrgEndpointMapping {
     std::string namespaceUri; // Format: "anexee:{shortCode}"
 };
 
+// Session Context Structure
+
+
 // Per-session context - holds all org-specific resources
 struct SessionContext {
     std::string shortCode;
@@ -47,26 +50,11 @@ struct SessionContext {
     // Session metadata
     std::string sessionKey;
     
-    SessionContext() : shouldStop(false), namespaceIndex(0), orgId(0) {}
+    SessionContext() : shouldStop(false), namespaceIndex(65535), orgId(0) {}
 
-    ~SessionContext() {
-        shouldStop = true;
-        cv.notify_all();
-        if (workerThread.joinable()) {
-            workerThread.join();
-        }
-
-        for (auto& [_, nodeId] : nodeMap) {
-            UA_NodeId_clear(&nodeId);
-        }
-
-        for (auto& [_, nodeId] : alarmMap) {
-            UA_NodeId_clear(&nodeId);
-        }
         
-        // MQTT Unsubscriptions are handled by SessionWorker before thread exit,
-        // or by SessionManager explicitly if needed.
-    }
+    // Destructor moved to implementation file to handle resource cleanup
+    ~SessionContext();
 };
 
 
@@ -90,8 +78,8 @@ public:
     // Unregister session (stops worker and cleans up)
     void unregisterSession(const UA_NodeId& sessionId);
     
-    // Get session context (thread-safe)
-    SessionContext* getSession(const UA_NodeId& sessionId);
+    // Get session context (thread-safe, shared ownership)
+    std::shared_ptr<SessionContext> getSession(const UA_NodeId& sessionId);
     
     // Get active session count
     size_t getActiveSessionCount() const;
@@ -101,7 +89,7 @@ public:
     
 private:
     mutable std::mutex managerMutex;
-    std::unordered_map<std::string, std::unique_ptr<SessionContext>> sessions;
+    std::unordered_map<std::string, std::shared_ptr<SessionContext>> sessions;
     std::unordered_map<std::string, OrgEndpointMapping> endpointMappings;
     std::vector<OrgConfig> organizations;  // Store all organizations for auth-based routing
     

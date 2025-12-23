@@ -58,13 +58,15 @@ UA_NodeId findNodeByPath(UA_Server *server, UA_NodeId startNode, const std::vect
     return current;
 }
 
-extern std::recursive_mutex g_server_mutex; // Extern declaration
+// extern std::recursive_mutex g_server_mutex; // Extern declaration - REMOVED: Redundant with Job Queue
+
+extern thread_local bool is_internal_write;
 
 UA_StatusCode setStealthValueByPath(UA_Server *server, UA_NodeId baseNode, 
                                  std::vector<const char*> path, 
                                  void *newValue, const UA_DataType *type) {
     // Protect against concurrent deletion (SessionWorker)
-    std::lock_guard<std::recursive_mutex> lock(g_server_mutex);
+    // std::lock_guard<std::recursive_mutex> lock(g_server_mutex); // REMOVED: Already on Server Thread via Job Queue
 
     UA_NodeId targetNode = findNodeByPath(server, baseNode, path);
     if(UA_NodeId_isNull(&targetNode)) {
@@ -72,10 +74,41 @@ UA_StatusCode setStealthValueByPath(UA_Server *server, UA_NodeId baseNode,
         return UA_STATUSCODE_BADNOTFOUND;
     }
     
+    // Set internal flag to prevent writeCallback from publishing this update back to MQTT
+    is_internal_write = true;
     
     ScopedVariant val;
     UA_Variant_setScalarCopy(val.get(), newValue, type);
+
+    // --------------------------------------------------------
+    // DEDUPLICATION: Read current value and compare
+    // --------------------------------------------------------
+    ScopedVariant currentVal;
+    if(UA_Server_readValue(server, targetNode, currentVal.get()) == UA_STATUSCODE_GOOD) {
+        if(val.get()->type == currentVal.get()->type) {
+            bool isEqual = false;
+            if(type == &UA_TYPES[UA_TYPES_BOOLEAN]) {
+                isEqual = (*(UA_Boolean*)val.get()->data == *(UA_Boolean*)currentVal.get()->data);
+            } else if(type == &UA_TYPES[UA_TYPES_UINT16]) {
+                isEqual = (*(UA_UInt16*)val.get()->data == *(UA_UInt16*)currentVal.get()->data);
+            } else if(type == &UA_TYPES[UA_TYPES_INT32]) {
+                isEqual = (*(UA_Int32*)val.get()->data == *(UA_Int32*)currentVal.get()->data);
+            }
+             // Add other types as needed, but Alarms mostly use Bool/UInt16
+            
+            if(isEqual) {
+                // Value matches, do NOT write (prevents internal events)
+                is_internal_write = false;
+                UA_NodeId_clear(&targetNode);
+                return UA_STATUSCODE_GOOD;
+            }
+        }
+    }
+
     UA_StatusCode sc = UA_Server_writeValue(server, targetNode, val.var);
+    
+    is_internal_write = false;
+
     UA_NodeId_clear(&targetNode);
     return sc;
 }
@@ -934,7 +967,7 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
 }
 
 /* Custom ConditionRefresh method callback */
-static UA_StatusCode
+UA_StatusCode
 ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
                                void *sessionContext, const UA_NodeId *methodId,
                                void *methodContext, const UA_NodeId *objectId,
@@ -1031,79 +1064,83 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
                 branchId = bi->second.branchNodeId;
 
             // === CREATE EVENT WITH KEY-VALUE MAP ===
-            UA_KeyValueMap *map = UA_KeyValueMap_new();
-            if(map) {
-                // ActiveState/Id
-                UA_Boolean val = bs.active;
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ActiveState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
-                
-                // ActiveState
-                UA_LocalizedText valLT = bs.active ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Active") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Inactive");
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ActiveState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "ConditionRefresh: Creating KeyValueMap (Stack)...");
+            
+            // FIX: Use stack allocation to avoid heap corruption
+            UA_KeyValueMap map = UA_KEYVALUEMAP_NULL;
+            
+            // Helper macro or just checks
+            // Note: UA_KeyValueMap_setScalar likely copies.
+            
+            // ActiveState/Id
+            UA_Boolean val = bs.active;
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ActiveState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            
+            // ActiveState
+            UA_LocalizedText valLT = bs.active ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Active") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Inactive");
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ActiveState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
 
-                // AckedState/Id
-                val = bs.acked;
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"AckedState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            // AckedState/Id
+            val = bs.acked;
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"AckedState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
 
-                // AckedState
-                valLT = bs.acked ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Acknowledged") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unacknowledged");
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"AckedState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+            // AckedState
+            valLT = bs.acked ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Acknowledged") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unacknowledged");
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"AckedState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
 
-                // ConfirmedState/Id
-                val = bs.confirmed;
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            // ConfirmedState/Id
+            val = bs.confirmed;
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
 
-                // ConfirmedState
-                valLT = bs.confirmed ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Confirmed") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unconfirmed");
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+            // ConfirmedState
+            valLT = bs.confirmed ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Confirmed") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unconfirmed");
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
 
-                // Retain
-                val = shouldRetain;
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"Retain"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            // Retain
+            val = shouldRetain;
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Retain"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
 
-                // Time
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"Time"), &bs.time, &UA_TYPES[UA_TYPES_DATETIME]);
+            // Time
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Time"), &bs.time, &UA_TYPES[UA_TYPES_DATETIME]);
 
-                // ReceiveTime
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ReceiveTime"), &bs.receiveTime, &UA_TYPES[UA_TYPES_DATETIME]);
+            // ReceiveTime
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ReceiveTime"), &bs.receiveTime, &UA_TYPES[UA_TYPES_DATETIME]);
 
-                // Quality
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"Quality"), &bs.quality, &UA_TYPES[UA_TYPES_STATUSCODE]);
+            // Quality
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Quality"), &bs.quality, &UA_TYPES[UA_TYPES_STATUSCODE]);
 
-                // EnabledState/Id
-                val = UA_TRUE;
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"EnabledState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            // EnabledState/Id
+            val = UA_TRUE;
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EnabledState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
 
-                // EnabledState
-                valLT = UA_LOCALIZEDTEXT((char*)"en", (char*)"Enabled");
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"EnabledState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+            // EnabledState
+            valLT = UA_LOCALIZEDTEXT((char*)"en", (char*)"Enabled");
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EnabledState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
 
-                // BranchId
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"BranchId"), &branchId, &UA_TYPES[UA_TYPES_NODEID]);
+            // BranchId
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"BranchId"), &branchId, &UA_TYPES[UA_TYPES_NODEID]);
 
-                // SourceNode
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"SourceNode"), &sourceNodeId, &UA_TYPES[UA_TYPES_NODEID]);
+            // SourceNode
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"SourceNode"), &sourceNodeId, &UA_TYPES[UA_TYPES_NODEID]);
 
-                // EventType
-                UA_NodeId eventTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE);
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"EventType"), &eventTypeId, &UA_TYPES[UA_TYPES_NODEID]);
+            // EventType
+            UA_NodeId eventTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE);
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EventType"), &eventTypeId, &UA_TYPES[UA_TYPES_NODEID]);
 
-                // ConditionClassId
-                UA_NodeId condClassId = UA_NODEID_NULL;
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConditionClassId"), &condClassId, &UA_TYPES[UA_TYPES_NODEID]);
+            // ConditionClassId
+            UA_NodeId condClassId = UA_NODEID_NULL;
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionClassId"), &condClassId, &UA_TYPES[UA_TYPES_NODEID]);
 
-                // ConditionName
-                UA_String condName = UA_STRING((char *)alarmKey.c_str());
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConditionName"), &condName, &UA_TYPES[UA_TYPES_STRING]);
+            // ConditionName
+            UA_String condName = UA_STRING((char *)alarmKey.c_str());
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionName"), &condName, &UA_TYPES[UA_TYPES_STRING]);
 
-                // ConditionId
-                UA_KeyValueMap_setScalar(map, UA_QUALIFIEDNAME(0, (char*)"ConditionId"), &conditionNodeId, &UA_TYPES[UA_TYPES_NODEID]);
-            }
+            // ConditionId
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionId"), &conditionNodeId, &UA_TYPES[UA_TYPES_NODEID]);
+      
 
             // Message & Severity (Arguments)
-            UA_LocalizedText msgText = UA_LOCALIZEDTEXT((char*)"en-US", (char*)bs.message.c_str()); // Stack allocated is fine for immediate call?
-            // Actually UA_LOCALIZEDTEXT macro expects char pointers, creates shallow copies on stack.
-            // UA_Server_createEvent copies. 
+            UA_LocalizedText msgText = UA_LOCALIZEDTEXT((char*)"en-US", (char*)bs.message.c_str()); 
             
             // DEBUG: Log what we're about to fire
             UA_String branchIdStr = UA_STRING_NULL;
@@ -1117,10 +1154,12 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
 
             // Fire Event
             UA_ByteString newEventId = UA_BYTESTRING_NULL;
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "ConditionRefresh: Calling UA_Server_createEvent...");
+            
             UA_StatusCode rc = UA_Server_createEvent(
                 server, sourceNodeId,
                 UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE),
-                bs.severity, msgText, map, NULL, &newEventId);
+                bs.severity, msgText, &map, NULL, &newEventId);
 
             if(rc == UA_STATUSCODE_GOOD && newEventId.length > 0) {
                 // Store the new EventId so client can acknowledge it
@@ -1132,7 +1171,10 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
             }
             
             UA_ByteString_clear(&newEventId);
-            UA_KeyValueMap_delete(map);
+            
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "ConditionRefresh: Clearing Map (Stack)...");
+            UA_KeyValueMap_clear(&map); // Clean up stack map
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "ConditionRefresh: Iteration complete.");
 
         }
 

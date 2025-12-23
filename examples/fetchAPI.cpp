@@ -126,57 +126,62 @@ json getBearerToken(string host, string port , string username, string password)
 
 
 
-json getResponse(string host , string port , string bearerToken , string json_body , string target) {
+json getResponse(string host,
+                 string port,
+                 string bearerToken,
+                 string json_body,
+                 string target) {
 
-try{
-    // std::string host = host;
-    // std::string port = port;
-    int version = 11;
+    try {
+        int version = 11;
 
-    // Set up I/O context and connection
-    tcp::resolver resolver(http_ioc);
-    beast::tcp_stream stream(http_ioc);
+        tcp::resolver resolver(http_ioc);
+        beast::tcp_stream stream(http_ioc);
 
-    // Resolve and connect
-    auto const results = resolver.resolve(host, port);
-    stream.connect(results);
+        auto const results = resolver.resolve(host, port);
+        stream.connect(results);
 
-    // Build HTTP POST request
-    beast::http::request<beast::http::string_body> req{beast::http::verb::post, target, version};
-    req.set(beast::http::field::host, host);
-    req.set(beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-    req.set(beast::http::field::content_type, "application/json");
+        // Build HTTP POST request
+        beast::http::request<beast::http::string_body> req{
+            beast::http::verb::post, target, version
+        };
+        req.set(beast::http::field::host, host);
+        req.set(beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+        req.set(beast::http::field::content_type, "application/json");
+        req.set(beast::http::field::authorization, "Bearer " + bearerToken);
 
-    // Set Bearer Authorization header
-    req.set(beast::http::field::authorization, "Bearer " + bearerToken);
+        req.body() = json_body;
+        req.prepare_payload();
 
-    req.body() = json_body;
-    req.prepare_payload();
+        // Send request
+        beast::http::write(stream, req);
 
-    // Send request
-    beast::http::write(stream, req);
+        // ------------------------------
+        // 🔥 IMPORTANT PART (BODY LIMIT)
+        // ------------------------------
+        beast::flat_buffer buffer;
 
-    // Get response
-    beast::flat_buffer buffer;
-    beast::http::response<beast::http::string_body> res;
-    beast::http::read(stream, buffer, res);
+        beast::http::response_parser<beast::http::dynamic_body> parser;
+        parser.body_limit(100 * 1024 * 1024); // 100 MB (adjust as needed)
 
-    
-    // Output response
+        beast::http::read(stream, buffer, parser);
 
-    // log(res.body().c_str(),LogLevel::DEBUG);
-    json result = json::parse(res.body());
-    // Shutdown connection
-    beast::error_code ec;
-    stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+        beast::http::response<beast::http::dynamic_body> res =
+            parser.release();
+        // ------------------------------
 
-    return result;
+        auto bodyStr = boost::beast::buffers_to_string(res.body().data());
+        json result = json::parse(bodyStr);
+
+        beast::error_code ec;
+        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+
+        return result;
 
     } catch (const std::exception &e) {
-    log("getResponse Error: " + string(e.what()),LogLevel::ERRORS);
-        throw; // Re-throw to allow retry logic to handle it
+        log("getResponse Error: " + string(e.what()), LogLevel::ERRORS);
+        throw;
     }
-    
 }
 
 
