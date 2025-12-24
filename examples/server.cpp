@@ -383,8 +383,8 @@ customActivateSession(UA_Server *server, UA_AccessControl *ac,
              // We can wait responsive or just block here as this is connection phase
              profileJson = futureResponse.get();
              
-             // Store in Redis (TTL 10 mins)
-             g_redisClient.set(cacheKey, profileJson.dump(), 600);
+             // Store in Redis (Persistent - no TTL)
+             g_redisClient.setCompressed(cacheKey, profileJson.dump(), 0);
              
              profile = ParseUserProfileFromJson(profileJson);
         }
@@ -1740,11 +1740,15 @@ void start_mqtt_client(UA_Server *server) {
 // Migrated logic from main()
 int RunServer(int argc, char **argv) {
     // Generate Unique Instance ID for Redis Isolation
-    auto now = std::chrono::system_clock::now().time_since_epoch().count();
-    DWORD pid = GetCurrentProcessId();
-    std::stringstream ss;
-    ss << "OPC_UA:" << std::hex << now << "_" << pid;
-    std::string uniquePrefix = ss.str();
+    // Generate Unique Instance ID for Redis Isolation
+    // CHANGED: Use Static Prefix for Persistence (as requested)
+    std::string uniquePrefix = "OPCUA_SERVER:";
+    
+    // auto now = std::chrono::system_clock::now().time_since_epoch().count();
+    // DWORD pid = GetCurrentProcessId();
+    // std::stringstream ss;
+    // ss << "OPC_UA:" << std::hex << now << "_" << pid;
+    // std::string uniquePrefix = ss.str();
 
     // Initialize Redis Cache
     // Host: 216.48.184.131, Port: 6379, Pass: xeeredis@techd, DB: 0
@@ -2178,8 +2182,6 @@ int RunServer(int argc, char **argv) {
     config->maxRetransmissionQueueSize = 100;         // Standard: Unlimited (was 1/10 for debugging)
     config->maxNotificationsPerPublish = 1000;      // Limit per PublishResponse
     log("Performance Limits used: MaxSessions=100, GlobalMAXMI=20000", LogLevel::INFO);
-
-
 
 
 

@@ -209,8 +209,8 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
             }
             topicResponse = futureResponse.get();
             
-            // Store in Redis (TTL 10 mins = 600s)
-            g_redisClient.set(cacheKey, topicResponse.dump(), 600);
+            // Store in Redis (Persistent - no TTL)
+            g_redisClient.setCompressed(cacheKey, topicResponse.dump(), 0);
         }
 
         // Check again immediately after getting result
@@ -626,8 +626,8 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
             }
             json alarmResponse = futureResponse.get();
             
-            // Store in Redis
-            g_redisClient.set(alarmCacheKey, alarmResponse.dump(), 600);
+            // Store in Redis (Persistent - no TTL)
+            g_redisClient.setCompressed(alarmCacheKey, alarmResponse.dump(), 0);
             
             alarms = ParseAlarmConfigFromJson(alarmResponse);
         }

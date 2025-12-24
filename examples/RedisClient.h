@@ -7,6 +7,8 @@
 #include <optional>
 #include <boost/asio.hpp>
 
+#include <zlib.h>
+
 class RedisClient {
 public:
     RedisClient();
@@ -23,7 +25,11 @@ public:
     // Key will be prefixed automatically
     bool set(const std::string& key, const std::string& value, int ttlSeconds);
 
-    // Retrieve value
+    // Store COMPRESSED value with TTL
+    // Uses ZLIB and adds Magic Header for transparent decompression
+    bool setCompressed(const std::string& key, const std::string& value, int ttlSeconds);
+
+    // Retrieve value (Transparently decompresses if magic header is found)
     // Key will be prefixed automatically
     std::optional<std::string> get(const std::string& key);
 
@@ -40,6 +46,11 @@ private:
     // Internal helper to send command and get reply
     std::string executeCommand(const std::vector<std::string>& args);
     std::string readResponse();
+    
+    // Compression Helpers
+    std::string compressData(const std::string& data);
+    std::string decompressData(const std::string& compressedData);
+    bool isCompressed(const std::string& data);
 
     // Reconnection logic
     bool reconnect();

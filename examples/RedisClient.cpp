@@ -171,8 +171,16 @@ bool RedisClient::set(const std::string& key, const std::string& value, int ttlS
 
     try {
         std::string fullKey = m_keyPrefix + key;
-        // CMD: SET key value EX ttl
-        std::string resp = executeCommand({"SET", fullKey, value, "EX", std::to_string(ttlSeconds)});
+        std::string resp;
+        
+        // CMD: SET key value [EX ttl]
+        if (ttlSeconds > 0) {
+            resp = executeCommand({"SET", fullKey, value, "EX", std::to_string(ttlSeconds)});
+        } else {
+            // Persistent set (no expiration)
+            resp = executeCommand({"SET", fullKey, value});
+        }
+
         if (resp == "OK") return true;
         std::cerr << "[REDIS] SET failed: " << resp << std::endl;
         return false;
@@ -182,10 +190,114 @@ bool RedisClient::set(const std::string& key, const std::string& value, int ttlS
         if (reconnect()) {
              try {
                 std::string fullKey = m_keyPrefix + key;
-                std::string resp = executeCommand({"SET", fullKey, value, "EX", std::to_string(ttlSeconds)});
+                std::string resp;
+                if (ttlSeconds > 0) {
+                    resp = executeCommand({"SET", fullKey, value, "EX", std::to_string(ttlSeconds)});
+                } else {
+                    resp = executeCommand({"SET", fullKey, value});
+                }
                 return (resp == "OK");
              } catch (...) { return false; }
         }
+        return false;
+    }
+}
+
+// Compression Helpers
+std::string RedisClient::compressData(const std::string& data) {
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+
+    if (deflateInit(&zs, Z_BEST_SPEED) != Z_OK) { // Use Best Speed for large payloads
+        throw std::runtime_error("deflateInit failed while compressing.");
+    }
+
+    zs.next_in = (Bytef*)data.data();
+    zs.avail_in = (uInt)data.size();
+
+    int ret;
+    char outbuffer[32768];
+    std::string outstring;
+
+    // get the compressed bytes blockwise
+    do {
+        zs.next_out = (Bytef*)outbuffer;
+        zs.avail_out = sizeof(outbuffer);
+
+        ret = deflate(&zs, Z_FINISH);
+
+        if (outstring.size() < zs.total_out) {
+            // append the block to the output string
+            outstring.append(outbuffer, zs.total_out - outstring.size());
+        }
+    } while (ret == Z_OK);
+
+    deflateEnd(&zs);
+
+    if (ret != Z_STREAM_END) {
+        throw std::runtime_error("Exception during zlib compression: " + std::to_string(ret));
+    }
+
+    return outstring;
+}
+
+std::string RedisClient::decompressData(const std::string& compressedData) {
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+
+    if (inflateInit(&zs) != Z_OK) {
+        throw std::runtime_error("inflateInit failed while decompressing.");
+    }
+
+    zs.next_in = (Bytef*)compressedData.data();
+    zs.avail_in = (uInt)compressedData.size();
+
+    int ret;
+    char outbuffer[32768];
+    std::string outstring;
+
+    // get the decompressed bytes blockwise
+    do {
+        zs.next_out = (Bytef*)outbuffer;
+        zs.avail_out = sizeof(outbuffer);
+
+        ret = inflate(&zs, 0);
+
+        if (outstring.size() < zs.total_out) {
+            outstring.append(outbuffer, zs.total_out - outstring.size());
+        }
+
+    } while (ret == Z_OK);
+
+    inflateEnd(&zs);
+
+    if (ret != Z_STREAM_END) {
+        throw std::runtime_error("Exception during zlib decompression: " + std::to_string(ret));
+    }
+
+    return outstring;
+}
+
+// Magic Header: 4 bytes "ZLIB"
+const std::string MAGIC_HEADER = "ZLIB";
+
+bool RedisClient::isCompressed(const std::string& data) {
+    if (data.size() < MAGIC_HEADER.size()) return false;
+    return (data.compare(0, MAGIC_HEADER.size(), MAGIC_HEADER) == 0);
+}
+
+bool RedisClient::setCompressed(const std::string& key, const std::string& value, int ttlSeconds) {
+    try {
+        std::string compressed = compressData(value);
+        std::string payload = MAGIC_HEADER + compressed;
+        
+        // Log savings (verbose)
+        // double ratio = (double)payload.size() / (double)value.size();
+        // std::cout << "[REDIS] Compressing " << key << ": " << value.size() << " -> " << payload.size() << " bytes\n";
+        
+        return set(key, payload, ttlSeconds);
+    } catch (std::exception& e) {
+        std::cerr << "[REDIS] Compression failed for " << key << ": " << e.what() << "\n";
         return false;
     }
 }
@@ -196,40 +308,37 @@ std::optional<std::string> RedisClient::get(const std::string& key) {
 
     try {
         std::string fullKey = m_keyPrefix + key;
-        // CMD: GET key
         std::string resp = executeCommand({"GET", fullKey});
         
-        if (resp.rfind("-Error", 0) == 0) return std::nullopt; // or throw
-        if (resp.empty()) return std::nullopt; // Null bulk string often returns empty/null handling in readResponse?
-        // Wait, readResponse returns "" for $-1.
-        // What if value IS empty string? $0\r\n\r\n. content="0". read returns "".
-        // Distinction: 
-        // $-1 -> Null
-        // $0 -> ""
-        // My readResponse returns "" for $-1.
-        // It returns "" for $0 \r\n \r\n ?
-        // Let's refine readResponse behavior.
-        // Actually, if Cache Miss ($-1), we want std::nullopt.
-        // If Cache Hit but empty string ($0), we want "".
-        // I need to update readResponse signature or convention.
-        
-        // Simpler: If response is valid data, return it.
-        // For cache, if it returns "", we assume miss or empty.
-        // Since we store JSON, it's never empty.
-        // So "" == Miss/Null is acceptable for this use case.
-        
-        if (resp == "") return std::nullopt; 
+        if (resp.rfind("-Error", 0) == 0) return std::nullopt;
+        if (resp == "") return std::nullopt; // Assumes empty string = miss/null for our JSON case
+
+        // Check for Compression
+        if (isCompressed(resp)) {
+            // Decompress
+            try {
+                std::string raw = resp.substr(MAGIC_HEADER.size());
+                return decompressData(raw);
+            } catch (std::exception& e) {
+                 std::cerr << "[REDIS] Decompression failed for " << key << ": " << e.what() << "\n";
+                 // Return raw or null? Return null to indicate corruption/failure
+                 return std::nullopt;
+            }
+        }
         
         return resp;
 
     } catch (std::exception& e) {
         std::cerr << "[REDIS] GET Exception: " << e.what() << std::endl;
-        // Try reconnect once
         if (reconnect()) {
              try {
                 std::string fullKey = m_keyPrefix + key;
                 std::string resp = executeCommand({"GET", fullKey});
                 if (resp == "") return std::nullopt;
+                
+                if (isCompressed(resp)) {
+                    return decompressData(resp.substr(MAGIC_HEADER.size()));
+                }
                 return resp;
              } catch (...) { return std::nullopt; }
         }
@@ -245,16 +354,12 @@ void RedisClient::clearCache() {
         std::cout << "[REDIS] Clearing cache with prefix: " << m_keyPrefix << "*" << std::endl;
         
         // Lua script to find and delete keys atomicaly
-        // ARGV[1] is the pattern
         std::string script = "local keys = redis.call('keys', ARGV[1]) if #keys > 0 then return redis.call('del', unpack(keys)) else return 0 end";
         
         std::string pattern = m_keyPrefix + "*";
         
-        // CMD: EVAL script 0 pattern
         std::string resp = executeCommand({"EVAL", script, "0", pattern});
         
-        // Response should be integer (number of keys deleted)
-        // e.g., ":5" or ":0"
         if (resp.length() > 0 && resp[0] == ':') {
              std::cout << "[REDIS] Cleared " << resp.substr(1) << " keys." << std::endl;
         } else {
@@ -265,3 +370,4 @@ void RedisClient::clearCache() {
         std::cerr << "[REDIS] ClearCache Exception: " << e.what() << std::endl;
     }
 }
+

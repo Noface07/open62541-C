@@ -93,6 +93,9 @@ private:
     std::unordered_map<std::string, OrgEndpointMapping> endpointMappings;
     std::vector<OrgConfig> organizations;  // Store all organizations for auth-based routing
     
+    // Deduplication: Track active workers by OrgID
+    std::unordered_map<int, std::weak_ptr<SessionContext>> activeWorkers; 
+    
     // Helper: Convert UA_NodeId to string key
     std::string formatNodeId(const UA_NodeId* nodeId) const;
 };

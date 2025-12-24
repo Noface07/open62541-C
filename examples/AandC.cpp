@@ -3,6 +3,7 @@
 #include <iostream>
 #include <chrono>
 #include "alarm_enums.h"
+#include "Logger.h"
 
 using json = nlohmann::ordered_json;
 
@@ -975,8 +976,7 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
                                const UA_Variant *input, size_t outputSize,
                                UA_Variant *output) {
 
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                ">>> ConditionRefresh CALLBACK CALLED! <<<");
+    log(">>> ConditionRefresh CALLBACK CALLED! <<<", LogLevel::INFO);
 
     // STEP 1: Lock Mutex
     std::lock_guard<std::mutex> lock(g_alarmMutex);

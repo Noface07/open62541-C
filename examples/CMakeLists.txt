@@ -57,6 +57,22 @@ endif()
 
 message(STATUS "Using SQLite target: ${SQLITE3_TARGET}")
 find_package(nlohmann_json 3.2.0 REQUIRED CONFIG)
+# --- HARD OVERRIDE FOR ZLIB ---
+message(STATUS "FORCING ZLIB paths for vcpkg x64-windows...")
+
+set(ZLIB_FOUND TRUE)
+set(ZLIB_INCLUDE_DIR "D:/VCPKG/vcpkg/installed/x64-windows/include")
+set(ZLIB_LIBRARY "D:/VCPKG/vcpkg/installed/x64-windows/lib/zlib.lib")
+
+# This creates the logical name "ZLIB::ZLIB" that your other targets expect
+if(NOT TARGET ZLIB::ZLIB)
+    add_library(ZLIB::ZLIB UNKNOWN IMPORTED)
+    set_target_properties(ZLIB::ZLIB PROPERTIES
+        IMPORTED_LOCATION "${ZLIB_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${ZLIB_INCLUDE_DIR}"
+    )
+    message(STATUS "ZLIB::ZLIB target created manually.")
+endif()
 find_package(Threads REQUIRED)
 
 # ---- libpqxx (optional) ----
@@ -174,7 +190,7 @@ target_link_libraries(client PRIVATE
     Boost::system
     nlohmann_json::nlohmann_json
     Threads::Threads
-#   ${PQXX_LINK_TARGET}
+    ZLIB::ZLIB
 )
 #if(MSVC)
  #   target_compile_options(client PRIVATE /Zm2000)
@@ -193,6 +209,7 @@ set_target_properties(client PROPERTIES FOLDER "open62541/examples/Complex")
         Boost::system
         nlohmann_json::nlohmann_json
         Threads::Threads
+        ZLIB::ZLIB
     )   
     set_target_properties(server_cpp PROPERTIES FOLDER "open62541/examples/Complex")
 #endif()
@@ -200,6 +217,18 @@ set_target_properties(client PROPERTIES FOLDER "open62541/examples/Complex")
 # ===================================================================
 # END OF CORRECTIONS
 # ===================================================================
+
+# --- Define the 'RedisUpdater' utility ---
+add_executable(RedisUpdater RedisUpdater.cpp RedisClient.cpp fetchAPI.cpp Encryption.cpp)
+target_link_libraries(RedisUpdater PRIVATE
+    open62541::open62541
+    Boost::system
+    Threads::Threads
+    nlohmann_json::nlohmann_json
+    ZLIB::ZLIB
+)
+target_include_directories(RedisUpdater PRIVATE ${ASYNC_MQTT_INCLUDE_DIR}) # For async_mqtt/all.hpp in fetchAPI.cpp
+set_target_properties(RedisUpdater PROPERTIES FOLDER "open62541/examples/Utility")
 
 # Add simple C examples using the macro
 # NOTE: The original add_example calls for 'client' and 'server_cpp' have been removed.

@@ -106,43 +106,61 @@ bool SessionManager::registerSession(const UA_NodeId& sessionId,
     // Convert session ID to key
     std::string sessionKey = formatNodeId(&sessionId);
     
-    // Create session context
-    auto ctx = std::make_shared<SessionContext>();
-    ctx->sessionKey = sessionKey;
-    ctx->shortCode = shortCode;
-    ctx->orgId = orgConfig->orgId;
-    ctx->namespaceUri = "Anexee:" + orgConfig->shortCode;
-    ctx->shouldStop.store(false);
+    // DEDUPLICATION: Check if worker already exists for this Org
+    std::shared_ptr<SessionContext> ctx;
+    bool reused = false;
     
-    // Synchronously register namespace to avoid race conditions with Access Control
-    // This ensures ctx->namespaceIndex can be resolved immediately by CheckAccess
-    ctx->namespaceIndex = UA_Server_addNamespace(server, ctx->namespaceUri.c_str());
-    log("✓ Registered namespace '" + ctx->namespaceUri + "' at index " + std::to_string(ctx->namespaceIndex), LogLevel::INFO);
+    if(activeWorkers.find(orgConfig->orgId) != activeWorkers.end()) {
+        ctx = activeWorkers[orgConfig->orgId].lock();
+        if(ctx) {
+            reused = true;
+            log("♻️ Reusing active worker for org '" + shortCode + "' (OrgID: " + 
+                std::to_string(orgConfig->orgId) + ") - Shared by multiple sessions", LogLevel::INFO);
+        }
+    }
     
-    log("🧵 Creating dedicated worker thread for org '" + shortCode + "' (OrgID: " + 
-        std::to_string(orgConfig->orgId) + ")", LogLevel::INFO);
+    if(!ctx) {
+        // Create NEW session context
+        ctx = std::make_shared<SessionContext>();
+        ctx->sessionKey = sessionKey; // Note: Primary key. Shared contexts might have multiple keys logic? 
+                                      // Actually context sessionKey field is less relevant if shared.
+        ctx->shortCode = shortCode;
+        ctx->orgId = orgConfig->orgId;
+        ctx->namespaceUri = "Anexee:" + orgConfig->shortCode;
+        ctx->shouldStop.store(false);
+        
+        // Synchronously register namespace 
+        ctx->namespaceIndex = UA_Server_addNamespace(server, ctx->namespaceUri.c_str());
+        log("✓ Registered namespace '" + ctx->namespaceUri + "' at index " + std::to_string(ctx->namespaceIndex), LogLevel::INFO);
+        
+        log("🧵 Creating dedicated worker thread for org '" + shortCode + "' (OrgID: " + 
+            std::to_string(orgConfig->orgId) + ")", LogLevel::INFO);
+        
+        // Spawn dedicated worker thread
+        ctx->workerThread = std::thread(sessionWorkerThread, ctx, server,
+                                        bearerToken, apiHost, apiPort);
+                                        
+        // Register in activeWorkers
+        activeWorkers[orgConfig->orgId] = ctx;
+    }
     
-    // Spawn dedicated worker thread
-    // Keep a weak_ptr or just pass shared_ptr (worker holds reference)
-    ctx->workerThread = std::thread(sessionWorkerThread, ctx, server,
-                                    bearerToken, apiHost, apiPort);
+    // Store context in sessions map (Increments refCount)
+    sessions[sessionKey] = ctx;
     
-    // Store context
-    sessions[sessionKey] = std::move(ctx);
-    
-    // Convert thread ID to string using ostringstream
-    std::ostringstream threadIdStream;
-    threadIdStream << sessions[sessionKey]->workerThread.get_id();
-    
-    log("✓ Session registered and worker thread started for org '" + shortCode + 
-        "' (OrgID: " + std::to_string(orgConfig->orgId) + 
-        ", Thread ID: " + threadIdStream.str() + ")", 
-        LogLevel::INFO);
+    if(!reused) {
+        // Convert thread ID to string using ostringstream
+        std::ostringstream threadIdStream;
+        threadIdStream << ctx->workerThread.get_id();
+        
+        log("✓ Session registered and worker thread started for org '" + shortCode + 
+            "' (OrgID: " + std::to_string(orgConfig->orgId) + 
+            ", Thread ID: " + threadIdStream.str() + ")", 
+            LogLevel::INFO);
+    }
     
     return true;
 }
 
-// Unregister session and cleanup
 // Unregister session and cleanup
 void SessionManager::unregisterSession(const UA_NodeId& sessionId) {
     std::shared_ptr<SessionContext> ctx_ptr;
@@ -155,38 +173,22 @@ void SessionManager::unregisterSession(const UA_NodeId& sessionId) {
         auto it = sessions.find(sessionKey);
         
         if(it != sessions.end()) {
-            // Take ownership of the context locally
-            ctx_ptr = std::move(it->second);
-            // Remove from map immediately
-            sessions.erase(it);
+            ctx_ptr = std::move(it->second); // Take local ownership
+            sessions.erase(it);              // Decrement global refCount
             
             if(ctx_ptr) {
                 shortCode = ctx_ptr->shortCode;
-                log(" Closing session for org '" + shortCode + "' (OrgID: " + 
-                    std::to_string(ctx_ptr->orgId) + ")", LogLevel::INFO);
+                // log("ℹ️ Unregistering session for org '" + shortCode + "'", LogLevel::DEBUG);
             }
         }
-    } // Unlock managerMutex here
+    } // Unlock managerMutex
 
-    // Perform cleanup without holding the lock
-    if(ctx_ptr) {
-        // Signal worker thread to stop
-        ctx_ptr->shouldStop.store(true);
-        ctx_ptr->cv.notify_all(); // Wake up worker thread immediately
-        
-        log("⏳ Waiting for worker thread to terminate...", LogLevel::DEBUG);
-        
-        // Wait for thread to finish
-        if(ctx_ptr->workerThread.joinable()) {
-            ctx_ptr->workerThread.join();
-            log("✓ Worker thread terminated successfully", LogLevel::INFO);
-        }
-        
-        log("✓ Session closed and resources cleaned up for org '" + 
-            shortCode + "'", LogLevel::INFO);
-        
-        // ctx_ptr destructor runs here, freeing the memory
-    }
+    // RAII Cleanup:
+    // If 'sessions' held the last shared_ptr, ctx_ptr is now the last owner.
+    // When ctx_ptr goes out of scope (end of function), destructor is called.
+    // Destructor stops the thread.
+    // If activeWorkers still holds weak_ptr, it doesn't count towards ownership.
+    // If another session shares this context, refCount > 1, so destructor is NOT called.
 }
 
 // Get session context (thread-safe, shared ownership)
