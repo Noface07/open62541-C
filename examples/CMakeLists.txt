@@ -200,7 +200,7 @@ set_target_properties(client PROPERTIES FOLDER "open62541/examples/Complex")
 
 # --- Define the 'server_cpp' executable ---
 #if(PQXX_FOUND)
-    add_executable(server_cpp server.cpp ${CLIENT_LIB_SOURCES} AandC.cpp SessionManager.cpp SessionWorker.cpp AccessControl.cpp)
+    add_executable(server_cpp server.cpp ${CLIENT_LIB_SOURCES} AandC.cpp SessionManager.cpp SessionWorker.cpp AccessControl.cpp InstrumentedMutex.cpp)
     target_include_directories(server_cpp PRIVATE ${ASYNC_MQTT_INCLUDE_DIR})
     target_link_libraries(server_cpp PRIVATE
         open62541::open62541

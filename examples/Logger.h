@@ -184,7 +184,7 @@ inline void log(const std::string &msg, LogLevel level = LogLevel::INFO) {
     localtime_r(&tm_buf, &t);
 #endif
 
-    const char *lvl = level == LogLevel::INFO ? "INFO" : (level == LogLevel::DEBUG ? "DEBUG" : "ERROR");
+    const char *lvl = level == LogLevel::INFO ? "INFO" : (level == LogLevel::DEBUG ? "DEBUG" : (level == LogLevel::WARNING ? "WARNING" : "ERROR"));
 
     // Create timestamp string manually to avoid Windows put_time issues
     char timestamp[32];
@@ -224,6 +224,10 @@ inline void log(const std::string &msg, LogLevel level = LogLevel::INFO) {
                 std::cout << "[DEBUG] " << msg << std::endl;
                 std::cout.flush(); // Ensure flush within lock
                 break;
+            case LogLevel::WARNING:
+                std::cout << "[WARNING] " << msg << std::endl;
+                std::cout.flush(); // Ensure flush within lock
+                break;
             case LogLevel::ERRORS:
                 std::cerr << "[ERROR] " << msg << std::endl;
                 std::cerr.flush(); // Ensure flush within lock
@@ -235,6 +239,7 @@ inline void log(const std::string &msg, LogLevel level = LogLevel::INFO) {
 // Convenience functions for different log levels
 inline void log_info(const std::string& msg) { log(msg, LogLevel::INFO); }
 inline void log_debug(const std::string& msg) { log(msg, LogLevel::DEBUG); }
+inline void log_warning(const std::string& msg) { log(msg, LogLevel::WARNING); }
 inline void log_error(const std::string& msg) { log(msg, LogLevel::ERRORS); }
 
 // Get current log file path

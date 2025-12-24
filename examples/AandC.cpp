@@ -2,6 +2,7 @@
 #include <open62541/plugin/log_stdout.h>
 #include <iostream>
 #include <chrono>
+#include <shared_mutex>
 #include "alarm_enums.h"
 #include "Logger.h"
 
@@ -11,11 +12,16 @@ using json = nlohmann::ordered_json;
 //Global Maps
 
 // Global Maps
-std::mutex g_alarmMutex;
+InstrumentedMutex g_alarmMutex("g_alarmMutex");
 std::unordered_map<std::string, std::vector<TriggerToAlarmMapping>> g_triggerToAlarmMap;
 std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
 std::unordered_map<std::string, std::unordered_map<std::string, AlarmBranchInfo>> g_alarmBranches;
 std::unordered_map<std::string, std::unordered_map<std::string, BranchState>> g_branchStates;
+
+std::unordered_map<std::string, AlarmConditionCache> g_alarmConditionCache;
+std::unordered_map<UA_NodeId, std::string, UA_NodeId_hash, UA_NodeId_KeyEqual> g_nodeIdToGuidMap;
+std::shared_mutex g_cache_mutex;
+
 
 
 //Helpers
@@ -216,6 +222,39 @@ std::string getPreciseTimestamp() {
     return std::string(finalBuf);
 }
 
+// Helper to populate/retrieve cached NodeIds for an alarm
+AlarmConditionCache ensureAlarmCache(UA_Server *server, const std::string &alarmKey, const UA_NodeId &conditionId) {
+    std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
+    auto it = g_alarmConditionCache.find(alarmKey);
+    if (it != g_alarmConditionCache.end()) {
+        return it->second;
+    }
+
+    // Not found, cache it
+    AlarmConditionCache cache;
+    UA_NodeId_copy(&conditionId, &cache.conditionId);
+
+    // Lookup SourceNode
+    ScopedVariant sourceVar;
+    if (UA_Server_readObjectProperty(server, conditionId,
+                                     UA_QUALIFIEDNAME(0, (char *)"SourceNode"),
+                                     sourceVar.get()) == UA_STATUSCODE_GOOD) {
+        if (UA_Variant_hasScalarType(sourceVar.get(), &UA_TYPES[UA_TYPES_NODEID])) {
+            UA_NodeId_copy((UA_NodeId *)sourceVar.var.data, &cache.sourceNodeId);
+        }
+    }
+    // Fallback if SourceNode not found (point to self)
+    if (UA_NodeId_isNull(&cache.sourceNodeId)) {
+        UA_NodeId_copy(&conditionId, &cache.sourceNodeId);
+    }
+
+    // Lookup EnabledState
+    cache.enabledStateNodeId = findChildNodeIdAnyNS(server, conditionId, (char *)"EnabledState");
+
+    g_alarmConditionCache[alarmKey] = cache;
+    return cache;
+}
+
 
 
 
@@ -270,6 +309,13 @@ getOrCreateAlarmBranch(UA_Server *server, const UA_NodeId &conditionId,
     //             guid.c_str(), masterBranchId.namespaceIndex, nodeIdStr.c_str());
 
     // 5. Return a DEEP COPY to the caller from the MAP (persistent source)
+    
+    // Register in Reverse Lookup Map (Optimization)
+    {
+        std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
+        g_nodeIdToGuidMap[branchMap[guid].branchNodeId] = guid;
+    }
+
     return UA_NodeId_copy(&branchMap[guid].branchNodeId, outBranchId);
 }
 
@@ -461,7 +507,7 @@ customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
     std::string commentText = "";
 
     // 2. Lock Mutex
-    std::lock_guard<std::mutex> lock(g_alarmMutex);
+    InstrumentedGuard lock(g_alarmMutex);
 
     std::string alarmKey = findAlarmKeyForCondition(objectId);
     std::string guid = "";
@@ -607,7 +653,7 @@ customConfirmCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
     std::string commentText = "";  // FIX: Declare scope here
 
     // 2. Lock Mutex
-    std::lock_guard<std::mutex> lock(g_alarmMutex);
+    InstrumentedGuard lock(g_alarmMutex);
 
     std::string alarmKey = findAlarmKeyForCondition(objectId);
     std::string guid = "";
@@ -705,7 +751,7 @@ customEnableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessio
                      const UA_Variant *input, size_t outputSize, UA_Variant *output) {
 
     // 1. Lock Mutex
-    std::lock_guard<std::mutex> lock(g_alarmMutex);
+    InstrumentedGuard lock(g_alarmMutex);
 
     std::string alarmKey = findAlarmKeyForCondition(objectId);
     
@@ -780,7 +826,7 @@ customDisableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
                       const UA_Variant *input, size_t outputSize, UA_Variant *output) {
 
     // 1. Lock Mutex
-    std::lock_guard<std::mutex> lock(g_alarmMutex);
+    InstrumentedGuard lock(g_alarmMutex);
 
     std::string alarmKey = findAlarmKeyForCondition(objectId);
     
@@ -873,7 +919,7 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
     std::string commentText = "";
 
     // 2. Lock Mutex
-    std::lock_guard<std::mutex> lock(g_alarmMutex);
+    InstrumentedGuard lock(g_alarmMutex);
 
     std::string alarmKey = findAlarmKeyForCondition(objectId);
     std::string guid = "";
@@ -967,6 +1013,50 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
     return UA_STATUSCODE_GOOD;
 }
 
+
+
+struct RefreshEventData {
+    std::string guid;
+    UA_NodeId conditionId;
+    UA_NodeId branchId;
+    UA_NodeId sourceNodeId;
+    BranchState state; // Handles deep copy internally
+    std::string alarmName;
+
+    RefreshEventData() {
+        UA_NodeId_init(&conditionId);
+        UA_NodeId_init(&branchId);
+        UA_NodeId_init(&sourceNodeId);
+    }
+
+    ~RefreshEventData() {
+        UA_NodeId_clear(&conditionId);
+        UA_NodeId_clear(&branchId);
+        UA_NodeId_clear(&sourceNodeId);
+        // state destructor handles eventIds
+    }
+    
+    RefreshEventData(const RefreshEventData& other) : state(other.state) {
+        guid = other.guid;
+        alarmName = other.alarmName;
+        UA_NodeId_copy(&other.conditionId, &conditionId);
+        UA_NodeId_copy(&other.branchId, &branchId);
+        UA_NodeId_copy(&other.sourceNodeId, &sourceNodeId);
+    }
+    
+    RefreshEventData(RefreshEventData&& other) noexcept : state(std::move(other.state)) {
+        guid = std::move(other.guid);
+        alarmName = std::move(other.alarmName);
+        conditionId = other.conditionId;
+        branchId = other.branchId;
+        sourceNodeId = other.sourceNodeId;
+        
+        UA_NodeId_init(&other.conditionId);
+        UA_NodeId_init(&other.branchId);
+        UA_NodeId_init(&other.sourceNodeId);
+    }
+};
+
 /* Custom ConditionRefresh method callback */
 UA_StatusCode
 ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
@@ -978,21 +1068,26 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
 
     log(">>> ConditionRefresh CALLBACK CALLED! <<<", LogLevel::INFO);
 
-    // STEP 1: Lock Mutex
-    std::lock_guard<std::mutex> lock(g_alarmMutex);
-    
-    // STEP 2: Fire RefreshStartEvent
+    // Snapshot storage
+    std::vector<RefreshEventData> eventsToFire;
+    eventsToFire.reserve(100);
+
+    // STEP 1: Lock Mutex for SNAPSHOT Phase
     {
-        UA_ByteString eventId = UA_BYTESTRING_NULL;
-        UA_LocalizedText msg = UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Refresh Start");
+        InstrumentedGuard lock(g_alarmMutex);
+    
+        // Fire RefreshStartEvent (Quick enough to do under lock to ensure ordering)
+        {
+            UA_ByteString eventId = UA_BYTESTRING_NULL;
+            UA_LocalizedText msg = UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Refresh Start");
 
-        UA_Server_createEvent(server, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
-                              UA_NODEID_NUMERIC(0, UA_NS0ID_REFRESHSTARTEVENTTYPE), 
-                              100, msg, NULL, NULL, &eventId);
-        UA_ByteString_clear(&eventId);
-    }
+            UA_Server_createEvent(server, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
+                                  UA_NODEID_NUMERIC(0, UA_NS0ID_REFRESHSTARTEVENTTYPE), 
+                                  100, msg, NULL, NULL, &eventId);
+            UA_ByteString_clear(&eventId);
+        }
 
-    // STEP 3: Iterate through all alarms
+    // STEP 2: Iterate through all alarms to COLLECT data
     for(auto &alarmPair : g_alarmBranches) {
         std::string alarmKey = alarmPair.first;
         auto &branchMap = alarmPair.second;
@@ -1002,52 +1097,37 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
         UA_NodeId conditionNodeId = branchMap.begin()->second.conditionNodeId;
         if(UA_NodeId_isNull(&conditionNodeId))
             continue;
-
-        // Lookup SourceNode
-        UA_NodeId sourceNodeId = UA_NODEID_NULL;
-        ScopedVariant sourceVar;
-        if(UA_Server_readObjectProperty(server, conditionNodeId,
-                                        UA_QUALIFIEDNAME(0, (char *)"SourceNode"),
-                                        sourceVar.get()) == UA_STATUSCODE_GOOD) {
-            if(UA_Variant_hasScalarType(sourceVar.get(), &UA_TYPES[UA_TYPES_NODEID])) {
-                UA_NodeId_copy((UA_NodeId *)sourceVar.var.data, &sourceNodeId);
-            }
+            
+        // Use CACHED NodeIds (Optimization #1 & #3)
+        // ensureAlarmCache is thread-safe (uses its own mutex) but we also hold g_alarmMutex here so it's safe to read map keys
+        AlarmConditionCache cache = ensureAlarmCache(server, alarmKey, conditionNodeId);
+        
+        // Check EnabledState (Optimization #1)
+        // Read directly from cached NodeId without finding it again
+        UA_Boolean isEnabled = UA_TRUE;
+        if(!UA_NodeId_isNull(&cache.enabledStateNodeId)) {
+             UA_Variant val;
+             UA_Variant_init(&val);
+             // Using readValue is faster than readObjectProperty for "Id"
+             if(UA_Server_readValue(server, cache.enabledStateNodeId, &val) == UA_STATUSCODE_GOOD) {
+                 if(UA_Variant_hasScalarType(&val, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+                     isEnabled = *(UA_Boolean*)val.data;
+                 }
+                 UA_Variant_clear(&val);
+             }
         }
-        if(UA_NodeId_isNull(&sourceNodeId))
-            UA_NodeId_copy(&conditionNodeId, &sourceNodeId);
+        
+        if(!isEnabled) {
+             // Skipping disabled alarm
+             continue;
+        }
 
         auto branchStateMapIt = g_branchStates.find(alarmKey);
         if(branchStateMapIt == g_branchStates.end()) {
-            UA_NodeId_clear(&sourceNodeId);
             continue;
         }
 
-        // CHECK IF ALARM IS DISABLED - Skip refresh for disabled alarms per OPC UA spec
-        {
-            UA_NodeId enabledStateId = findChildNodeIdAnyNS(server, conditionNodeId, (char*)"EnabledState");
-            bool isEnabled = true;  // Default to enabled
-            
-            if(!UA_NodeId_isNull(&enabledStateId)) {
-                UA_QualifiedName qId = UA_QUALIFIEDNAME_ALLOC(0, (char*)"Id");
-                ScopedVariant enabledVar;
-                UA_StatusCode enabledRc = UA_Server_readObjectProperty(server, enabledStateId, qId, enabledVar.get());
-                if(enabledRc == UA_STATUSCODE_GOOD && UA_Variant_hasScalarType(enabledVar.get(), &UA_TYPES[UA_TYPES_BOOLEAN])) {
-                    isEnabled = *(UA_Boolean*)enabledVar.var.data;
-                }
-            }
-            
-            if(!isEnabled) {
-                UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                           "ConditionRefresh: Skipping disabled alarm '%s' (EnabledState=false)",
-                           alarmKey.c_str());
-                UA_NodeId_clear(&sourceNodeId);
-                continue;  // Skip disabled alarms - they should not appear in refresh
-            }
-        }
-
-        // ========================================================
-        // STEP 4: MANUAL EVENT CONSTRUCTION FOR EACH BRANCH
-        // ========================================================
+        // Collect Events for this Alarm
         for(auto &branchPair : branchStateMapIt->second) {
             std::string guid = branchPair.first;
             BranchState &bs = branchPair.second;
@@ -1057,130 +1137,134 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
             if(!shouldRetain)
                 continue;
 
-            // Get BranchId NodeId for this GUID
-            UA_NodeId branchId = UA_NODEID_NULL;
+            // Create Snapshot Data
+            RefreshEventData data;
+            data.guid = guid;
+            data.alarmName = alarmKey;
+            
+            UA_NodeId_copy(&conditionNodeId, &data.conditionId);
+            UA_NodeId_copy(&cache.sourceNodeId, &data.sourceNodeId); // Use Cached SourceNode
+            
+            // Get BranchId
             auto bi = branchMap.find(guid);
-            if(bi != branchMap.end())
-                branchId = bi->second.branchNodeId;
-
-            // === CREATE EVENT WITH KEY-VALUE MAP ===
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "ConditionRefresh: Creating KeyValueMap (Stack)...");
-            
-            // FIX: Use stack allocation to avoid heap corruption
-            UA_KeyValueMap map = UA_KEYVALUEMAP_NULL;
-            
-            // Helper macro or just checks
-            // Note: UA_KeyValueMap_setScalar likely copies.
-            
-            // ActiveState/Id
-            UA_Boolean val = bs.active;
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ActiveState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
-            
-            // ActiveState
-            UA_LocalizedText valLT = bs.active ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Active") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Inactive");
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ActiveState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-            // AckedState/Id
-            val = bs.acked;
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"AckedState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-            // AckedState
-            valLT = bs.acked ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Acknowledged") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unacknowledged");
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"AckedState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-            // ConfirmedState/Id
-            val = bs.confirmed;
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-            // ConfirmedState
-            valLT = bs.confirmed ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Confirmed") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unconfirmed");
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-            // Retain
-            val = shouldRetain;
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Retain"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-            // Time
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Time"), &bs.time, &UA_TYPES[UA_TYPES_DATETIME]);
-
-            // ReceiveTime
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ReceiveTime"), &bs.receiveTime, &UA_TYPES[UA_TYPES_DATETIME]);
-
-            // Quality
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Quality"), &bs.quality, &UA_TYPES[UA_TYPES_STATUSCODE]);
-
-            // EnabledState/Id
-            val = UA_TRUE;
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EnabledState/Id"), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-            // EnabledState
-            valLT = UA_LOCALIZEDTEXT((char*)"en", (char*)"Enabled");
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EnabledState"), &valLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-            // BranchId
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"BranchId"), &branchId, &UA_TYPES[UA_TYPES_NODEID]);
-
-            // SourceNode
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"SourceNode"), &sourceNodeId, &UA_TYPES[UA_TYPES_NODEID]);
-
-            // EventType
-            UA_NodeId eventTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE);
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EventType"), &eventTypeId, &UA_TYPES[UA_TYPES_NODEID]);
-
-            // ConditionClassId
-            UA_NodeId condClassId = UA_NODEID_NULL;
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionClassId"), &condClassId, &UA_TYPES[UA_TYPES_NODEID]);
-
-            // ConditionName
-            UA_String condName = UA_STRING((char *)alarmKey.c_str());
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionName"), &condName, &UA_TYPES[UA_TYPES_STRING]);
-
-            // ConditionId
-            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionId"), &conditionNodeId, &UA_TYPES[UA_TYPES_NODEID]);
-      
-
-            // Message & Severity (Arguments)
-            UA_LocalizedText msgText = UA_LOCALIZEDTEXT((char*)"en-US", (char*)bs.message.c_str()); 
-            
-            // DEBUG: Log what we're about to fire
-            UA_String branchIdStr = UA_STRING_NULL;
-            UA_NodeId_print(&branchId, &branchIdStr);
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                       "ConditionRefresh: Triggering MANUAL event for GUID='%s', "
-                       "BranchId=%.*s, ACTIVE=%d, ACKED=%d, severity=%u",
-                       guid.c_str(), (int)branchIdStr.length, branchIdStr.data,
-                       bs.active, bs.acked, bs.severity);
-            UA_String_clear(&branchIdStr);
-
-            // Fire Event
-            UA_ByteString newEventId = UA_BYTESTRING_NULL;
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "ConditionRefresh: Calling UA_Server_createEvent...");
-            
-            UA_StatusCode rc = UA_Server_createEvent(
-                server, sourceNodeId,
-                UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE),
-                bs.severity, msgText, &map, NULL, &newEventId);
-
-            if(rc == UA_STATUSCODE_GOOD && newEventId.length > 0) {
-                // Store the new EventId so client can acknowledge it
-                bs.addEventId(&newEventId);
-            } else {
-                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                              "Failed to create temp event for GUID '%s': %s",
-                              guid.c_str(), UA_StatusCode_name(rc));
+            if(bi != branchMap.end()) {
+                UA_NodeId_copy(&bi->second.branchNodeId, &data.branchId);
             }
             
-            UA_ByteString_clear(&newEventId);
+            // Deep Copy State
+            data.state = bs; // Uses Copy Assignment
             
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "ConditionRefresh: Clearing Map (Stack)...");
-            UA_KeyValueMap_clear(&map); // Clean up stack map
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "ConditionRefresh: Iteration complete.");
-
+            eventsToFire.push_back(std::move(data));
         }
-
-
-        UA_NodeId_clear(&sourceNodeId);
     }
+    
+    } // UNLOCK Mutex (End of Phase 1)
+    
+
+    // STEP 3: Fire Events from Snapshot (Optimization #3: Template Map)
+    log("ConditionRefresh: Firing " + std::to_string(eventsToFire.size()) + " events...", LogLevel::INFO);
+    
+    // 1. Create a "Template" map OUTSIDE the loop
+    UA_KeyValueMap map = UA_KEYVALUEMAP_NULL;
+    UA_NodeId eventTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE);
+    UA_Boolean enabledVal = UA_TRUE;
+    UA_LocalizedText enabledLT = UA_LOCALIZEDTEXT((char*)"en", (char*)"Enabled");
+    UA_Boolean retainVal = UA_TRUE; // Always true for Refresh
+
+    // Pre-set fields that are the same for all events
+    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EventType"), &eventTypeId, &UA_TYPES[UA_TYPES_NODEID]);
+    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EnabledState/Id"), &enabledVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EnabledState"), &enabledLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Retain"), &retainVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    
+    // Placeholders for dynamic fields (Optimization: Initialize once)
+    UA_NodeId nullNodeId = UA_NODEID_NULL;
+    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionClassId"), &nullNodeId, &UA_TYPES[UA_TYPES_NODEID]);
+
+    for(auto &evt : eventsToFire) {
+        
+        // 2. Only update the DYNAMIC fields (Time, ActiveState, Severity, etc.)
+        
+        // ActiveState/Id
+        UA_Boolean activeId = evt.state.active;
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ActiveState/Id"), &activeId, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        
+        // ActiveState
+        UA_LocalizedText activeLT = evt.state.active ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Active") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Inactive");
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ActiveState"), &activeLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+
+        // AckedState/Id
+        UA_Boolean ackedId = evt.state.acked;
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"AckedState/Id"), &ackedId, &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+        // AckedState
+        UA_LocalizedText ackedLT = evt.state.acked ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Acknowledged") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unacknowledged");
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"AckedState"), &ackedLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+
+        // ConfirmedState/Id
+        UA_Boolean confirmedId = evt.state.confirmed;
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState/Id"), &confirmedId, &UA_TYPES[UA_TYPES_BOOLEAN]);
+
+        // ConfirmedState
+        UA_LocalizedText confirmedLT = evt.state.confirmed ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Confirmed") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unconfirmed");
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState"), &confirmedLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+
+        // Time
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Time"), &evt.state.time, &UA_TYPES[UA_TYPES_DATETIME]);
+
+        // ReceiveTime
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ReceiveTime"), &evt.state.receiveTime, &UA_TYPES[UA_TYPES_DATETIME]);
+
+        // Quality
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Quality"), &evt.state.quality, &UA_TYPES[UA_TYPES_STATUSCODE]);
+
+        // BranchId
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"BranchId"), &evt.branchId, &UA_TYPES[UA_TYPES_NODEID]);
+
+        // SourceNode
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"SourceNode"), &evt.sourceNodeId, &UA_TYPES[UA_TYPES_NODEID]);
+
+        // ConditionName
+        UA_String condName = UA_STRING((char *)evt.alarmName.c_str());
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionName"), &condName, &UA_TYPES[UA_TYPES_STRING]);
+
+        // ConditionId
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionId"), &evt.conditionId, &UA_TYPES[UA_TYPES_NODEID]);
+
+        // Message & Severity (Arguments)
+        UA_LocalizedText msgText = UA_LOCALIZEDTEXT((char*)"en-US", (char*)evt.state.message.c_str()); 
+        
+        // Fire Event
+        UA_ByteString newEventId = UA_BYTESTRING_NULL;
+        
+        UA_StatusCode rc = UA_Server_createEvent(
+            server, evt.sourceNodeId,
+            UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE),
+            evt.state.severity, msgText, &map, NULL, &newEventId);
+
+        if(rc == UA_STATUSCODE_GOOD && newEventId.length > 0) {
+            // Note: We cannot update the 'state' eventIds here safely because it might have changed
+            // in the global map since we unlocked. However, refresh events are usually transient.
+            // If we need to track this EventId for Acknowledge, we need to re-lock and update g_branchStates.
+            
+            // Optimization: Only lock if we need to add the ID
+            InstrumentedGuard lock(g_alarmMutex);
+            auto &states = g_branchStates[evt.alarmName];
+            auto it = states.find(evt.guid);
+            if(it != states.end()) {
+                it->second.addEventId(&newEventId);
+            }
+        } else {
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                          "Failed to create temp event for GUID '%s': %s",
+                          evt.guid.c_str(), UA_StatusCode_name(rc));
+        }
+        
+        UA_ByteString_clear(&newEventId);
+        // DO NOT Clear map here! We reuse it.
+    }
+    
+    UA_KeyValueMap_clear(&map); // Clean up once at the very end
 
     // STEP 8: Fire RefreshEndEvent
     {
@@ -1216,45 +1300,15 @@ static std::string findGUIDForBranchId(const UA_NodeId *branchId, const std::str
 
 /* Find GUID for a given NodeId (branch or condition) */
 std::string findGUIDForNodeId(const UA_NodeId *nodeId, const std::string &alarmKey) {
-    // If alarmKey is provided, search in that specific alarm's branches
-    if(!alarmKey.empty()) {
-        // Check if this is a branch
-        auto branchMapIt = g_alarmBranches.find(alarmKey);
-        if(branchMapIt != g_alarmBranches.end()) {
-            for(const auto &branchPair : branchMapIt->second) {
-                if(UA_NodeId_equal(&branchPair.second.branchNodeId, nodeId)) {
-                    return branchPair.second.guid;
-                }
-            }
-        }
-        
-        // Check if this is the main condition
-        auto alarmIt = g_alarmByKey.find(alarmKey);
-        if(alarmIt != g_alarmByKey.end()) {
-            if(UA_NodeId_equal(&alarmIt->second, nodeId)) {
-                return "";  // Main branch has empty GUID
-            }
-        }
-    } else {
-        // Search across all alarms if alarmKey not provided
-        // First check all branches
-        for(const auto &alarmBranchPair : g_alarmBranches) {
-            for(const auto &branchPair : alarmBranchPair.second) {
-                if(UA_NodeId_equal(&branchPair.second.branchNodeId, nodeId)) {
-                    return branchPair.second.guid;
-                }
-            }
-        }
-        
-        // Then check all main conditions
-        for(const auto &alarmPair : g_alarmByKey) {
-            if(UA_NodeId_equal(&alarmPair.second, nodeId)) {
-                return "";  // Main branch has empty GUID
-            }
-        }
+    if(!nodeId) return "";
+    
+    std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
+    auto it = g_nodeIdToGuidMap.find(*nodeId);
+    if(it != g_nodeIdToGuidMap.end()) {
+        return it->second;
     }
     
-    return "";  // Not found
+    return ""; 
 }
 
 /* Cleanup inactive and acknowledged branches */
@@ -1283,6 +1337,16 @@ cleanupBranches(const std::string &alarmKey) {
             UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                         "Cleaning up branch GUID '%s' for alarm '%s'", guid.c_str(),
                         alarmKey.c_str());
+            
+            // Remove from Reverse Lookup Map
+            {
+                std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
+                auto bit = branchMap.find(guid);
+                if(bit != branchMap.end()) {
+                    g_nodeIdToGuidMap.erase(bit->second.branchNodeId);
+                }
+            }
+
             if(stateIt != branchStateMap.end()) {
                 branchStateMap.erase(stateIt);
             }

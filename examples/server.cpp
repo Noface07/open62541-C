@@ -40,6 +40,7 @@
 #include "ServerConfig.h"
 #include "ServiceUtils.h"
 #include "RedisClient.h"
+#include "InstrumentedMutex.cpp"
 
 #include <async_mqtt/all.hpp>
 #include <async_mqtt/asio_bind/predefined_layer/mqtts.hpp>
@@ -1213,7 +1214,7 @@ as::awaitable<void> perform_subscriptions() {
     sub_entries.reserve(sub_batch.size() * 2);
 
     {
-        std::lock_guard<std::mutex> alarmLock(g_alarmMutex);
+        InstrumentedGuard alarmLock(g_alarmMutex);
 
         for(const auto &topic : sub_batch) {
             sub_entries.emplace_back(topic, am::qos::at_most_once);
@@ -1283,7 +1284,7 @@ void start_mqtt_client(UA_Server *server) {
                     g_mqtt_connected.store(true);
                                         // Clear and queue
                     {
-                        std::lock_guard<std::mutex> alarmLock(g_alarmMutex);
+                        InstrumentedGuard alarmLock(g_alarmMutex);
                         std::lock_guard<std::mutex> lock(g_sub_mutex);
                         g_subscribed_topics.clear(); 
                         g_pending_subscriptions.clear(); // Ensure clean state
@@ -1346,7 +1347,7 @@ void start_mqtt_client(UA_Server *server) {
                                     // Thread-Safe Lookup: Copy mappings to local vector under lock
                                     std::vector<TriggerToAlarmMapping> mappings;
                                     {
-                                        std::lock_guard<std::mutex> lock(g_alarmMutex);
+                                        InstrumentedGuard lock(g_alarmMutex);
                                         auto triggerIt = g_triggerToAlarmMap.find(baseTopic);
                                         if(triggerIt != g_triggerToAlarmMap.end()) {
                                             mappings = triggerIt->second;
@@ -1445,7 +1446,8 @@ void start_mqtt_client(UA_Server *server) {
                                                         // 1. Find Alarm Node (using global map safely on server thread)
                                                         UA_NodeId alarmId = UA_NODEID_NULL;
                                                         {
-                                                            std::lock_guard<std::mutex> lock(g_alarmMutex);
+                                                            InstrumentedGuard lock(
+                                                                g_alarmMutex);
                                                             if(g_alarmByKey.count(mapping.alarmKey)) {
                                                                 alarmId = g_alarmByKey[mapping.alarmKey];
                                                             } else {
@@ -1478,7 +1480,12 @@ void start_mqtt_client(UA_Server *server) {
                                                         if(!jobData.aeInstanceId.empty() && jobData.aeInstanceId != "0") {
                                                             // Logic to get/create branch
                                                             {
-                                                                std::lock_guard<std::mutex> mapLock(g_alarmMutex); // Ensure thread safety for map access
+                                                                InstrumentedGuard mapLock (g_alarmMutex);  // Ensure
+                                                                                    // thread
+                                                                                    // safety
+                                                                                    // for
+                                                                                    // map
+                                                                                    // access
                                                                 UA_StatusCode sc = getOrCreateAlarmBranch(server, alarmId, jobData.aeInstanceId, mapping.alarmKey, &branchNodeId);
                                                                 if(sc != UA_STATUSCODE_GOOD) {
                                                                      // cleanup
@@ -2168,7 +2175,7 @@ int RunServer(int argc, char **argv) {
     // PERFORMANCE TUNING: Limit Queues to prevent Memory Leaks
     // ======================================================================== 
     config->maxSessions = 100;
-    config->maxSecureChannels = 50;      // Limit concurrent TCP connections
+    config->maxSecureChannels = 200;      // Limit concurrent TCP connections
     config->maxSessionTimeout = 10000.0; // Prune detached sessions after 10s to free MonitoredItems
     //config->maxSubscriptionsPerSession = 50;
     //config->maxMonitoredItemsPerSubscription = 1000;
@@ -2181,6 +2188,17 @@ int RunServer(int argc, char **argv) {
     config->enableRetransmissionQueue = true;  // Enable retransmission queue
     config->maxRetransmissionQueueSize = 100;         // Standard: Unlimited (was 1/10 for debugging)
     config->maxNotificationsPerPublish = 1000;      // Limit per PublishResponse
+   
+    // Allow the server to send larger packets (1 MB chunks, 10 MB total message)
+    config->tcpBufSize = 16 * 1024 * 1024;     // 16 MB TCP Buffer (Excellent)
+    config->tcpMaxMsgSize = 10 * 1024 * 1024;  // 10 MB - Allows massive Browse responses
+    config->tcpMaxChunks = 100;                // Allow splitting big messages into 100 chunks
+    config->tcpReuseAddr = true;               // Allows immediate restart after a crash
+    
+    //Operations
+    config->maxNodesPerBrowse = 5000;
+    config->maxNodesPerRead = 5000;
+    
     log("Performance Limits used: MaxSessions=100, GlobalMAXMI=20000", LogLevel::INFO);
 
 

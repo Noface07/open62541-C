@@ -19,7 +19,7 @@ extern void GlobalMQTT_UnsubscribeBatch(const std::vector<std::string> &topics);
 
 extern std::map<std::string, UA_NodeId> nodeMap;
 extern std::mutex g_nodeMap_mutex;
-extern std::mutex g_alarmMutex;
+//extern InstrumentedMutex g_alarmMutex("g_alarmMutex");
 
 // Extern declarations for MQTT Globals (Required for batch filtering in SessionWorker)
 #include <deque>
@@ -181,10 +181,18 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
              auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
              if(cachedVal) {
+
                  try {
+                     auto parse_start = std::chrono::high_resolution_clock::now();
                      topicResponse = json::parse(*cachedVal);
+                     auto parse_end = std::chrono::high_resolution_clock::now();
+                     auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(parse_end - parse_start).count();
+                     
                      cacheHit = true;
-                     log("⚡ Redis Cache HIT for Topics (OrgID: " + std::to_string(ctx->orgId) + ") - Fetched in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
+                     log("⚡ Redis Cache HIT for Topics (OrgID: " + std::to_string(ctx->orgId) + 
+                         ") - Fetch: " + std::to_string(elapsed_ms) + " ms, " +
+                         "Parse: " + std::to_string(parse_ms) + " ms (" + 
+                         std::to_string(cachedVal->size()) + " bytes)", LogLevel::INFO);
                  } catch(const std::exception& e) {
                      log("⚠️ Redis Cache Parse Error: " + std::string(e.what()), LogLevel::WARNING);
                  }
@@ -745,7 +753,7 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
 
                                 // 2. Global Maps (Protected)
                                 {
-                                    std::lock_guard<std::mutex> lock(g_alarmMutex);
+                                    InstrumentedGuard lock(g_alarmMutex);
                                     
                                     UA_NodeId globalId;
                                     UA_NodeId_copy(&alarmId, &globalId);
@@ -876,7 +884,7 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
 
                                 // 2. Global Maps (Protected)
                                 {
-                                    std::lock_guard<std::mutex> lock(g_alarmMutex);
+                                    InstrumentedGuard lock(g_alarmMutex);
                                     UA_NodeId globalId; UA_NodeId_copy(&alarmId, &globalId);
                                     if(g_alarmByKey.count(alarmKey)) UA_NodeId_clear(&g_alarmByKey[alarmKey]);
                                     g_alarmByKey[alarmKey] = globalId;

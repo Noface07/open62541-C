@@ -6,8 +6,10 @@
 #include <vector>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
+#include "InstrumentedMutex.cpp"
 
 /**
  * @brief A custom comparator for using UA_NodeId as a key in std::map.
@@ -21,6 +23,88 @@ struct UA_NodeId_less_than {
     }
 };
 
+/**
+ * @brief Custom Hash and Equality for UA_NodeId to be used in std::unordered_map
+ */
+struct UA_NodeId_hash {
+    std::size_t operator()(const UA_NodeId& id) const {
+        // Simple hash combining namespace and identifier
+        std::size_t h1 = std::hash<UA_UInt16>{}(id.namespaceIndex);
+        std::size_t h2 = 0;
+        if(id.identifierType == UA_NODEIDTYPE_NUMERIC) {
+            h2 = std::hash<UA_UInt32>{}(id.identifier.numeric);
+        } else if(id.identifierType == UA_NODEIDTYPE_STRING) {
+            h2 = std::hash<std::string>{}(std::string((char*)id.identifier.string.data, id.identifier.string.length));
+        } else if(id.identifierType == UA_NODEIDTYPE_GUID) {
+             // Basic hash for GUID (using data1)
+             h2 = std::hash<UA_UInt32>{}(id.identifier.guid.data1);
+        }
+        return h1 ^ (h2 << 1); 
+    }
+};
+
+struct UA_NodeId_KeyEqual {
+    bool operator()(const UA_NodeId& lhs, const UA_NodeId& rhs) const {
+        return UA_NodeId_equal(&lhs, &rhs);
+    }
+};
+
+/**
+ * @brief Cached NodeIds for an Alarm Condition to avoid repeated SDK lookups
+ */
+struct AlarmConditionCache {
+    UA_NodeId sourceNodeId;
+    UA_NodeId enabledStateNodeId;
+    UA_NodeId conditionId; // The key
+    
+    AlarmConditionCache() {
+        UA_NodeId_init(&sourceNodeId);
+        UA_NodeId_init(&enabledStateNodeId);
+        UA_NodeId_init(&conditionId);
+    }
+    
+    ~AlarmConditionCache() {
+        UA_NodeId_clear(&sourceNodeId);
+        UA_NodeId_clear(&enabledStateNodeId);
+        UA_NodeId_clear(&conditionId);
+    }
+    
+    // Copy Constructor
+    AlarmConditionCache(const AlarmConditionCache& other) {
+        UA_NodeId_copy(&other.sourceNodeId, &sourceNodeId);
+        UA_NodeId_copy(&other.enabledStateNodeId, &enabledStateNodeId);
+        UA_NodeId_copy(&other.conditionId, &conditionId);
+    }
+    
+    // Move Constructor
+    AlarmConditionCache(AlarmConditionCache&& other) noexcept {
+        sourceNodeId = other.sourceNodeId;
+        enabledStateNodeId = other.enabledStateNodeId;
+        conditionId = other.conditionId;
+        UA_NodeId_init(&other.sourceNodeId);
+        UA_NodeId_init(&other.enabledStateNodeId);
+        UA_NodeId_init(&other.conditionId);
+    }
+    
+    // Move Assignment
+     AlarmConditionCache& operator=(AlarmConditionCache&& other) noexcept {
+        if(this != &other) {
+            UA_NodeId_clear(&sourceNodeId);
+            UA_NodeId_clear(&enabledStateNodeId);
+            UA_NodeId_clear(&conditionId);
+            sourceNodeId = other.sourceNodeId;
+            enabledStateNodeId = other.enabledStateNodeId;
+            conditionId = other.conditionId;
+            UA_NodeId_init(&other.sourceNodeId);
+            UA_NodeId_init(&other.enabledStateNodeId);
+            UA_NodeId_init(&other.conditionId);
+        }
+        return *this;
+     }
+
+     AlarmConditionCache& operator=(const AlarmConditionCache&) = default;
+};
+
 /* Map trigger topic (applicableTagName) to list of alarm keys (emitter+alarmName) */
 struct TriggerToAlarmMapping {
     std::string triggerTopic;           // MQTT topic from applicableTagName
@@ -31,7 +115,8 @@ struct TriggerToAlarmMapping {
 };
 
 extern std::unordered_map<std::string, std::vector<TriggerToAlarmMapping>> g_triggerToAlarmMap;
-extern std::mutex g_alarmMutex;
+
+
 extern void GlobalMQTT_Subscribe(const std::string &topic);
 
 /**
@@ -94,7 +179,7 @@ struct AlarmBranchInfo {
 
     // Copy Assignment (Deep Copy)
     AlarmBranchInfo& operator=(const AlarmBranchInfo& other) {
-        if(this != &other) {
+        if(this != &other) {    
             UA_NodeId_clear(&branchNodeId);
             UA_NodeId_clear(&conditionNodeId);
             UA_NodeId_copy(&other.branchNodeId, &branchNodeId);
@@ -232,11 +317,18 @@ struct BranchState {
 };
 
 
+
 extern std::unordered_map<std::string, std::vector<TriggerToAlarmMapping>> g_triggerToAlarmMap;
-extern std::mutex g_alarmMutex;
+
+extern InstrumentedMutex g_alarmMutex; 
 extern std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
 extern std::unordered_map<std::string, std::unordered_map<std::string, AlarmBranchInfo>> g_alarmBranches;
 extern std::unordered_map<std::string, std::unordered_map<std::string, BranchState>> g_branchStates;
+
+// Optimization Maps
+extern std::unordered_map<std::string, AlarmConditionCache> g_alarmConditionCache;
+extern std::unordered_map<UA_NodeId, std::string, UA_NodeId_hash, UA_NodeId_KeyEqual> g_nodeIdToGuidMap;
+extern std::shared_mutex g_cache_mutex;
 
 
 extern void GlobalMQTT_Subscribe(const std::string &topic);

@@ -3,8 +3,9 @@
 #include "fetchAPI.h"
 #include <sstream>
 #include <iomanip>
+#include "InstrumentedMutex.cpp"
+#include "AandC.h"
 
-// Forward declaration of worker thread function
 // Forward declaration of worker thread function
 void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                         const std::string& bearerToken,
@@ -224,7 +225,7 @@ bool SessionManager::isValidShortCode(const std::string& shortCode) const {
 // SessionContext Implementation (Cleanup)
 // ============================================================================
 extern std::unordered_map<std::string, UA_NodeId> g_alarmByKey;
-extern std::mutex g_alarmMutex;
+//extern std::mutex g_alarmMutex;
 
 SessionContext::~SessionContext() {
     // 1. Stop worker if running
@@ -238,7 +239,7 @@ SessionContext::~SessionContext() {
 
     // 2. Remove Alarms from Global Map (Thread-Safe)
     if(!alarmMap.empty()) {
-        std::lock_guard<std::mutex> lock(g_alarmMutex);
+        InstrumentedGuard lock(g_alarmMutex);
         for(const auto& pair : alarmMap) {
             // Only remove if it exists (safe check)
             // DISABLED: User requested to keep address space persistent across reconnections
