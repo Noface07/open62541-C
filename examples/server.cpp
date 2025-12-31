@@ -366,8 +366,13 @@ customActivateSession(UA_Server *server, UA_AccessControl *ac,
                  try {
                      profileJson = nlohmann::ordered_json::parse(*cachedVal);
                      profile = ParseUserProfileFromJson(profileJson);
-                     cacheHit = true;
-                     log("⚡ Redis Cache HIT for UserProfile (User: " + username + ") - Fetched in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
+                     if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
+                        cacheHit = true;
+                        log("⚡ Redis Cache HIT for UserProfile (User: " + username + ") - Fetched in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
+                     } else {
+                        log("⚠️ Cached UserProfile incomplete (missing OrgCode/ID). Forcing refresh.", LogLevel::WARNING);
+                        cacheHit = false;
+                     }
                  } catch(const std::exception& e) {
                       log("⚠️ Redis Cache Parse Error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
                  }
@@ -1761,7 +1766,9 @@ int RunServer(int argc, char **argv) {
     // Host: 216.48.184.131, Port: 6379, Pass: xeeredis@techd, DB: 0
     // Prefix: OPC_UA:<TimestampHex>_<PID>
     log("Redis Cache Prefix: " + uniquePrefix, LogLevel::INFO);
-    g_redisClient.init("216.48.184.131", 6379, "xeeredis@techd", 0, uniquePrefix);
+    // Redis Initialization moved after config loading
+    // g_redisClient.init(...) 
+
 
     // Determine if running as service (via arguments or context)
     bool isService = false;
@@ -1845,6 +1852,17 @@ int RunServer(int argc, char **argv) {
 
     // Extract ConfigurationSettings
     std::string NodeID = Settingsconfig["ConfigurationSettings"]["NodeID"].get<std::string>();
+
+    // Extract RedisConfig
+    std::string redisHost = Settingsconfig["RedisConfig"]["Host"].get<std::string>();
+    int redisPort = Settingsconfig["RedisConfig"]["Port"].get<int>();
+    std::string redisPassword = Settingsconfig["RedisConfig"]["Password"].get<std::string>();
+    int redisDb = Settingsconfig["RedisConfig"]["DbIndex"].get<int>();
+
+    // Initialize Redis Client
+    log("Redis Cache Prefix: " + uniquePrefix, LogLevel::INFO);
+    g_redisClient.init(redisHost, redisPort, redisPassword, redisDb, uniquePrefix);
+
 
     std::cout << "✓ Configuration parsed successfully" << std::endl;
     std::cout << "API Host: " << applicationEndURLHost << ":" << applicationEndURLPort << std::endl;
@@ -2182,12 +2200,15 @@ int RunServer(int argc, char **argv) {
     config->maxMonitoredItems = 0;   // Global limit to prevent TimerTree explosion
     config->queueSizeLimits.max = 200;  // Global limit for MonitoredItems
     //config->maxSubscriptions = 200;      // Global limit for subscriptions
-    config->publishingIntervalLimits.min = 100.0; // Enforce min 100ms publishing interval
+    config->publishingIntervalLimits.min = 50.0; // Enforce min 100ms publishing interval
     config->samplingIntervalLimits.min = 500.0;   // Throttle sampling to max 5Hz to prevent notification flood
     config->publishingIntervalLimits.max = 3600.0 * 1000.0;
     config->enableRetransmissionQueue = true;  // Enable retransmission queue
     config->maxRetransmissionQueueSize = 100;         // Standard: Unlimited (was 1/10 for debugging)
     config->maxNotificationsPerPublish = 1000;      // Limit per PublishResponse
+
+    config->keepAliveCountLimits.min = 3;  // Prune dead subscriptions faster
+    config->keepAliveCountLimits.max = 5;
    
     // Allow the server to send larger packets (1 MB chunks, 10 MB total message)
     config->tcpBufSize = 16 * 1024 * 1024;     // 16 MB TCP Buffer (Excellent)

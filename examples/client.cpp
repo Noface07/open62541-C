@@ -39,6 +39,8 @@
  #include <boost/asio.hpp>
  #include <unordered_map>
  #include <nlohmann/json.hpp>
+#include "UserProfile.h"
+#include "RedisClient.h"
 
 using namespace std;
 
@@ -54,7 +56,8 @@ static std::mutex cert_loading_mutex;
 unordered_map<string, int> groupIdMap;
 
 std::atomic<bool> g_running(true);
-
+std::string APIusername = "bhupesh.paliwal@techondater.com";
+std::string APIpassword = "Admin@123";
 
 
 #ifdef _WIN32
@@ -275,7 +278,7 @@ myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg
             log(buffer, LogLevel::INFO);
             break;
         case UA_LOGLEVEL_DEBUG:
-            log(buffer, LogLevel::DEBUG);
+            // log(buffer, LogLevel::DEBUG); // Silenced library debug logs
             break;
     }
 }
@@ -379,6 +382,19 @@ runClient(bool isService, int argc, char *argv[]) {
         std::string dbPath = config["Payload"]["OfflineQueueOptions"]["DbPath"].get<std::string>();
         int retentionDays = config["Payload"]["OfflineQueueOptions"]["RetentionDays"].get<int>();
         int retryBatchSize = config["Payload"]["OfflineQueueOptions"]["RetryBatchSize"].get<int>();
+
+        // Extract RedisConfig
+        std::string redisHost = config["RedisConfig"]["Host"].get<std::string>();
+        int redisPort = config["RedisConfig"]["Port"].get<int>();
+        std::string redisPassword = config["RedisConfig"]["Password"].get<std::string>();
+        int redisDb = config["RedisConfig"]["DbIndex"].get<int>();
+        
+        // Initialize Redis Client
+        // Use "OPCUA_SERVER:" prefix to match the server's storage for User Profiles
+        std::string uniquePrefix = "OPCUA_SERVER:"; 
+        log("Initializing Redis Client with prefix: " + uniquePrefix, LogLevel::INFO);
+        g_redisClient.init(redisHost, redisPort, redisPassword, redisDb, uniquePrefix);
+
 
 
         #ifdef _WIN32
@@ -775,6 +791,10 @@ runClient(bool isService, int argc, char *argv[]) {
         UA_ClientConfig *config = UA_Client_getConfig(ctx->client.get());
         UA_ClientConfig_setDefault(config); // Start with a default config for EVERY client
         config->logging = &myLogger; // Apply your custom logger
+
+        UA_String_clear(&config->clientDescription.applicationUri);
+        config->clientDescription.applicationUri =
+            UA_STRING_ALLOC("urn:Anexee.client.application");
     
         // --- Start of Corrected Security Logic ---
     
@@ -844,27 +864,39 @@ runClient(bool isService, int argc, char *argv[]) {
             
             // This part needs to be dynamic based on your securityPolicy from JSON
             const std::string &policy = server.securityPolicy;
+
+            //UA_String_clear(&config->securityPolicyUri);
+
             if(policy == "UA_SP_BASIC256") {
-                config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
+                config->securityPolicyUri = UA_STRING_ALLOC(
+                    (char*)"http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
             } else if(policy == "UA_SP_AES128") {
-                config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
+                config->securityPolicyUri =
+                    UA_STRING_ALLOC(
+                    (char *)"http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
             } else if(policy == "UA_SP_AES256") {
-                config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss");
+                config->securityPolicyUri =
+                    UA_STRING_ALLOC(
+                    (char *)"http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss");
             } else {
-                // Fallback to None
-                config->securityPolicyUri = UA_STRING_ALLOC("http://opcfoundation.org/UA/SecurityPolicy#None");
+                config->securityPolicyUri = UA_STRING_ALLOC(
+                    (char *)"http://opcfoundation.org/UA/SecurityPolicy#None");
             }
-    
+
         } 
         // If msgSecurityMode is "NONE", we do nothing extra. The UA_ClientConfig_setDefault already handled it.
+
+
+
     
         // --- End of Corrected Security Logic ---
             if(server.authType == "AUTH_STG_ANYMS" || server.authType == "AUTH_STG_ANYMS") {
                 return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
             } else if(server.authType == "AUTH_STG_AUTH") {
                 return UA_Client_connectUsername(ctx->client.get(),
-                                                 server.endpointUrl.c_str(), "user1",
-                                                 "password1");
+                                                 server.endpointUrl.c_str(),
+                                                 APIusername.c_str(),
+                    APIpassword.c_str());
             }
             else if(server.authType == "AUTH_STG_CERT") {
                 return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
@@ -872,7 +904,98 @@ runClient(bool isService, int argc, char *argv[]) {
             return UA_STATUSCODE_BADIDENTITYTOKENINVALID;
         };
 
-        context->onConnected = [ctx=context.get(), server = server_copy]() {
+        //-------------------------------------------------------------------------
+
+            UserProfile profile;
+        try {
+            std::string json_body = "{}";
+            std::string cacheKey = "USER_PROFILE_" + APIusername;
+            nlohmann::ordered_json profileJson;
+            bool cacheHit = false;
+
+            if(true) {
+                auto start_time = std::chrono::steady_clock::now();
+                auto cachedVal = g_redisClient.get(cacheKey);
+                auto end_time = std::chrono::steady_clock::now();
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      end_time - start_time)
+                                      .count();
+
+                if(cachedVal) {
+                    try {
+                        profileJson = nlohmann::ordered_json::parse(*cachedVal);
+                        profile = ParseUserProfileFromJson(profileJson);
+                        
+                        // Validate critical fields
+                        if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
+                            cacheHit = true;
+                            log("⚡ Redis Cache HIT for UserProfile (User: " + APIusername +
+                                    ") - Fetched in " + std::to_string(elapsed_ms) + " ms",
+                                LogLevel::INFO);
+                        } else {
+                            log("⚠️ Cached UserProfile incomplete (missing OrgCode/ID). Forcing refresh.", LogLevel::WARNING);
+                            cacheHit = false;
+                        }
+                    } catch(const std::exception &e) {
+                        log("⚠️ Redis Cache Parse Error for UserProfile: " +
+                                std::string(e.what()),
+                            LogLevel::WARNING);
+                    }
+                } else {
+                    if(g_redisClient.isConnected())
+                        log("📉 Redis Cache MISS for UserProfile (User: " + APIusername +
+                                ") - Checked in " + std::to_string(elapsed_ms) + " ms",
+                            LogLevel::INFO);
+                }
+            }
+
+            if(!cacheHit) {
+                auto token = getBearerTokenNow(applicationEndURLHost,
+                                               std::to_string(applicationEndURLPort),
+                                               APIusername, APIpassword, true).get();
+
+                auto futureResponse = std::async(
+                    std::launch::async, getResponse, applicationEndURLHost,
+                               std::to_string(applicationEndURLPort), token, json_body,
+                               "/api/GetUserProfile");
+
+                // We can wait responsive or just block here as this is connection phase
+                profileJson = futureResponse.get();
+
+                // Store in Redis (Persistent - no TTL)
+                g_redisClient.setCompressed(cacheKey, profileJson.dump(), 0);
+
+                profile = ParseUserProfileFromJson(profileJson);
+            }
+
+        } catch(const std::exception &e) {
+            log("❌ User profile request failed: " + std::string(e.what()),
+                LogLevel::ERRORS);
+            return UA_STATUSCODE_BADUSERACCESSDENIED;
+        }
+
+        if(profile.currentOrgId.empty()) {
+            log("❌ No currentOrgId in user profile", LogLevel::ERRORS);
+            return UA_STATUSCODE_BADUSERACCESSDENIED;
+        }
+
+        log("✓ User profile: " + profile.displayName + " (OrgID: " +
+                profile.currentOrgId + ", Org: " + profile.currentOrgCode
+            + ")",
+            LogLevel::INFO);
+
+        printf("User Profile Loaded: %s | OrgID: %s | OrgCode: %s\n",
+               profile.displayName.c_str(), profile.currentOrgId.c_str(),
+               profile.currentOrgCode.c_str());
+
+        std::string orgShortCode = profile.currentOrgCode;
+
+        std:
+        string NamespaceURI = "Anexee:" + orgShortCode;
+        //------------------------------------------------------------------------------------------
+
+        context->onConnected = [ctx = context.get(), server = server_copy,
+                                NamespaceURI]() {
             // base subscription (events)
             UA_CreateSubscriptionRequest req = UA_CreateSubscriptionRequest_default();
             UA_CreateSubscriptionResponse sub =
@@ -881,7 +1004,7 @@ runClient(bool isService, int argc, char *argv[]) {
             MonitorEvent(ctx->client.get(), ctx->subscriptions[server.name]);
 
 #ifdef UA_ENABLE_SUBSCRIPTIONS
-            // group subscriptions
+            // group subscriptions 
             for(const auto &group : server.groups) {
                 UA_CreateSubscriptionRequest greq = UA_CreateSubscriptionRequest_default();
                 greq.requestedMaxKeepAliveCount = group.maxKeepAliveCount;
@@ -893,7 +1016,8 @@ runClient(bool isService, int argc, char *argv[]) {
                 UA_CreateSubscriptionResponse gsub =
                     UA_Client_Subscriptions_create(ctx->client.get(), greq, nullptr, nullptr, nullptr);
                 ctx->subscriptions[group.name] = gsub;
-                log("Subscription Created:" + group.name);
+                log("Subscription Created: " + group.name + " | ID: " + std::to_string(gsub.subscriptionId) + 
+                    " | Interval: " + std::to_string(gsub.revisedPublishingInterval) + "ms", LogLevel::INFO);
             }
 #endif
 
@@ -904,12 +1028,20 @@ runClient(bool isService, int argc, char *argv[]) {
                     if(!tag.mappedInfospaceTags) continue;
                     for(const auto &infoSpace : *tag.mappedInfospaceTags) {
                         std::lock_guard<std::mutex> lock(ctx->taskMutex);
-                        ctx->taskQueue.push([ctx, infoSpace, groupName]() {
-                            MyMonitorContext *myContext = new MyMonitorContext{infoSpace, g_mqttHandler , g_sqliteService};
-                            MonitorItem(ctx->client.get(),
-                                        ctx->subscriptions[groupName],
+                        ctx->taskQueue.push([ctx, infoSpace, groupName, NamespaceURI]() {
+                            MyMonitorContext *myContext = new MyMonitorContext{
+                                infoSpace, g_mqttHandler, g_sqliteService};
+
+                            // Create a scheduler lambda using the current context
+                            TaskScheduler scheduler = [ctx](std::function<void()> task) {
+                                std::lock_guard<std::mutex> lock(ctx->taskMutex);
+                                ctx->taskQueue.push(task);
+                            };
+
+                            MonitorItem(ctx->client.get(), ctx->subscriptions[groupName],
                                         Mapping[infoSpace.tagId].first.c_str(),
-                                        infoSpace.tagId, myContext);
+                                        infoSpace.tagId, myContext, NamespaceURI.c_str(), scheduler);
+
                         });
                     }
                 }
@@ -1054,7 +1186,7 @@ runClient(bool isService, int argc, char *argv[]) {
     log("Cleaning up...");
 
     for(auto &context : clientContexts) {
-        UA_Client_disconnect(context->client.get());
+        //UA_Client_disconnect(context->client.get());
         context->stopLoop();
     }
 

@@ -1449,6 +1449,11 @@ if(UA_ENABLE_ENCRYPTION_LIBRESSL)
     target_compile_definitions(open62541 PUBLIC NOCRYPT=1)
 endif()
 
+# Enable deprecated / insecure security policies (Basic128Rsa15, Basic256)
+target_compile_definitions(open62541-object PRIVATE UA_INCLUDE_INSECURE_POLICIES)
+target_compile_definitions(open62541-plugins PRIVATE UA_INCLUDE_INSECURE_POLICIES)
+target_compile_definitions(open62541 PRIVATE UA_INCLUDE_INSECURE_POLICIES)
+
 # Generate properly versioned shared library links on Linux.
 # When building packages, include the source in the library name to enable parallel
 # installation of multiple major versions.

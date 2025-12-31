@@ -960,7 +960,7 @@ addAllSecurityPolicies(UA_SecurityPolicy *sp, size_t *length,
                        UA_StatusCode_name(retval));
     }
 
-//#ifdef UA_INCLUDE_INSECURE_POLICIES
+#ifdef UA_INCLUDE_INSECURE_POLICIES
     /* Basic128Rsa15 should no longer be used */
     retval = UA_SecurityPolicy_Basic128Rsa15(sp + *length, certificate, privateKey, logging);
     *length += (retval == UA_STATUSCODE_GOOD) ? 1 : 0;
@@ -978,7 +978,7 @@ addAllSecurityPolicies(UA_SecurityPolicy *sp, size_t *length,
                        "Could not add SecurityPolicy#Basic256 with error code %s",
                        UA_StatusCode_name(retval));
     }
-//#endif
+#endif
 }
 
 static UA_StatusCode

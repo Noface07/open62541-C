@@ -1,4 +1,4 @@
-#include <open62541/client_config_default.h>
+﻿#include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
 #include <open62541/client_subscriptions.h>
 #include <open62541/plugin/log_stdout.h>
@@ -14,8 +14,11 @@
 #include "MQTThandler.h"
 #include "SqliteQueueService.h"
 #include "Logger.h"
+#include "Logger.h"
 #include <string>
- #include <exprtk.hpp>
+#include <exprtk.hpp>
+#include <thread>
+#include <chrono>
 
 using namespace std;
 using json = nlohmann::ordered_json;
@@ -228,10 +231,16 @@ createMonitoredItemRequest(UA_NodeId nodeId) {
 }
 
 static UA_NodeId
-parseNodeId(const char *nodeIdStr) {
+parseNodeId(UA_Client *client, const char *nodeIdStr,
+            const char *overrideNamespaceUri) {
+
+    printf("Parsing NodeId string: %s\n with NamesapceURI : %s", nodeIdStr , overrideNamespaceUri);
     UA_NodeId nodeId = UA_NODEID_NULL;
 
-    // Parse namespace
+    /* --------------------------------------------------
+     * 1) Parse namespace from ns=<index>
+     * -------------------------------------------------- */
+
     const char *nsStart = strstr(nodeIdStr, "ns=");
     if(!nsStart)
         return nodeId;
@@ -240,43 +249,51 @@ parseNodeId(const char *nodeIdStr) {
     if(!nsEnd)
         return nodeId;
 
-    // Extract namespace index
-    size_t nsLen = nsEnd - (nsStart + 3);
-    char *nsStr = (char *)UA_malloc(nsLen + 1);
-    if(!nsStr)
-        return nodeId;
+    UA_UInt16 namespaceIndex = (UA_UInt16)strtoul(nsStart + 3, NULL, 10);
 
-    memcpy(nsStr, nsStart + 3, nsLen);
-    nsStr[nsLen] = '\0';
+    /* --------------------------------------------------
+     * 2) OPTIONAL override using Namespace URI
+     * -------------------------------------------------- */
 
-    // Convert namespace string to index
-    UA_UInt16 namespaceIndex = (UA_UInt16)strtoul(nsStr, NULL, 10);
-    UA_free(nsStr);
+    if(overrideNamespaceUri && client) {
+        UA_UInt16 resolvedNs;
+        UA_StatusCode sc = UA_Client_getNamespaceIndex(
+            client, UA_STRING((char *)overrideNamespaceUri), &resolvedNs);
 
-    // Parse identifier type and value
+        if(sc == UA_STATUSCODE_GOOD) {
+            namespaceIndex = resolvedNs; /* override */
+        }
+        /* else: silently keep original ns */
+    }
+
+    /* --------------------------------------------------
+     * 3) Parse identifier
+     * -------------------------------------------------- */
+
     const char *idStart = nsEnd + 1;
+
     if(strncmp(idStart, "i=", 2) == 0) {
-        // Numeric identifier
         UA_UInt32 numericId = (UA_UInt32)strtoul(idStart + 2, NULL, 10);
         nodeId = UA_NODEID_NUMERIC(namespaceIndex, numericId);
+
     } else if(strncmp(idStart, "s=", 2) == 0) {
-        // String identifier
-        nodeId = UA_NODEID_STRING(namespaceIndex, const_cast<char *>(idStart + 2));
+        nodeId = UA_NODEID_STRING_ALLOC(namespaceIndex, idStart + 2);
+
     } else if(strncmp(idStart, "g=", 2) == 0) {
-        // GUID identifier
         UA_Guid guid;
-        if(UA_Guid_parse(&guid, UA_String_fromChars(idStart + 2)) == UA_STATUSCODE_GOOD) {
+        UA_String guidStr = UA_String_fromChars(idStart + 2);
+        if(UA_Guid_parse(&guid, guidStr) == UA_STATUSCODE_GOOD)
             nodeId = UA_NODEID_GUID(namespaceIndex, guid);
-        }
+        UA_String_clear(&guidStr);
+
     } else if(strncmp(idStart, "b=", 2) == 0) {
-        // Base64 string identifier
         UA_ByteString bs;
+        UA_ByteString_init(&bs);
         bs.length = strlen(idStart + 2);
         bs.data = (UA_Byte *)UA_malloc(bs.length);
         if(bs.data) {
             memcpy(bs.data, idStart + 2, bs.length);
-            nodeId = UA_NODEID_BYTESTRING(namespaceIndex, (char *)bs.data);
-            UA_ByteString_clear(&bs);
+            nodeId = UA_NODEID_BYTESTRING_ALLOC(namespaceIndex, (const char *)bs.data);
         }
     }
 
@@ -286,16 +303,23 @@ parseNodeId(const char *nodeIdStr) {
 
 
 
+
+// Include the header to ensure signature match
+#include "Monitoring.h"
+
 void
 MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
-            const char *nodeIdStr, int tagID, MyMonitorContext *myContext) {
+            const char *nodeIdStr, int tagID, MyMonitorContext *myContext,
+            const char *overrideNamespaceUri,
+            TaskScheduler scheduler, int attempt) {
+
 
     UA_MonitoredItemCreateRequest monRequest;
     UA_MonitoredItemCreateResult monResponse;
 
     // global_mqttHandler = g_mqttHandler;
 
-    UA_NodeId nodeId = parseNodeId(nodeIdStr);
+    UA_NodeId nodeId = parseNodeId(client, nodeIdStr, overrideNamespaceUri);
     if(UA_NodeId_isNull(&nodeId)) {
         log("Invalid node ID format: " + string(nodeIdStr), LogLevel::ERRORS);
         return;
@@ -312,8 +336,15 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
     
     // Configure the monitoring filter
     UA_DataChangeFilter filter;
-    filter.deadbandType = UA_DEADBANDTYPE_PERCENT; // No deadband filtering
-    filter.deadbandValue =  myContext->infoSpace.deadband;
+    
+    if (myContext->infoSpace.deadband > 0) {
+        filter.deadbandType = UA_DEADBANDTYPE_PERCENT; 
+        filter.deadbandValue =  myContext->infoSpace.deadband;
+    } else {
+         filter.deadbandType = UA_DEADBANDTYPE_NONE;
+         filter.deadbandValue = 0.0;
+    }
+    
     filter.trigger = UA_DATACHANGETRIGGER_STATUSVALUE;
     UA_ExtensionObject filterExtObj;
     memset(&filterExtObj, 0, sizeof(filterExtObj));
@@ -322,15 +353,62 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
     filterExtObj.content.decoded.data = &filter;
     monRequest.requestedParameters.filter = filterExtObj;
 
+
+        log("Requesting MonitoredItem for NodeId: " + string(nodeIdStr) + 
+            " | Sampling: " + std::to_string(monRequest.requestedParameters.samplingInterval) + 
+            "ms | Queue: " + std::to_string(monRequest.requestedParameters.queueSize), LogLevel::INFO);
+
+    // Async Retry Logic
+    int maxRetries = 5;
+
     monResponse = UA_Client_MonitoredItems_createDataChange(
         client, response.subscriptionId, UA_TIMESTAMPSTORETURN_BOTH, monRequest, myContext,
         handler_NodeValueChanged, NULL);
-    if(monResponse.statusCode == UA_STATUSCODE_GOOD) {
-        UA_String nodeIdStr = UA_STRING_NULL;
-        UA_NodeId_print(&monRequest.itemToMonitor.nodeId, &nodeIdStr);
-        log("Monitoring Node " + string((char *)nodeIdStr.data, nodeIdStr.length) +
-            ", id " + to_string(monResponse.monitoredItemId) + to_string(tagID));
-        UA_String_clear(&nodeIdStr);
+        
+    if (monResponse.statusCode == UA_STATUSCODE_GOOD) {
+        UA_String nodeIdStrPrint = UA_STRING_NULL;
+        UA_NodeId_print(&monRequest.itemToMonitor.nodeId, &nodeIdStrPrint);
+        log("Monitoring Created Successfully for Node " + string((char *)nodeIdStrPrint.data, nodeIdStrPrint.length) +
+            " | Id: " + to_string(monResponse.monitoredItemId) + " | TagID: " + to_string(tagID), LogLevel::INFO);
+        UA_String_clear(&nodeIdStrPrint);
+    } else if (monResponse.statusCode == UA_STATUSCODE_BADNODEIDUNKNOWN && attempt < maxRetries) {
+        //log("Failed to create MonitoredItem (BadNodeIdUnknown) for TagID " + to_string(tagID) + 
+        //    ". Retrying in 2 seconds... (Attempt " + to_string(attempt + 1) + "/" + to_string(maxRetries) + ")", LogLevel::INFO);
+        
+        if (scheduler) {
+            // CRITICAL FIX: Capture strings by VALUE (std::string) to avoid dangling pointers
+            std::string nsUriCopy = overrideNamespaceUri ? overrideNamespaceUri : "";
+            std::string nodeIdCopy = nodeIdStr ? nodeIdStr : "";
+            
+            // Spawn a thread to wait, then schedule the next attempt on the main loop
+            std::thread([=]() {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                // Pass copies into the inner lambda
+                scheduler([=]() {
+                    MonitorItem(client, response, nodeIdCopy.c_str(), tagID, myContext, nsUriCopy.c_str(), scheduler, attempt + 1);
+                });
+            }).detach();
+            
+            return; 
+        } else {
+
+            // Fallback to synchronous sleep if no scheduler provided (legacy behavior)
+            log("No scheduler provided, falling back to synchronous retry", LogLevel::WARNING);
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            MonitorItem(client, response, nodeIdStr, tagID, myContext, overrideNamespaceUri, nullptr, attempt + 1);
+            return;
+        }
+
+    } else {
+            // Other error or max retries reached
+            //log("Failed to create MonitoredItem for TagID " + to_string(tagID) + 
+            //" | Status: " + string(UA_StatusCode_name(monResponse.statusCode)), LogLevel::ERRORS);
+    }
+
+    if (monResponse.statusCode != UA_STATUSCODE_GOOD) {
+        log("Permanently failed to create MonitoredItem for TagID " + to_string(tagID), LogLevel::ERRORS);
+        // Clean up context to avoid memory leak since it wasn't passed to a successful monitor
+        delete myContext;
     }
 }
 
@@ -341,81 +419,137 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
 
 
 
-void handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext,
-                   UA_UInt32 monId, void *monContext,
-                   const UA_KeyValueMap eventFields) {
-    log("Received Event Notification (" + to_string(eventFields.mapSize) + " fields):");
-    
+void
+handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext, UA_UInt32 monId,
+              void *monContext, const UA_KeyValueMap eventFields) {
+    log("========== EVENT NOTIFICATION ==========");
+    log("Fields count: " + std::to_string(eventFields.mapSize));
+
     for(size_t i = 0; i < eventFields.mapSize; ++i) {
         UA_KeyValuePair *pair = &eventFields.map[i];
         UA_Variant *value = &pair->value;
-        
-        // pair->key is UA_QualifiedName. We can print it too if we want.
 
+        // ---- Field name ----
+        std::string fieldName((char *)pair->key.name.data, pair->key.name.length);
+
+        log("Field: " + fieldName);
+
+        // ---- Empty value ----
+        if(!value || !value->data) {
+            log("  Value: <null>");
+            continue;
+        }
+
+        // ---- UINT16 / Severity ----
         if(UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_UINT16])) {
-            UA_UInt16 severity = *(UA_UInt16 *)value->data;
-            log("  Severity: " + std::to_string(severity));
-        } else if (UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT])) {
-            UA_LocalizedText *lt = (UA_LocalizedText *)value->data;
-            log("  Message: " + std::string((char *)lt->text.data, lt->text.length));
+            log("  Type: UInt16");
+            log("  Value: " + std::to_string(*(UA_UInt16 *)value->data));
         }
-        else if (UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_STRING])) {
+
+        // ---- BOOLEAN ----
+        else if(UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_BOOLEAN])) {
+            log("  Type: Boolean");
+            log(std::string("  Value: ") +
+                (*(UA_Boolean *)value->data ? "true" : "false"));
+        }
+
+        // ---- STRING ----
+        else if(UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_STRING])) {
             UA_String *s = (UA_String *)value->data;
-            log("  Source Name: " + std::string((char *)s->data, s->length));
+            log("  Type: String");
+            log("  Value: " + std::string((char *)s->data, s->length));
         }
 
-        else if (UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_DATETIME])) {
+        // ---- LOCALIZED TEXT ----
+        else if(UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT])) {
+            UA_LocalizedText *lt = (UA_LocalizedText *)value->data;
+            log("  Type: LocalizedText");
+            log("  Value: " + std::string((char *)lt->text.data, lt->text.length));
+        }
+
+        // ---- DATETIME ----
+        else if(UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_DATETIME])) {
             UA_DateTime dt = *(UA_DateTime *)value->data;
-            UA_Int64 UnixTime = UA_DateTime_toUnixTime(dt);
+            log("  Type: DateTime");
 
-            // Convert to time_t (seconds since epoch)
-            std::time_t t = static_cast<std::time_t>(UnixTime);
+            if(dt == 0) {
+                log("  Value: <not set>");
+            } else {
+                UA_Int64 unixTime = UA_DateTime_toUnixTime(dt);
+                std::time_t t = (std::time_t)unixTime;
 
-            // Convert to local time and print
-            char buf[64];
-            std::tm *tm_info = std::localtime(&t);
-            std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
-
-            log("  Time: " + string(buf));
+                char buf[64];
+                std::tm tm{};
+#ifdef _WIN32
+                localtime_s(&tm, &t);
+#else
+                localtime_r(&t, &tm);
+#endif
+                std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+                log("  Value: " + std::string(buf));
+            }
         }
 
-        else if (UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_NODEID])) {
+        // ---- NODEID ----
+        else if(UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_NODEID])) {
             UA_NodeId *nid = (UA_NodeId *)value->data;
-            log("  NODE ID: ns=" + to_string(nid->namespaceIndex) + ";");
-            switch (nid->identifierType) {
+            log("  Type: NodeId");
+
+            std::string nidStr = "ns=" + std::to_string(nid->namespaceIndex) + ";";
+            switch(nid->identifierType) {
                 case UA_NODEIDTYPE_NUMERIC:
-                    log("i=" + std::to_string(nid->identifier.numeric));
+                    nidStr += "i=" + std::to_string(nid->identifier.numeric);
                     break;
                 case UA_NODEIDTYPE_STRING:
-                    log("s=" + std::string((char *)nid->identifier.string.data,
-                                            nid->identifier.string.length));
+                    nidStr += "s=" + std::string((char *)nid->identifier.string.data,
+                                                 nid->identifier.string.length);
                     break;
                 case UA_NODEIDTYPE_GUID:
-                    log("g=GUID");
+                    nidStr += "g=<GUID>";
                     break;
                 case UA_NODEIDTYPE_BYTESTRING:
-                    log("b=ByteString");
+                    nidStr += "b=<ByteString>";
                     break;
             }
-            std::cout << std::endl;
+            log("  Value: " + nidStr);
         }
 
-         else {
-            // log("  Unknown field type" , LogLevel::ERRORS);
+        // ---- BYTESTRING (EventId) ----
+        else if(UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_BYTESTRING])) {
+            UA_ByteString *bs = (UA_ByteString *)value->data;
+            log("  Type: ByteString");
+
+            std::ostringstream oss;
+            for(size_t j = 0; j < bs->length; ++j)
+                oss << std::hex << std::setw(2) << std::setfill('0') << (int)bs->data[j];
+
+            log("  Value (hex): " + oss.str());
         }
+
+        // ---- STATUS CODE ----
+        else if(UA_Variant_hasScalarType(value, &UA_TYPES[UA_TYPES_STATUSCODE])) {
+            log("  Type: StatusCode");
+            log("  Value: " + std::to_string(*(UA_StatusCode *)value->data));
+        }
+
+        // ---- ARRAY ----
+        else if(UA_Variant_isArray(value)) {
+            log("  Type: Array");
+            log("  Length: " + std::to_string(value->arrayLength));
+        }
+
+        // ---- UNKNOWN ----
+        else {
+            log("  Type: Unknown / Unsupported");
+        }
+
+        log("--------------------------------------");
     }
-    std::cout << std::endl;
 
-    // payload
-            // {
-            // "type": "alarm",
-            // "timestamp": "2025-06-25T15:40:12Z",
-            // "tagId": 128,
-            // "message": "Level exceeded",
-            // "severity": 500
-            // }
-
+    log("========== END EVENT ==========\n");
 }
+
+
 
 void MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse response) {
 

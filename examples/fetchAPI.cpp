@@ -236,7 +236,7 @@ vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearer
                                 tagInfo.scaleMax = tagItem["scaleMax"].get<double>();
                                 tagInfo.enableExpression =
                                     tagItem["enableExpression"].get<bool>();
-                                tagInfo.expression = tagItem["expression"].get<string>();
+                                tagInfo.expression = tagItem.value("expression", "");
                                 tagInfo.dataPointId = tagItem["dataPointId"].get<int>();
                                 tagInfo.name = tagItem["name"].get<string>();
                                 tagInfo.nodeId = tagItem["nodeId"].get<string>();
@@ -246,11 +246,17 @@ vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearer
                                 tagInfo.deadband = tagItem["deadband"].get<int>();
                                 tagInfo.queuesize = tagItem["queueSize"].get<int>();
                                 tagInfo.rdWtOpt = tagItem["rdWtOpt"].get<string>();
-
+                               
                                 // Extract the OPC UA namespace field from the tag
-                                string opcUaNamespace = "";
                                 if(tagItem.contains("namespace") && tagItem["namespace"].is_string()) {
-                                    opcUaNamespace = tagItem["namespace"].get<string>();
+                                    tagInfo.namespaceNodeID =
+                                        tagItem["namespace"].get<string>();
+                                };
+
+                                string opcUaNamespace = "";
+                                if(tagItem.contains("name") &&
+                                   tagItem["name"].is_string()) {
+                                    opcUaNamespace = tagItem["name"].get<string>();
                                 }
 
                                 if(tagItem.contains("mappedInfospaceTags") &&
@@ -297,6 +303,10 @@ vector<ServerInfoO> ParseServerHierarchy(string host, string port, string bearer
                                         pair<string, string> NodePair = {
                                             opcUaNamespace, serverInfo.endpointUrl};
                                         Mapping[mappedInfo.tagId] = NodePair;
+                                        printf("Mapping TagID %d to Node %s at Endpoint %s\n",
+                                               mappedInfo.tagId,
+                                               opcUaNamespace.c_str(),
+                                               serverInfo.endpointUrl.c_str());
                                         // Store MQTT topic mapping for alarm fallback
                                         TopicMapping[mappedInfo.tagId] = mappedInfo.namespaces;
 
@@ -620,11 +630,11 @@ UserProfile ParseUserProfileFromJson(const json& response) {
             profile.defaultOrgName = item.value("defaultOrgName", "");
             profile.currentOrgId = getAsString("currentOrgId");
             profile.currentOrgName = item.value("currentOrgName", "");
-            profile.currentOrgProfileId = item.value("currentOrgProfileId", "");
-            profile.currentOrgProductName = item.value("currentOrgProductName", "");
-            profile.currentOrgCode = item.value("currentOrgCode", "");
-            profile.currentOrganisationType = item.value("currentOrganisationType", "");
-            profile.currentOrgLogo = item.value("currentOrgLogo", "");
+            profile.currentOrgProfileId = getAsString("currentOrgProfileId");
+            profile.currentOrgProductName = item.value("currentOrgProductName", ""); // String
+            profile.currentOrgCode = item.value("currentOrgCode", ""); // String
+            profile.currentOrganisationType = item.value("currentOrganisationType", ""); // String
+            profile.currentOrgLogo = item.value("currentOrgLogo", ""); // String
             
             log("✓ Parsed user profile: " + profile.displayName + 
                 " (OrgID: " + profile.currentOrgId + ")", LogLevel::DEBUG);
