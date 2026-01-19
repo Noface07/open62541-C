@@ -1,18 +1,19 @@
 #ifndef SQLITE_QUEUE_SERVICE_H
 #define SQLITE_QUEUE_SERVICE_H
 
-#include <string>
-#include <vector>
-#include <queue>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
+#include <any>
 #include <atomic>
 #include <functional>
 #include <map>
-#include <any>
+#include <mutex>
+#include <queue>
 #include <sqlite3.h>
+#include <string>
+#include <thread>
+#include <vector>
+
 #include "nlohmann/json.hpp"
+#include <condition_variable>
 
 // --- Data Models (mirroring C# Models) ---
 
@@ -20,20 +21,22 @@ struct MqttPayload {
     int datapointId;
     std::string name;
     int tagId;
-    std::string value;
+    nlohmann::json value;
     std::string tagType;
     std::string timeStamp;
-    std::string source;
+    int source;
     int infoId;
-    std::string quality;
+    int quality;
+    int UpdateType;
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(MqttPayload, datapointId, tagId, value, tagType, timeStamp, source, infoId, quality)
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(MqttPayload, datapointId, tagId, value, tagType,
+                                   timeStamp, source, infoId, quality, UpdateType)
 };
 
 struct QueueModel {
     int id;
     std::string topic;
-    std::string payload; // JSON string of MqttPayload
+    std::string payload;  // JSON string of MqttPayload
     std::string createdAt;
 };
 
@@ -46,16 +49,17 @@ struct QueueItem {
 struct ApiTagData {
     long orgId;
     int tagId;
-    std::string value;
+    nlohmann::json value;
     std::string tagType;
     std::string timeStamp;
-    std::string source;
+    int source;
     int datapointId;
     int infoId;
     int quality;
     int updateType;
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(ApiTagData, orgId, tagId, value, tagType, timeStamp, source, datapointId, infoId, quality, updateType)
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(ApiTagData, orgId, tagId, value, tagType, timeStamp,
+                                   source, datapointId, infoId, quality, updateType)
 };
 
 struct OfflineQueueOptions {
@@ -66,62 +70,94 @@ struct OfflineQueueOptions {
 // --- Service Class Definition ---
 
 class SqliteQueueService {
-public:
-    SqliteQueueService(const std::string& dbPath, const OfflineQueueOptions& options);
+  public:
+    SqliteQueueService(const std::string &dbPath, const OfflineQueueOptions &options);
     ~SqliteQueueService();
 
     // Public API mirroring C# service
-    void SetConfigurations(const std::map<int, long>& datapointToOrgIdMap);
-    void EnqueueMessage(const std::string& topic, const MqttPayload& payload, long orgId);
+    void
+    SetConfigurations(const std::map<int, long> &datapointToOrgIdMap);
+    void
+    EnqueueMessage(const std::string &topic, const MqttPayload &payload, long orgId);
 
-    void StartQueueWorker();
-    void StopQueueWorker();
+    void
+    StartQueueWorker();
+    void
+    StopQueueWorker();
 
-    void StartApiUploadTimer();
-    void StopApiUploadTimer();
+    void
+    StartApiUploadTimer();
+    void
+    StopApiUploadTimer();
 
-    void TriggerOfflineDataProcessing();
-    long GetRowCount();
+    void
+    TriggerOfflineDataProcessing();
+    long
+    GetRowCount();
 
-    void PublishLatestValuesToMqtt(const std::function<void(const std::string& topic, const std::string& payload)>& publishFunc);
+    void
+    PublishLatestValuesToMqtt(
+        const std::function<void(const std::string &topic, const std::string &payload)>
+            &publishFunc);
 
-    void DisposeDB();
+    void
+    DisposeDB();
 
     // Configuration setters
-    void SetApiUrl(const std::string& url);
-    void SetApiAuth(const std::string& bearerToken);
-    void SetApiMetadata(const nlohmann::json& metadata);
-    
+    void
+    SetApiUrl(const std::string &url);
+    void
+    SetApiAuth(const std::string &bearerToken);
+    void
+    SetApiMetadata(const nlohmann::json &metadata);
+
     // MQTT connection state management
-    static void SetMqttConnected(bool connected);
-    static bool IsMqttConnected();
-    
+    static void
+    SetMqttConnected(bool connected);
+    static bool
+    IsMqttConnected();
+
     // Trigger API upload manually
-    void TriggerApiUpload();
+    void
+    TriggerApiUpload();
 
+    using TokenRefreshCallback = std::function<std::string()>;
+    void
+    SetTokenRefreshCallback(TokenRefreshCallback callback);
 
-private:
+  private:
     // Database operations
-    void InitializeDatabase();
-    void InsertMessageToDatabase(const QueueItem& item);
-    std::vector<QueueModel> GetBatchQueuedMessages(int batchSize);
-    std::vector<QueueModel> GetLatestValues();
-    void DeleteMessages(const std::vector<int>& ids);
-    void ClearLatestValues();
+    void
+    InitializeDatabase();
+    void
+    InsertMessageToDatabase(const QueueItem &item);
+    std::vector<QueueModel>
+    GetBatchQueuedMessages(int batchSize);
+    std::vector<QueueModel>
+    GetLatestValues();
+    void
+    DeleteMessages(const std::vector<int> &ids);
+    void
+    ClearLatestValues();
 
     // Worker threads
-    void QueueWorkerLoop();
-    void ApiUploadWorkerLoop();
+    void
+    QueueWorkerLoop();
+    void
+    ApiUploadWorkerLoop();
 
     // Helper methods
-    bool SendToApi(const std::string& jsonPayload);
-    std::string GetCurrentTimestamp();
-    void ExecuteDbCommand(const std::function<int(sqlite3*)>& command);
+    bool
+    SendToApi(const std::string &jsonPayload, bool isRetry = false);
+    std::string
+    GetCurrentTimestamp();
+    void
+    ExecuteDbCommand(const std::function<int(sqlite3 *)> &command);
 
     // Member variables
     std::string dbPath_;
     OfflineQueueOptions options_;
-    sqlite3* db_;
+    sqlite3 *db_;
 
     // Queue worker members
     std::queue<QueueItem> queue_;
@@ -136,10 +172,9 @@ private:
     std::condition_variable apiUploadCv_;
     std::atomic<bool> apiUploadWorkerRunning_{false};
     std::atomic<bool> shouldUploadOfflineData_{false};
-    
+
     // MQTT connection state - shared across components
     static std::atomic<bool> mqttConnected_;
-
 
     std::string fullBacklogTable_;
     std::string latestValuesTable_;
@@ -149,7 +184,7 @@ private:
     std::string apiUrl_;
     std::string apiBearerToken_;
     nlohmann::json apiMetadata_;
-
+    TokenRefreshCallback tokenRefreshCallback_;
 };
 
-#endif // SQLITE_QUEUE_SERVICE_H
+#endif  // SQLITE_QUEUE_SERVICE_H

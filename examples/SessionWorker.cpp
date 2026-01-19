@@ -363,79 +363,79 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                                 nodeMap[ns] = nodeId; 
                             }
                             
-                            // Add EURange property if available
-                            if(item.contains("rangeMin") && item.contains("rangeMax")) {
-                                UA_Range range;
-                                range.low = item["rangeMin"].get<double>();
-                                range.high = item["rangeMax"].get<double>();
-                                
-                                UA_Variant rangeVariant;
-                                UA_Variant_setScalarCopy(&rangeVariant, &range, &UA_TYPES[UA_TYPES_RANGE]);
-                                
-                                UA_VariableAttributes rangeAttr = UA_VariableAttributes_default;
-                                rangeAttr.value = rangeVariant;
-                                rangeAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EURange");
-                                
-                                UA_NodeId rangeNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 1);
-                                UA_QualifiedName rangeName = UA_QUALIFIEDNAME_ALLOC(0, "EURange");
-                                
-                                UA_Server_addVariableNode(
-                                    server, rangeNodeId, nodeId,
-                                    UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
-                                    rangeName,
-                                    UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
-                                    rangeAttr, NULL, NULL);
-                                
-                                UA_QualifiedName_clear(&rangeName);
-                                UA_VariableAttributes_clear(&rangeAttr);
-                            }
-                            
-                            // Add alarm limits if available
-                            if(item.contains("alarmHiHi")) {
-                                UA_Double alarmHiHi = item["alarmHiHi"].get<double>();
-                                UA_Variant alarmVariant;
-                                UA_Variant_setScalarCopy(&alarmVariant, &alarmHiHi, &UA_TYPES[UA_TYPES_DOUBLE]);
-                                
-                                UA_VariableAttributes alarmAttr = UA_VariableAttributes_default;
-                                alarmAttr.value = alarmVariant;
-                                alarmAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "AlarmHiHi");
-                                
-                                UA_NodeId alarmNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 2);
-                                UA_QualifiedName alarmName = UA_QUALIFIEDNAME_ALLOC(0, "AlarmHiHi");
-                                UA_Server_addVariableNode(
-                                    server, alarmNodeId, nodeId,
-                                    UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
-                                    alarmName,
-                                    UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
-                                    alarmAttr, NULL, NULL);
-                                    
-                                UA_QualifiedName_clear(&alarmName);
-                                UA_VariableAttributes_clear(&alarmAttr);
-                            }
-                            
-                            // Add engineering unit if available
-                            if(item.contains("measurmentUnitType")) {
-                                UA_String unit = UA_STRING_ALLOC(item["measurmentUnitType"].get<std::string>().c_str());
-                                UA_Variant unitVariant;
-                                UA_Variant_setScalarCopy(&unitVariant, &unit, &UA_TYPES[UA_TYPES_STRING]);
-                                
-                                UA_VariableAttributes unitAttr = UA_VariableAttributes_default;
-                                unitAttr.value = unitVariant;
-                                unitAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EngineeringUnit");
-                                
-                                UA_NodeId unitNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 6);
-                                UA_QualifiedName unitName = UA_QUALIFIEDNAME_ALLOC(0, "EngineeringUnit");
-                                UA_Server_addVariableNode(
-                                    server, unitNodeId, nodeId,
-                                    UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
-                                    unitName,
-                                    UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
-                                    unitAttr, NULL, NULL);
-                                
-                                UA_QualifiedName_clear(&unitName);
-                                UA_String_clear(&unit);
-                                UA_VariableAttributes_clear(&unitAttr);
-                            }
+                            //// Add EURange property if available
+                            //if(item.contains("rangeMin") && item.contains("rangeMax")) {
+                            //    UA_Range range;
+                            //    range.low = item["rangeMin"].get<double>();
+                            //    range.high = item["rangeMax"].get<double>();
+                            //    
+                            //    UA_Variant rangeVariant;
+                            //    UA_Variant_setScalarCopy(&rangeVariant, &range, &UA_TYPES[UA_TYPES_RANGE]);
+                            //    
+                            //    UA_VariableAttributes rangeAttr = UA_VariableAttributes_default;
+                            //    rangeAttr.value = rangeVariant;
+                            //    rangeAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EURange");
+                            //    
+                            //    UA_NodeId rangeNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 1);
+                            //    UA_QualifiedName rangeName = UA_QUALIFIEDNAME_ALLOC(0, "EURange");
+                            //    
+                            //    UA_Server_addVariableNode(
+                            //        server, rangeNodeId, nodeId,
+                            //        UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                            //        rangeName,
+                            //        UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
+                            //        rangeAttr, NULL, NULL);
+                            //    
+                            //    UA_QualifiedName_clear(&rangeName);
+                            //    UA_VariableAttributes_clear(&rangeAttr);
+                            //}
+                            //
+                            //// Add alarm limits if available
+                            //if(item.contains("alarmHiHi")) {
+                            //    UA_Double alarmHiHi = item["alarmHiHi"].get<double>();
+                            //    UA_Variant alarmVariant;
+                            //    UA_Variant_setScalarCopy(&alarmVariant, &alarmHiHi, &UA_TYPES[UA_TYPES_DOUBLE]);
+                            //    
+                            //    UA_VariableAttributes alarmAttr = UA_VariableAttributes_default;
+                            //    alarmAttr.value = alarmVariant;
+                            //    alarmAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "AlarmHiHi");
+                            //    
+                            //    UA_NodeId alarmNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 2);
+                            //    UA_QualifiedName alarmName = UA_QUALIFIEDNAME_ALLOC(0, "AlarmHiHi");
+                            //    UA_Server_addVariableNode(
+                            //        server, alarmNodeId, nodeId,
+                            //        UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                            //        alarmName,
+                            //        UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
+                            //        alarmAttr, NULL, NULL);
+                            //        
+                            //    UA_QualifiedName_clear(&alarmName);
+                            //    UA_VariableAttributes_clear(&alarmAttr);
+                            //}
+                            //
+                            //// Add engineering unit if available
+                            //if(item.contains("measurmentUnitType")) {
+                            //    UA_String unit = UA_STRING_ALLOC(item["measurmentUnitType"].get<std::string>().c_str());
+                            //    UA_Variant unitVariant;
+                            //    UA_Variant_setScalarCopy(&unitVariant, &unit, &UA_TYPES[UA_TYPES_STRING]);
+                            //    
+                            //    UA_VariableAttributes unitAttr = UA_VariableAttributes_default;
+                            //    unitAttr.value = unitVariant;
+                            //    unitAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", "EngineeringUnit");
+                            //    
+                            //    UA_NodeId unitNodeId = UA_NODEID_NUMERIC(jobCtx->namespaceIndex, tagId * 1000 + 6);
+                            //    UA_QualifiedName unitName = UA_QUALIFIEDNAME_ALLOC(0, "EngineeringUnit");
+                            //    UA_Server_addVariableNode(
+                            //        server, unitNodeId, nodeId,
+                            //        UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                            //        unitName,
+                            //        UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
+                            //        unitAttr, NULL, NULL);
+                            //    
+                            //    UA_QualifiedName_clear(&unitName);
+                            //    UA_String_clear(&unit);
+                            //    UA_VariableAttributes_clear(&unitAttr);
+                            //}
                         }
                      }
                      

@@ -41,11 +41,13 @@
  #include <nlohmann/json.hpp>
 #include "UserProfile.h"
 #include "RedisClient.h"
+#include "alarm_enums.h"
 
 using namespace std;
 
 // Global MQTT handler instance
 MQTTHandler *g_mqttHandler = nullptr;
+std::shared_ptr<AsyncPublisher> g_asyncPublisher = nullptr;
 
 //Global SqliteQueueService instance
 SqliteQueueService *g_sqliteService = nullptr;
@@ -377,6 +379,9 @@ runClient(bool isService, int argc, char *argv[]) {
         // Extract Authorization
         std::string authUsername = config["Authorization"]["Username"].get<std::string>();
         std::string authPassword = config["Authorization"]["Password"].get<std::string>();
+
+        //Extract NodeID
+        std::string NodeID = config["ConfigurationSettings"]["NodeID"].get<std::string>();
     
         // Extract Payload
         std::string dbPath = config["Payload"]["OfflineQueueOptions"]["DbPath"].get<std::string>();
@@ -394,6 +399,11 @@ runClient(bool isService, int argc, char *argv[]) {
         std::string uniquePrefix = "OPCUA_SERVER:"; 
         log("Initializing Redis Client with prefix: " + uniquePrefix, LogLevel::INFO);
         g_redisClient.init(redisHost, redisPort, redisPassword, redisDb, uniquePrefix);
+        if (!g_redisClient.connect()) {
+            log("Failed to connect to Redis at startup. Cache will be disabled.", LogLevel::WARNING);
+        } else {
+            log("Successfully connected to Redis.", LogLevel::INFO);
+        }
 
 
 
@@ -479,40 +489,76 @@ runClient(bool isService, int argc, char *argv[]) {
         try {
             log("Attempt " + std::to_string(attempt) + " - Fetching server hierarchy...", LogLevel::INFO);
 
+            // 1. Try Redis First
+            std::string redisKey = "OPCUA_HIERARCHY_" + NodeID;
+            bool cacheHit = false;
 
-            std::string target = "/api/GetOpcUaHierarchy";
-            // JSON body
-            std::string json_body = R"(
-            {
-           
-                "orgId": 0,
-                "roleId": "",
-                "userId": 0,
-                "moduleId": 0,
-                "userType": "",
-                "requestDateTime": "2024-12-26T08:16:05.629Z",
-                "ipAddress": "",
-                "originName": "",
-                "filterModel": {
-                    
-                    "customValue": "all"
-                },
-        
-                "data": {
-                    "nodeId": "ND02"
+            if (g_redisClient.isConnected()) {
+                log("Redis is CONNECTED. Checking key: " + redisKey, LogLevel::INFO);
+                auto fromCache = g_redisClient.get(redisKey);
+                
+                if (fromCache.has_value()) {
+                    log("Cache Hit! Loading hierarchy for " + NodeID + " from Redis.",
+                        LogLevel::INFO);
+                    try {
+                        json cachedJson = json::parse(fromCache.value());
+                        serverList = ParseServerHierarchyFromJson(cachedJson);
+                        if (!serverList.empty()) {
+                            hierarchySuccess = true;
+                            cacheHit = true;
+                            log("Hierarchy loaded from Redis successfully.", LogLevel::INFO);
+                        } else {
+                            log("Redis data invalid or empty. Falling back to API.", LogLevel::WARNING);
+                        }
+                    } catch (const std::exception& e) {
+                       log("Error parsing Redis data: " + std::string(e.what()) + ". Falling back to API.", LogLevel::ERRORS); 
+                    }
+                } else {
+                    log("Cache Miss " + redisKey + ". Fetching from API...", LogLevel::INFO);
                 }
             }
-            )";
-            
-            
-            serverList = ParseServerHierarchy(applicationEndURLHost, std::to_string(applicationEndURLPort), BearerToken, json_body, target);
-            
-            if (!serverList.empty()) {
-                hierarchySuccess = true;
-                log("Server hierarchy fetched successfully! Found " + std::to_string(serverList.size()) + " servers.", LogLevel::INFO);
-            } else {
-                log("Empty server hierarchy response - retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::ERRORS);
+
+            // 2. Fallback to API if Cache Miss or Parse Failure 
+            if (!cacheHit) {
+                std::string target = "/api/GetOpcUaHierarchy";
+                // JSON body
+                json jBody;
+                jBody["orgId"] = 0;
+                jBody["roleId"] = "";
+                jBody["userId"] = 0;
+                jBody["moduleId"] = 0;
+                jBody["userType"] = "";
+                jBody["requestDateTime"] = "2024-12-26T08:16:05.629Z"; // Keep hardcoded for now or use dynamic
+                jBody["ipAddress"] = "";
+                jBody["originName"] = "";
+                jBody["filterModel"]["customValue"] = NodeID;
+
+                std::string json_body = jBody.dump();
+                
+                // Call getResponse directly to get the raw JSON for caching
+                auto futureResponse = std::async(std::launch::async, getResponse, 
+                                                applicationEndURLHost, std::to_string(applicationEndURLPort), 
+                                                BearerToken, json_body, target);
+                
+                json apiResponse = futureResponse.get();
+
+                // Cache the fresh response
+                if (!apiResponse.is_null()) {
+                     g_redisClient.setCompressed(redisKey, apiResponse.dump(), 0);
+                     log("Cached fresh hierarchy to Redis key: " + redisKey, LogLevel::INFO);
+                }
+
+                // Parse
+                serverList = ParseServerHierarchyFromJson(apiResponse);
+                
+                if (!serverList.empty()) {
+                    hierarchySuccess = true;
+                    log("Server hierarchy fetched from API successfully! Found " + std::to_string(serverList.size()) + " servers.", LogLevel::INFO);
+                } else {
+                    log("Empty server hierarchy response - retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::ERRORS);
+                }
             }
+
         } catch (const std::exception& e) {
             log("Hierarchy fetch failed: " + std::string(e.what()), LogLevel::ERRORS);
         }
@@ -540,10 +586,10 @@ runClient(bool isService, int argc, char *argv[]) {
     
     // The Mapping variable is already populated by ParseServerHierarchy in fetchAPI.cpp
     // Let's log the populated mapping for debugging
-    log("Mapping populated with " + std::to_string(Mapping.size()) + " entries:");
-    for (const auto& entry : Mapping) {
-        log("TagId " + std::to_string(entry.first) + " -> " + entry.second.first + " @ " + entry.second.second);
-    }
+    //log("Mapping populated with " + std::to_string(Mapping.size()) + " entries:");
+    //for (const auto& entry : Mapping) {
+    //    log("TagId " + std::to_string(entry.first) + " -> " + entry.second.first + " @ " + entry.second.second);
+    //}
 
     // Initialize SqliteQueueService
     try {
@@ -559,6 +605,17 @@ runClient(bool isService, int argc, char *argv[]) {
         g_sqliteService->SetApiUrl("http://164.52.221.177:5128/api/UploadBulkTagData");   // required
         string BearerToken2 = getBearerTokenNow(applicationEndURLHost, std::to_string(applicationEndURLPort), authUsername, authPassword, true).get();
         g_sqliteService->SetApiAuth(BearerToken2);  
+
+        // Set callback for token refresh on 401
+        g_sqliteService->SetTokenRefreshCallback([=]() -> std::string {
+            try {
+                log("[Callback] Refreshing bearer token...", LogLevel::INFO);
+                return getBearerTokenNow(applicationEndURLHost, std::to_string(applicationEndURLPort), authUsername, authPassword, true).get();
+            } catch (const std::exception& e) {
+                 log("[Callback] Token refresh failed: " + std::string(e.what()), LogLevel::ERRORS);
+                 return "";
+            }
+        });
 
         nlohmann::json apiMetadata;
         apiMetadata["OrgId"] = 1;
@@ -581,9 +638,19 @@ runClient(bool isService, int argc, char *argv[]) {
     // Initialize global MQTT handler OUTSIDE the try block to ensure proper scope
     log("Creating MQTT handler...", LogLevel::INFO);
     boost::asio::io_context ioc;
+    boost::asio::ssl::context ssl_ctx{boost::asio::ssl::context::tlsv12};
+    
+    // Optional: Configure SSL context for certificate verification
+    // ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer);
+    // ssl_ctx.load_verify_file("ca-cert.pem");
+    
     try {
-        g_mqttHandler = new MQTTHandler(ioc);
+        g_mqttHandler = new MQTTHandler(ioc, ssl_ctx);
         log("MQTT handler initialized successfully", LogLevel::INFO);
+        
+        // Initialize Async Publisher
+        g_asyncPublisher = std::make_shared<AsyncPublisher>(g_mqttHandler);
+        log("AsyncPublisher initialized.", LogLevel::INFO);
         
         // Connect MQTTHandler with SqliteQueueService for proper state management
         if (g_sqliteService) {
@@ -655,15 +722,16 @@ runClient(bool isService, int argc, char *argv[]) {
                         p.name = ""; // We don't have the name in the JSON
                         p.tagId = data.value("TagId", 0);
                         p.tagType = data.value("TagType", "INFO_DCR");
-                        p.source = std::to_string(data.value("Source", 4));
+                        p.source = data.value("Source", static_cast<int>(AlarmSource::AEEngine));
                         p.infoId = data.value("InfoId", 1001);
-                        p.value = data.value("Value", "");
+                        p.value = data["Value"];
                         p.timeStamp = data.value("TimeStamp", "");
-                        p.quality = data.value("Quality", "0");
+                        p.quality = data.value("Quality", static_cast<int>(AlarmQuality::Good));
+                        p.UpdateType = data.value("UpdateType", static_cast<int>(UpdateType::Telemetry));
                         
                         // Improved orgId lookup with proper fallback
                         long orgId = 1; // default fallback
-                        if (p.datapointId > 0) {
+                        if (p.datapointId > 0) { 
                             auto it = dpToOrg.find(p.datapointId);
                             if (it != dpToOrg.end()) {
                                 orgId = it->second;
@@ -693,6 +761,17 @@ runClient(bool isService, int argc, char *argv[]) {
         g_mqttHandler->setOnDisconnectCallback(onMqttDisconnect);
         g_mqttHandler->setOnFailedMessageCallback(onFailedMessages);
 
+        // ... existing code ...
+
+        // Fix other errors reported by user (lines ~1198, ~1204, ~1264)
+        // Need to locate where UpdateType::TELEMETRY etc. are used and fix typos/scope.
+        // Assuming context is inside a loop processing messages or similar.
+        // The error log indicates specific lines. I will replace the whole block around these lines if possible or target them.
+        
+        // Wait, I am replacing lines 714-750 first block.
+        // And then I will do another replacement for lines ~1198.
+
+
     } catch (const std::exception& e) {
         log("FATAL: Failed to initialize MQTT handler: " + std::string(e.what()), LogLevel::ERRORS);
         return EXIT_FAILURE;
@@ -720,45 +799,71 @@ runClient(bool isService, int argc, char *argv[]) {
 
 
 
-    log("endpoints: ");
+    std::vector<std::string> topicsToSubscribe;
+    //log("Collecting topics to subscribe...", LogLevel::INFO);
+    
     for(const auto &server : serverList) {
-        log(server.name + " ", LogLevel::DEBUG);
-        cout << (endl);
+        //log(server.name + " ", LogLevel::DEBUG);
+        //cout << (endl);
 
         // Print tags if they exist
         for(const auto &group : server.groups) {
             for(const auto &tag : group.tags) {
-                if(tag.name) {
-                    log(*tag.name + " ", LogLevel::DEBUG);
-                }
-                cout << endl;
+                //if(tag.name) {
+                //    //log(*tag.name + " ", LogLevel::DEBUG);
+                //}
+                //cout << endl;
 
                 if(tag.rdWtOpt == "RD_WRT_RO") {
-                    log("ReadOnly");
+                    //log("ReadOnly");
                 } else if(tag.rdWtOpt == "RD_WRT_RW") {
                     if(tag.mappedInfospaceTags) {
                         for(const auto &infoSpace : *tag.mappedInfospaceTags) {
-                            log(infoSpace.namespaces);
-
-                            if(g_mqttHandler->isConnected()) {
-                                g_mqttHandler->subscribe(infoSpace.namespaces);
-                                log("Subscribing to topic: " + infoSpace.namespaces,
-                                    LogLevel::DEBUG);
-                            } else {
-                                log("MQTT handler is not connected", LogLevel::DEBUG);
-                            }
-
+                            //log(infoSpace.namespaces);
+                            topicsToSubscribe.push_back(infoSpace.namespaces);
                             // cout << infoSpace.namespaces << " subscribed; ";
-                            cout << endl;
-                            // Add a small delay between subscriptions
-                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                            //cout << endl;
                         }
                     }
                 }
             }
         }
     }
-    cout << endl;
+    //cout << endl;
+
+    if (!topicsToSubscribe.empty()) {
+        log("Waiting for MQTT connection before subscribing...", LogLevel::INFO);
+        // Wait up to 10 seconds for connection
+        int retries = 0;
+        while (!g_mqttHandler->isConnected() && retries < 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            retries++;
+        }
+
+        if (g_mqttHandler->isConnected()) {
+            size_t total = topicsToSubscribe.size();
+            size_t batchSize = 500;
+            log("Starting batch subscription for " + std::to_string(total) + " topics...", LogLevel::INFO);
+            
+            for (size_t i = 0; i < total; i += batchSize) {
+                size_t end = std::min(i + batchSize, total);
+                std::vector<std::string> batch(topicsToSubscribe.begin() + i, topicsToSubscribe.begin() + end);
+                
+                log("Subscribing to batch " + std::to_string(i/batchSize + 1) + 
+                    " (" + std::to_string(batch.size()) + " topics)...", LogLevel::INFO);
+                
+                g_mqttHandler->subscribeBatch(batch);
+                
+                // Small delay between batches to avoid overwhelming the broker
+                std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
+            }
+            log("All batch subscriptions initiated.", LogLevel::INFO);
+        } else {
+            log("Failed to connect to MQTT broker after waiting. Subscriptions skipped.", LogLevel::ERRORS);
+        }
+    } else {
+        log("No topics found to subscribe.", LogLevel::INFO);
+    }
 
     // *** FIX START ***
     // Add this block BEFORE the main "for" loop
@@ -893,10 +998,17 @@ runClient(bool isService, int argc, char *argv[]) {
             if(server.authType == "AUTH_STG_ANYMS" || server.authType == "AUTH_STG_ANYMS") {
                 return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
             } else if(server.authType == "AUTH_STG_AUTH") {
+                std::string user = server.username;
+                std::string pass = server.password;
+
+                // Fallback to global credentials if server-specific ones are missing
+                if(user.empty()) user = APIusername;
+                if(pass.empty()) pass = APIpassword;
+
                 return UA_Client_connectUsername(ctx->client.get(),
                                                  server.endpointUrl.c_str(),
-                                                 APIusername.c_str(),
-                    APIpassword.c_str());
+                                                 user.c_str(),
+                                                 pass.c_str());
             }
             else if(server.authType == "AUTH_STG_CERT") {
                 return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
@@ -1007,11 +1119,15 @@ runClient(bool isService, int argc, char *argv[]) {
             // group subscriptions 
             for(const auto &group : server.groups) {
                 UA_CreateSubscriptionRequest greq = UA_CreateSubscriptionRequest_default();
-                greq.requestedMaxKeepAliveCount = group.maxKeepAliveCount;
+                //greq.requestedMaxKeepAliveCount = group.maxKeepAliveCount;
+                greq.requestedMaxKeepAliveCount = 40;
                 greq.requestedPublishingInterval = group.publishingInterval;
-                greq.requestedLifetimeCount = group.lifetimeCount;
+                //greq.requestedPublishingInterval = 50;
+                //greq.requestedLifetimeCount = group.lifetimeCount;
+                greq.requestedLifetimeCount = 120;
                 greq.priority = group.priority;
                 greq.maxNotificationsPerPublish = group.maxNotificationsPerPublish;
+                //greq.maxNotificationsPerPublish = 0;
 
                 UA_CreateSubscriptionResponse gsub =
                     UA_Client_Subscriptions_create(ctx->client.get(), greq, nullptr, nullptr, nullptr);
@@ -1030,7 +1146,7 @@ runClient(bool isService, int argc, char *argv[]) {
                         std::lock_guard<std::mutex> lock(ctx->taskMutex);
                         ctx->taskQueue.push([ctx, infoSpace, groupName, NamespaceURI]() {
                             MyMonitorContext *myContext = new MyMonitorContext{
-                                infoSpace, g_mqttHandler, g_sqliteService};
+                                infoSpace, g_mqttHandler, g_sqliteService, nullptr, g_asyncPublisher};
 
                             // Create a scheduler lambda using the current context
                             TaskScheduler scheduler = [ctx](std::function<void()> task) {
@@ -1061,7 +1177,7 @@ runClient(bool isService, int argc, char *argv[]) {
     log("Client pool initialized. Press Ctrl+C to stop...");
 
     g_mqttHandler->setCallback([&clientPool](const std::string &topic, const std::string &payload) {
-        log("Received MQTT message on topic: " + topic, LogLevel::DEBUG);
+        //log("Received MQTT message on topic: " + topic, LogLevel::DEBUG);
 
         // Parse and validate JSON payload
         json json_payload;
@@ -1089,7 +1205,7 @@ runClient(bool isService, int argc, char *argv[]) {
         int tagId = data["TagId"].get<int>();
         int updateType = data["UpdateType"].get<int>();
         
-        log("Processing TagId: " + std::to_string(tagId) + ", UpdateType: " + std::to_string(updateType), LogLevel::DEBUG);
+        //log("Processing TagId: " + std::to_string(tagId) + ", UpdateType: " + std::to_string(updateType), LogLevel::DEBUG);
 
         // Find client context for this tag
         if (Mapping.find(tagId) == Mapping.end()) {
@@ -1106,13 +1222,13 @@ runClient(bool isService, int argc, char *argv[]) {
 
         auto context = it->second;
 
-        if(updateType == UpdateType::TELEMETERY) {
+        if(updateType == static_cast<int>(UpdateType::Telemetry)) {
             // std::lock_guard<std::mutex> lock(context->taskMutex);
             // context->taskQueue.push([context, tagId]() {
             //     MonitorItem(context->client.get(), context->subscription,
             //                 Mapping[tagId].first.c_str(), tagId);
             // });
-        } else if(updateType == UpdateType::COMMAND) {
+        } else if(updateType == static_cast<int>(UpdateType::Control)) {
                 // Extract NodeId from mapping
                 std::string nodeIdStr = Mapping[tagId].first;
                 size_t lastSlash = nodeIdStr.find_last_of('/');
@@ -1172,7 +1288,7 @@ runClient(bool isService, int argc, char *argv[]) {
                     }
                 });
             }
-         else if(updateType == UpdateType::BULKDATA) {
+         else if(updateType == static_cast<int>(UpdateType::BulkData)) {
             log("BULKDATA update received", LogLevel::DEBUG);
         } else {
             log("Unknown UpdateType: " + std::to_string(updateType), LogLevel::ERRORS);

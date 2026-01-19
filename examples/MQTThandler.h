@@ -1,42 +1,46 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
 #include <unordered_map>
-#include <chrono>
 
 // Required Boost & MQTT headers
 #include <async_mqtt/all.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/ssl.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <async_mqtt/asio_bind/predefined_layer/mqtts.hpp>
 
-enum UpdateType { TELEMETERY = 1, COMMAND = 2, BULKDATA = 3 };
 // Forward declare the client type to keep this header clean
+// Changed from mqtt to mqtts for TLS/SSL support
 using client_t =
-    async_mqtt::client<async_mqtt::protocol_version::v5, async_mqtt::protocol::mqtt>;
+    async_mqtt::client<async_mqtt::protocol_version::v5, async_mqtt::protocol::mqtts>;
 
 // Structure to track pending messages
 struct PendingMessage {
     std::string topic;
     std::string payload;
     std::chrono::steady_clock::time_point timestamp;
-    
-    PendingMessage(const std::string& t, const std::string& p) 
+
+    PendingMessage(const std::string &t, const std::string &p)
         : topic(t), payload(p), timestamp(std::chrono::steady_clock::now()) {}
 };
 
 class MQTTHandler {
   public:
-    MQTTHandler(boost::asio::io_context &ioc);
+    MQTTHandler(boost::asio::io_context &ioc, boost::asio::ssl::context &ssl_ctx);
     ~MQTTHandler();
-    
+
     // Set reference to SqliteQueueService for notifications
-    void setSqliteService(class SqliteQueueService* service);
+    void
+    setSqliteService(class SqliteQueueService *service);
 
     // --- Public API ---
     bool
@@ -49,6 +53,8 @@ class MQTTHandler {
     bool
     subscribe(const std::string &topic);
     bool
+    subscribeBatch(const std::vector<std::string> &topics);
+    bool
     isConnected() const;
 
     // --- Callbacks ---
@@ -59,7 +65,8 @@ class MQTTHandler {
     void
     setOnDisconnectCallback(std::function<void()> cb);
     void
-    setOnFailedMessageCallback(std::function<void(const std::vector<PendingMessage>&)> cb);
+    setOnFailedMessageCallback(
+        std::function<void(const std::vector<PendingMessage> &)> cb);
 
   private:
     // --- Internal Methods ---
@@ -78,26 +85,29 @@ class MQTTHandler {
 
     // --- Member Variables ---
     boost::asio::io_context &m_ioc;
+    boost::asio::ssl::context &m_ssl_ctx;
     std::unique_ptr<client_t> m_client;
     std::thread m_mqtt_thread;
     std::atomic<bool> m_running;
 
     // State Management
     mutable std::mutex m_mutex;  // Protects m_connected, callbacks, and connection params
-    bool m_connected;
+    std::atomic<bool> m_connected{false};
     std::atomic<bool> m_is_connecting{false};  // Prevents concurrent connect attempts
 
-    using packet_id_t = async_mqtt::packet_id_type;  // adjust if the library exposes a typedef
+    using packet_id_t =
+        async_mqtt::packet_id_type;  // adjust if the library exposes a typedef
     std::unordered_map<packet_id_t, PendingMessage> m_pending_messages;
 
     uint16_t m_next_message_id{1};
-    std::chrono::seconds m_message_timeout{10}; // Messages older than this are considered failed
+    std::chrono::seconds m_message_timeout{
+        10};  // Messages older than this are considered failed
 
     // Callbacks
     std::function<void(const std::string &, const std::string &)> m_message_callback;
     std::function<void()> m_connect_callback;
     std::function<void()> m_disconnect_callback;
-    std::function<void(const std::vector<PendingMessage>&)> m_failed_message_callback;
+    std::function<void(const std::vector<PendingMessage> &)> m_failed_message_callback;
 
     // Connection Parameters (for reconnect)
     std::string m_broker;
@@ -108,7 +118,7 @@ class MQTTHandler {
     // Asio Timer for Reconnection (replaces the manual thread)
     boost::asio::steady_timer m_reconnect_timer;
     std::chrono::seconds m_reconnect_interval{5};
-    
+
     // Forward declaration for SqliteQueueService
-    class SqliteQueueService* sqliteService_;
+    class SqliteQueueService *sqliteService_;
 };

@@ -1614,18 +1614,75 @@ void start_mqtt_client(UA_Server *server) {
 
                                     if(!isAlarmEvent) {
                                         /* Regular data update path (Generic Telemetry) */
-                                        // Check if topic exists in nodeMap (optimization to avoid parsing irrelevant topics)
-                                        bool isKnownTopic = false;
-                                        {
-                                            std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
-                                            if(nodeMap.find(topic) != nodeMap.end()) isKnownTopic = true;
-                                        }
+                                        try {
+                                            // Parse the incoming MQTT payload
+                                            auto j = json::parse(payload);
 
-                                        if(isKnownTopic) {
-                                            try {
-                                                auto j = json::parse(payload);
-                                                
-                                                // NodeId Lookup (Optimized: Once per message)
+                                            // 1. Handle the "Data" array format (New Structure)
+                                            if (j.contains("Data") && j["Data"].is_array()) {
+                                                for (auto& entry : j["Data"]) {
+                                                    // Determine the topic/node. Usually, the 'topic' variable from MQTT 
+                                                    // is our key, but if your JSON provides a 'TagId' mapping, 
+                                                    // you might need to look up by ID instead.
+                                                    UA_NodeId nodeId = UA_NODEID_NULL;
+                                                    {
+                                                        std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
+                                                        auto it = nodeMap.find(topic);
+                                                        if(it != nodeMap.end()) nodeId = it->second;
+                                                    }
+
+                                                    if(UA_NodeId_isNull(&nodeId)) continue;
+
+                                                    // Handle the "Value" field which could be Array, Number, or Boolean
+                                                    if (entry.contains("Value")) {
+                                                        auto& valField = entry["Value"];
+
+                                                        if (valField.is_array()) {
+                                                            // CASE: Array of Values (e.g., [1211, 1211, ...])
+                                                            std::vector<double> values;
+                                                            for (auto& v : valField) {
+                                                                if (v.is_number()) values.push_back(v.get<double>());
+                                                            }
+
+                                                            if (!values.empty()) {
+                                                                enqueueServerJob([nodeId, values](UA_Server* server) {
+                                                                    ScopedVariant myVar;
+                                                                    // UA_Variant_setArrayCopy handles allocating the UA array and copying data
+                                                                    UA_Variant_setArrayCopy(myVar.get(), values.data(), values.size(), &UA_TYPES[UA_TYPES_DOUBLE]);
+                                                                    
+                                                                    is_internal_write = true;
+                                                                    UA_Server_writeValue(server, nodeId, myVar.var);
+                                                                    is_internal_write = false;
+                                                                }, ServerJobType::WriteValue);
+                                                            }
+                                                        } 
+                                                        else if (valField.is_number()) {
+                                                            // CASE: Scalar Number
+                                                            double val = valField.get<double>();
+                                                            enqueueServerJob([nodeId, val](UA_Server* server) {
+                                                                ScopedVariant myVar;
+                                                                UA_Variant_setScalarCopy(myVar.get(), &val, &UA_TYPES[UA_TYPES_DOUBLE]);
+                                                                is_internal_write = true;
+                                                                UA_Server_writeValue(server, nodeId, myVar.var);
+                                                                is_internal_write = false;
+                                                            }, ServerJobType::WriteValue);
+                                                        }
+                                                        else if (valField.is_boolean()) {
+                                                            // CASE: Scalar Boolean
+                                                            UA_Boolean val = valField.get<bool>() ? UA_TRUE : UA_FALSE;
+                                                            enqueueServerJob([nodeId, val](UA_Server* server) {
+                                                                ScopedVariant myVar;
+                                                                UA_Variant_setScalarCopy(myVar.get(), &val, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                                                                is_internal_write = true;
+                                                                UA_Server_writeValue(server, nodeId, myVar.var);
+                                                                is_internal_write = false;
+                                                            }, ServerJobType::WriteValue);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // 2. Fallback for the Old/Simple JSON format (Direct Object)
+                                            else {
                                                 UA_NodeId nodeId = UA_NODEID_NULL;
                                                 {
                                                     std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
@@ -1634,57 +1691,33 @@ void start_mqtt_client(UA_Server *server) {
                                                 }
 
                                                 if(!UA_NodeId_isNull(&nodeId)) {
-                                                    
-                                                    // Helper to process writes DRY
-                                                    auto processWrite = [&](const nlohmann::json& parent, const std::string& keyName) {
-                                                        if(!parent.contains(keyName)) return;
-
-                                                        if(parent[keyName].is_number()) {
-                                                            double value = parent[keyName].get<double>();
-                                                            enqueueServerJob([nodeId, value](UA_Server* server) {
+                                                    // Iterate through keys in the root object (e.g., {"Temperature": 22.5})
+                                                    for (auto& [key, value] : j.items()) {
+                                                        if (value.is_number()) {
+                                                            double v = value.get<double>();
+                                                            enqueueServerJob([nodeId, v](UA_Server* server) {
                                                                 ScopedVariant myVar;
-                                                                UA_Variant_setScalarCopy(myVar.get(), &value, &UA_TYPES[UA_TYPES_DOUBLE]);
-                                                                is_internal_write = true;
-                                                                UA_Server_writeValue(server, nodeId, myVar.var);
-                                                                is_internal_write = false;
-                                                            }, ServerJobType::WriteValue);
-                                                        } 
-                                                        else if(parent[keyName].is_boolean()) {
-                                                            UA_Boolean value = parent[keyName].get<bool>() ? UA_TRUE : UA_FALSE;
-                                                            enqueueServerJob([nodeId, value](UA_Server* server) {
-                                                                ScopedVariant myVar;
-                                                                UA_Variant_setScalarCopy(myVar.get(), &value, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                                                                UA_Variant_setScalarCopy(myVar.get(), &v, &UA_TYPES[UA_TYPES_DOUBLE]);
                                                                 is_internal_write = true;
                                                                 UA_Server_writeValue(server, nodeId, myVar.var);
                                                                 is_internal_write = false;
                                                             }, ServerJobType::WriteValue);
                                                         }
-                                                        else if(parent[keyName].is_string()) {
-                                                            std::string sVal = parent[keyName].get<std::string>();
-                                                            enqueueServerJob([nodeId, sVal](UA_Server* server) {
-                                                                UA_String uaS = UA_STRING((char*)sVal.c_str());
+                                                        else if (value.is_boolean()) {
+                                                            UA_Boolean v = value.get<bool>() ? UA_TRUE : UA_FALSE;
+                                                            enqueueServerJob([nodeId, v](UA_Server* server) {
                                                                 ScopedVariant myVar;
-                                                                UA_Variant_setScalarCopy(myVar.get(), &uaS, &UA_TYPES[UA_TYPES_STRING]);
+                                                                UA_Variant_setScalarCopy(myVar.get(), &v, &UA_TYPES[UA_TYPES_BOOLEAN]);
                                                                 is_internal_write = true;
                                                                 UA_Server_writeValue(server, nodeId, myVar.var);
                                                                 is_internal_write = false;
                                                             }, ServerJobType::WriteValue);
                                                         }
-                                                    };
-
-                                                    // Logic 1: Complex "Data" Array
-                                                    if(j.contains("Data") && j["Data"].is_array() && !j["Data"].empty()) {
-                                                        processWrite(j["Data"][0], "Value");
-                                                    }
-                                                    // Logic 2: Simple "Value" (Fallback)
-                                                    else if(j.contains("Value")) {
-                                                        processWrite(j, "Value");
                                                     }
                                                 }
-
-                                            } catch(const std::exception &e) {
-                                                log("JSON parse error: " + std::string(e.what()), LogLevel::ERRORS);
                                             }
+                                        } catch (const std::exception& e) {
+                                            log("Generic Telemetry Parser Error: " + std::string(e.what()), LogLevel::ERRORS);
                                         }
                                     }
                                 },
@@ -1952,8 +1985,12 @@ int RunServer(int argc, char **argv) {
     log("Loaded " + std::to_string(issuerListSize) + " issuer certificate(s)",
         LogLevel::INFO);
 
-    size_t revocationListSize = 0;
     UA_ByteString *revocationList = NULL;
+    size_t revocationListSize = loadCertsFromDirectory("server/issuers/crl", &revocationList);
+    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SERVER, "Loaded %zu revocation certificate(s).",
+                revocationListSize);
+    log("Loaded " + std::to_string(revocationListSize) + " revocation certificate(s)",
+        LogLevel::INFO);
 
     UA_Server *server = UA_Server_new();
     UA_ServerConfig *config = UA_Server_getConfig(server);
@@ -1984,9 +2021,9 @@ int RunServer(int argc, char **argv) {
 
     std::string json_body = std::format(R"(
     {{
-        "data": {{ "nodeId": "{}" }}
+        "data": {{ "nodeId": "ND01" }}
     }}
-    )", NodeID);
+    )");
 
     std::string target = "/api/GetOpcUaServersWithOrgMappings";
 
@@ -2198,17 +2235,18 @@ int RunServer(int argc, char **argv) {
     //config->maxSubscriptionsPerSession = 50;
     //config->maxMonitoredItemsPerSubscription = 1000;
     config->maxMonitoredItems = 0;   // Global limit to prevent TimerTree explosion
-    config->queueSizeLimits.max = 200;  // Global limit for MonitoredItems
+    config->queueSizeLimits.max = 100;  // Global limit for MonitoredItems
     //config->maxSubscriptions = 200;      // Global limit for subscriptions
     config->publishingIntervalLimits.min = 50.0; // Enforce min 100ms publishing interval
-    config->samplingIntervalLimits.min = 500.0;   // Throttle sampling to max 5Hz to prevent notification flood
-    config->publishingIntervalLimits.max = 3600.0 * 1000.0;
+    config->samplingIntervalLimits.min = 0.0;   // Throttle sampling to max 5Hz to prevent notification flood
+    config->publishingIntervalLimits.max = 10000.0;
+    //config->publishingIntervalLimits.max = 3600.0 * 1000.0;
     config->enableRetransmissionQueue = true;  // Enable retransmission queue
     config->maxRetransmissionQueueSize = 100;         // Standard: Unlimited (was 1/10 for debugging)
-    config->maxNotificationsPerPublish = 1000;      // Limit per PublishResponse
+    config->maxNotificationsPerPublish = 20000;      // Limit per PublishResponse
 
     config->keepAliveCountLimits.min = 3;  // Prune dead subscriptions faster
-    config->keepAliveCountLimits.max = 5;
+    config->keepAliveCountLimits.max = 1200;
    
     // Allow the server to send larger packets (1 MB chunks, 10 MB total message)
     config->tcpBufSize = 16 * 1024 * 1024;     // 16 MB TCP Buffer (Excellent)
@@ -2435,6 +2473,11 @@ int RunServer(int argc, char **argv) {
         for(size_t i = 0; i < issuerListSize; i++)
             UA_ByteString_clear(&issuerList[i]);
         UA_free(issuerList);
+    }
+    if(revocationList) {
+        for(size_t i = 0; i < revocationListSize; i++)
+            UA_ByteString_clear(&revocationList[i]);
+        UA_free(revocationList);
     }
     // Clean up method callback contexts
     // Note: In a production environment, you might want to keep track of all allocated

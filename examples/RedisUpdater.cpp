@@ -135,22 +135,24 @@ void updateOrgData(int orgId, const std::string& token) {
     }
 }
 
-// Main Flow: Login -> Profile -> Org Data
-void updateAllForUser(const std::string& username, const std::string& password) {
-    try {
-        // 1. Authenticate
-        std::cout << "\n[1/3] Authenticating as '" << username << "'...\n";
-        std::string encryptedPass = GetEncryptedString("", password, 0);
-        json authResponse = getBearerToken(API_HOST, API_PORT, username, encryptedPass);
-        
-        if (!authResponse.contains("access_token")) {
-            throw std::runtime_error("Authentication failed. Response: " + authResponse.dump());
-        }
-        std::string token = authResponse["access_token"].get<std::string>();
-        std::cout << "✓ Authenticated.\n";
+// Helper to get Token only
+std::string loginUser(const std::string& username, const std::string& password) {
+    std::cout << "\n   [Auth] Authenticating as '" << username << "'...\n";
+    std::string encryptedPass = GetEncryptedString("", password, 0);
+    json authResponse = getBearerToken(API_HOST, API_PORT, username, encryptedPass);
+    
+    if (authResponse.contains("access_token")) {
+        std::cout << "   [Auth] Success.\n";
+        return authResponse["access_token"].get<std::string>();
+    }
+    throw std::runtime_error("Authentication failed. Response: " + authResponse.dump());
+}
 
-        // 2. Fetch & Cache User Profile
-        std::cout << "\n[2/3] Fetching User Profile...\n";
+// Fetch Profile and Update Org (Assuming Token is valid)
+void updateUserProfileAndOrg(const std::string& username, const std::string& token) {
+     try {
+        // 1. Fetch & Cache User Profile
+        std::cout << "\n[1/2] Fetching User Profile...\n";
         auto profileResponse = getResponse(API_HOST, API_PORT, token, "{}", "/api/GetUserProfile");
         
         // Cache Profile
@@ -158,10 +160,9 @@ void updateAllForUser(const std::string& username, const std::string& password) 
         g_redisClient.setCompressed(profileKey, profileResponse.dump(), 0);
         std::cout << "✓ Cached User Profile to Redis (Key: " << profileKey << ")\n";
 
-        // 3. Extract Org ID and Fetch Org Data
+        // 2. Extract Org ID and Fetch Org Data
         std::string currentOrgIdStr;
         
-        // Logic matched to fetchAPI.cpp ParseUserProfileFromJson
         if (profileResponse.contains("data") && profileResponse["data"].is_array() && !profileResponse["data"].empty()) {
             auto& item = profileResponse["data"][0];
             if (item.contains("currentOrgId")) {
@@ -175,16 +176,21 @@ void updateAllForUser(const std::string& username, const std::string& password) 
         
         if (!currentOrgIdStr.empty()) {
             int orgId = std::stoi(currentOrgIdStr);
-            std::cout << "\n[3/3] Identified Organization ID: " << orgId << ". Fetching Org Data...\n";
+            std::cout << "\n[2/2] Identified Organization ID: " << orgId << ". Fetching Org Data...\n";
             updateOrgData(orgId, token);
             std::cout << "\n✓ Success! All data cached for user '" << username << "'.\n";
         } else {
             std::cout << "\n[Warning] 'currentOrgId' not found in profile 'data[0]'. Skipping Org Data fetch.\n";
         }
-
     } catch (const std::exception& e) {
         std::cerr << "❌ Error: " << e.what() << "\n";
     }
+}
+
+// Kept for backward compatibility with CLI arg usage
+void updateAllForUser(const std::string& username, const std::string& password) {
+    std::string token = loginUser(username, password);
+    updateUserProfileAndOrg(username, token);
 }
 
 // Helper to get Admin Token
@@ -201,6 +207,33 @@ std::string getAdminToken() {
 // Main
 // ----------------------------------------------------------------------------
 
+// Helper to update Hierarchy Data
+void updateHierarchy(int orgId, const std::string& nodeId, const std::string& token) {
+    std::cout << "\n   [API] Fetching Hierarchy for NodeID " << nodeId << " (Org " << orgId << ")...\n";
+    
+    try {
+        json body;
+        body["orgId"] = 0; 
+        body["roleId"] = ""; 
+        body["userId"] = 0;
+        body["moduleId"] = 0;
+        body["userType"] = "";
+        body["requestDateTime"] = "2024-12-26T08:16:05.629Z";
+        body["ipAddress"] = "";
+        body["originName"] = "";
+        body["filterModel"]["customValue"] = nodeId;
+        
+        // Use /api/GetOpcUaHierarchy
+        auto response = getResponse(API_HOST, API_PORT, token, body.dump(), "/api/GetOpcUaHierarchy");
+        
+        std::string key = "OPCUA_HIERARCHY_" + nodeId;
+        g_redisClient.setCompressed(key, response.dump(), 0);
+        std::cout << "   [Redis] Set " << key << " (Size: " << response.dump().size() << ")\n";
+    } catch (const std::exception& e) {
+        std::cerr << "   [Error] GetOpcUaHierarchy Failed: " << e.what() << "\n";
+    }
+}
+
 int main(int argc, char* argv[]) {
     setupLogging();
     
@@ -212,72 +245,114 @@ int main(int argc, char* argv[]) {
     g_redisClient.init(REDIS_HOST, REDIS_PORT, REDIS_PASS, REDIS_DB, REDIS_PREFIX);
     if (!g_redisClient.connect()) {
         std::cerr << "Failed to connect to Redis server.\n";
-        // Continue? The API calls don't strictly need Redis connected to succeed, but caching will fail.
-        // We will return 1.
         return 1;
     }
 
-    std::string command = "login"; // Default to interactive login
-    if (argc > 1) command = argv[1];
-
-    try {
-        if (command == "login" || command == "update_user") {
-            std::string username;
-            std::string password;
-
-            // 1. Get Username
-            if (argc >= 3) {
-                username = argv[2];
-            } else {
-                std::cout << "Enter Username: ";
-                std::getline(std::cin, username);
+    // CLI Arguments Handling
+    if (argc > 1) {
+        std::string command = argv[1];
+        try {
+            if (command == "login" || command == "update_user") {
+                if (argc < 4) { std::cerr << "Usage: update_user <user> <pass>\n"; return 1; }
+                updateAllForUser(argv[2], argv[3]);
             }
-
-            // 2. Get Password
-            if (argc >= 4) {
-                password = argv[3];
-            } else {
-                std::cout << "Enter Password: ";
-                std::getline(std::cin, password);
+            else if (command == "update_org") {
+                if (argc < 3) { std::cerr << "Usage: update_org <orgId>\n"; return 1; }
+                updateOrgData(std::stoi(argv[2]), getAdminToken());
             }
-
-            if (username.empty() || password.empty()) {
-                std::cerr << "Username and password are required.\n";
-                return 1;
+            else if (command == "update_hierarchy") {
+                if (argc < 4) { std::cerr << "Usage: update_hierarchy <orgId> <nodeId>\n"; return 1; }
+                updateHierarchy(std::stoi(argv[2]), argv[3], getAdminToken());
             }
-
-            updateAllForUser(username, password);
-        }
-        else if (command == "update_org") {
-            if (argc < 3) {
-                std::cerr << "Usage: update_org <orgId>\n";
-                return 1;
+            else if (command == "set") {
+                if (argc < 4) return 1;
+                g_redisClient.set(argv[2], argv[3], 0);
             }
-            int orgId = std::stoi(argv[2]);
-            std::string token = getAdminToken(); 
-            updateOrgData(orgId, token);
-        }
-        else if (command == "set") {
-             if (argc < 4) return 1;
-             g_redisClient.set(argv[2], argv[3], 0);
-             std::cout << "OK\n";
-        }
-        else if (command == "setfile") {
-             if (argc < 4) return 1;
-             std::ifstream t(argv[3]);
-             std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
-             g_redisClient.set(argv[2], str, 0);
-             std::cout << "OK\n";
-        } 
-        else {
-            printUsage(argv[0]);
+            else if (command == "setfile") {
+                if (argc < 4) return 1;
+                std::ifstream t(argv[3]);
+                std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
+                g_redisClient.set(argv[2], str, 0);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "CLI Error: " << e.what() << "\n";
             return 1;
         }
-
-    } catch (const std::exception& e) {
-        std::cerr << "Exception: " << e.what() << "\n";
-        return 1;
+        return 0;
     }
 
+    // Interactive Mode (Linear Flow)
+    std::string sessionUser;
+    std::string sessionPass;
+    std::string sessionNodeID;
+
+    std::cout << "\n=== RedisUpdater: Update All Cache ===\n";
+    
+    // 1. Get Username
+    std::cout << "1) Enter Username: ";
+    std::getline(std::cin, sessionUser);
+    if (sessionUser.empty()) return 0;
+
+    // 2. Get Password
+    std::cout << "2) Enter Password: ";
+    std::getline(std::cin, sessionPass);
+    if (sessionPass.empty()) return 0;
+
+    // 3. Get Node ID
+    std::cout << "3) Enter Node ID: ";
+    std::getline(std::cin, sessionNodeID);
+    if (sessionNodeID.empty()) return 0;
+
+    try {
+        std::cout << "\n--- Starting Update Process ---\n";
+
+        // Step 1: Login
+        std::string token = loginUser(sessionUser, sessionPass);
+
+        // Step 2: Update Profile -> Get Org ID -> Update Org Data
+        // We need to modify updateUserProfileAndOrg or do it manually here to capture the OrgID
+        // Let's refactor inline for clarity since we need the OrgID for Step 3
+        
+        // 2a. Fetch Profile
+        std::cout << "\n[Step 2] Fetching User Profile...\n";
+        auto profileResponse = getResponse(API_HOST, API_PORT, token, "{}", "/api/GetUserProfile");
+        
+        std::string profileKey = "USER_PROFILE_" + sessionUser;
+        g_redisClient.setCompressed(profileKey, profileResponse.dump(), 0);
+        std::cout << "   [Redis] Set " << profileKey << "\n";
+
+        // 2b. Extract Org ID
+        int orgId = 0;
+        if (profileResponse.contains("data") && profileResponse["data"].is_array() && !profileResponse["data"].empty()) {
+            auto& item = profileResponse["data"][0];
+            if (item.contains("currentOrgId")) {
+                if (item["currentOrgId"].is_number()) orgId = item["currentOrgId"].get<int>();
+                else if (item["currentOrgId"].is_string()) orgId = std::stoi(item["currentOrgId"].get<std::string>());
+            }
+        }
+
+        if (orgId == 0) {
+            throw std::runtime_error("Could not determine Organization ID from User Profile.");
+        }
+        std::cout << "   [Info] Identified Organization ID: " << orgId << "\n";
+
+        // Step 3: Update Org Data (Topics, Alarms)
+        std::cout << "\n[Step 3] Fetching Organization Data (Topics & Alarms)...\n";
+        updateOrgData(orgId, token);
+
+        // Step 4: Update Hierarchy
+        std::cout << "\n[Step 4] Fetching Hierarchy Data...\n";
+        updateHierarchy(orgId, sessionNodeID, token);
+
+        std::cout << "\n=== SUCCESS: All data updated in Redis! ===\n";
+
+    } catch (const std::exception& e) {
+        std::cerr << "\n❌ FAIL: " << e.what() << "\n";
+    }
+
+    std::cout << "\nPress Enter to exit...";
+    std::string dummy;
+    std::getline(std::cin, dummy);
+    
     return 0;
 }
