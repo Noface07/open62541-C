@@ -63,7 +63,7 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
     p.datapointId = myContext->infoSpace.tagId;
     p.name = myContext->infoSpace.name;
     p.tagId = myContext->infoSpace.tagId;  // Redundant?
-    p.tagType = myContext->infoSpace.sourceDatatype;
+    p.tagType = myContext->infoSpace.tagType;
     p.source = static_cast<int>(AlarmSource::OPC);           // TODO: parameterize
     p.infoId = 1001;                                         // TODO: parameterize
     p.quality = static_cast<int>(AlarmSource::OPC);          // Good quality by default

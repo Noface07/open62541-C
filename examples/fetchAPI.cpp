@@ -288,8 +288,8 @@ ParseServerHierarchyFromJson(const json &response) {
                                             mappedInfo.rawMax = tagInfo.rawMax;
                                             mappedInfo.scaleMin = tagInfo.scaleMin;
                                             mappedInfo.scaleMax = tagInfo.scaleMax;
-                                            mappedInfo.sourceDatatype =
-                                                tagInfo.sourceDatatype;
+                                            mappedInfo.tagType =
+                                                mappedTag.value("tagType", "");
                                             mappedInfo.enableExpression =
                                                 tagInfo.enableExpression;
                                             mappedInfo.expression = tagInfo.expression;

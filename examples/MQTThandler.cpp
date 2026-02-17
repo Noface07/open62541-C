@@ -17,6 +17,7 @@ namespace am = async_mqtt;
 MQTTHandler::MQTTHandler(boost::asio::io_context &ioc, boost::asio::ssl::context &ssl_ctx)
     : m_ioc(ioc), m_ssl_ctx(ssl_ctx),
       m_client(std::make_unique<client_t>(ioc.get_executor(), ssl_ctx)),
+      wm_client(std::make_unique<client_wt>(ioc.get_executor())),
       m_running(true), m_connected(false), m_reconnect_timer(ioc),
       sqliteService_(nullptr) {
     log("Starting MQTT thread with TLS/SSL support...", LogLevel::DEBUG);
@@ -54,13 +55,14 @@ MQTTHandler::~MQTTHandler() {
 
 bool
 MQTTHandler::connect(const std::string &broker, const std::string &port,
-                     const std::string &username, const std::string &password) {
+                     const std::string &username, const std::string &password , const bool &protocol) {
     // Store connection details for auto-reconnect
     std::lock_guard<std::mutex> lock(m_mutex);
     m_broker = broker;
     m_port = port;
     m_username = username;
     m_password = password;
+    m_protocol = protocol;
 
     // Post the initial connection attempt to the Asio thread
     as::post(m_ioc, [this]() { try_reconnect(); });
@@ -75,58 +77,116 @@ MQTTHandler::try_reconnect() {
 
     log("Attempting to connect to MQTT broker...", LogLevel::INFO);
 
-    as::co_spawn(
-        m_ioc,
-        [this]() -> as::awaitable<void> {
-            try {
-                m_client = std::make_unique<client_t>(m_ioc.get_executor(), m_ssl_ctx);
+    if(m_protocol) {
 
-                // 1. Establish the underlying TCP + TLS connection
-                // For mqtts, this performs both TCP connection and TLS handshaking
-                co_await m_client->async_underlying_handshake(m_broker, m_port,
-                                                              as::use_awaitable);
-                log("TLS/SSL handshake completed successfully.", LogLevel::INFO);
+        as::co_spawn(
+            m_ioc,
+            [this]() -> as::awaitable<void> {
+                try {
+                    m_client =
+                        std::make_unique<client_t>(m_ioc.get_executor(), m_ssl_ctx);
 
-                // 2. DISABLE NAGLE'S ALGORITHM HERE
-                // This is the most critical spot to prevent the 200ms delay.
-                boost::system::error_code ec_nagle;
-                m_client->lowest_layer().set_option(as::ip::tcp::no_delay(true),
-                                                    ec_nagle);
-                if(!ec_nagle) {
-                    log("TCP_NODELAY enabled: Socket optimized for real-time "
-                        "performance.",
-                        LogLevel::INFO);
-                } else {
-                    log("Warning: Could not set TCP_NODELAY: " + ec_nagle.message(),
-                        LogLevel::WARNING);
-                }
+                    // 1. Establish the underlying TCP + TLS connection
+                    // For mqtts, this performs both TCP connection and TLS handshaking
+                    co_await m_client->async_underlying_handshake(m_broker, m_port,
+                                                                  as::use_awaitable);
+                    log("TLS/SSL handshake completed successfully.", LogLevel::INFO);
 
-                // 3. Start the MQTT layer handshake
-                auto connack_opt = co_await m_client->async_start(
-                    am::v5::connect_packet{true, 0x1234, "", std::nullopt, m_username,
-                                           m_password},
-                    as::use_awaitable);
+                    // 2. DISABLE NAGLE'S ALGORITHM HERE
+                    // This is the most critical spot to prevent the 200ms delay.
+                    boost::system::error_code ec_nagle;
+                    m_client->lowest_layer().set_option(as::ip::tcp::no_delay(true),
+                                                        ec_nagle);
+                    if(!ec_nagle) {
+                        log("TCP_NODELAY enabled: Socket optimized for real-time "
+                            "performance.",
+                            LogLevel::INFO);
+                    } else {
+                        log("Warning: Could not set TCP_NODELAY: " + ec_nagle.message(),
+                            LogLevel::WARNING);
+                    }
 
-                if(connack_opt) {
-                    log("MQTT session started successfully.", LogLevel::INFO);
-                    m_is_connecting = false;
-                    notifyConnected();
-                    start_receive();
-                } else {
-                    log("Failed to connect to MQTT broker. Retrying...",
+                    // 3. Start the MQTT layer handshake
+                    auto connack_opt = co_await m_client->async_start(
+                        am::v5::connect_packet{true, 0x1234, "", std::nullopt, m_username,
+                                               m_password},
+                        as::use_awaitable);
+
+                    if(connack_opt) {
+                        log("MQTT session started successfully.", LogLevel::INFO);
+                        m_is_connecting = false;
+                        notifyConnected();
+                        start_receive();
+                    } else {
+                        log("Failed to connect to MQTT broker. Retrying...",
+                            LogLevel::ERRORS);
+                        m_is_connecting = false;
+                        notifyDisconnected();
+                    }
+                } catch(const std::exception &e) {
+                    log("MQTT connection error: " + std::string(e.what()),
                         LogLevel::ERRORS);
                     m_is_connecting = false;
                     notifyDisconnected();
                 }
-            } catch(const std::exception &e) {
-                log("MQTT connection error: " + std::string(e.what()), LogLevel::ERRORS);
-                m_is_connecting = false;
-                notifyDisconnected();
-            }
-            co_return;
-        },
-        as::detached);
-}
+                co_return;
+            },
+            as::detached);
+    } else {
+        as::co_spawn(
+            m_ioc,
+            [this]() -> as::awaitable<void> {
+                try {
+                    wm_client =
+                        std::make_unique<client_wt>(m_ioc.get_executor());
+
+                    // 1. Establish the underlying TCP connection
+                    // Use async_underlying_handshake which handles TCP connect for 'mqtt' protocol too
+                    co_await wm_client->async_underlying_handshake(m_broker, m_port,
+                                                                  as::use_awaitable);
+                    log("TCP connection established.", LogLevel::INFO);
+
+                    // 2. DISABLE NAGLE'S ALGORITHM
+                    boost::system::error_code ec_nagle;
+                    wm_client->lowest_layer().set_option(as::ip::tcp::no_delay(true),
+                                                        ec_nagle);
+                    if(!ec_nagle) {
+                        log("TCP_NODELAY enabled: Socket optimized for real-time "
+                            "performance.",
+                            LogLevel::INFO);
+                    } else {
+                        log("Warning: Could not set TCP_NODELAY: " + ec_nagle.message(),
+                            LogLevel::WARNING);
+                    }
+
+                    // 3. Start the MQTT layer handshake
+                    auto connack_opt = co_await wm_client->async_start(
+                        am::v5::connect_packet{true, 0x1234, "", std::nullopt, m_username,
+                                               m_password},
+                        as::use_awaitable);
+
+                    if(connack_opt) {
+                        log("MQTT session started (TCP) successfully.", LogLevel::INFO);
+                        m_is_connecting = false;
+                        notifyConnected();
+                        start_receive();
+                    } else {
+                        log("Failed to connect to MQTT broker (TCP). Retrying...",
+                            LogLevel::ERRORS);
+                        m_is_connecting = false;
+                        notifyDisconnected();
+                    }
+                } catch(const std::exception &e) {
+                    log("MQTT connection error (TCP): " + std::string(e.what()),
+                        LogLevel::ERRORS);
+                    m_is_connecting = false;
+                    notifyDisconnected();
+                }
+                co_return;
+            },
+            as::detached);
+    }
+    }
 
 void
 MQTTHandler::start_receive() {
@@ -135,22 +195,39 @@ MQTTHandler::start_receive() {
         [this]() -> as::awaitable<void> {
             while(isConnected()) {
                 try {
-                    auto pv_opt = co_await m_client->async_recv(as::use_awaitable);
-                    if(!pv_opt) {
-                        log("Connection closed by broker.", LogLevel::INFO);
-                        notifyDisconnected();
-                        break;  // Exit receive loop
+                    if (m_protocol) {
+                         auto pv_opt = co_await m_client->async_recv(as::use_awaitable);
+                         if(!pv_opt) {
+                            log("Connection closed by broker.", LogLevel::INFO);
+                            notifyDisconnected();
+                            break;
+                         }
+                         pv_opt->visit(am::overload{
+                            [&](am::v5::publish_packet &p) {
+                                std::lock_guard<std::mutex> lock(m_mutex);
+                                if(m_message_callback) {
+                                    m_message_callback(p.topic(), std::string(p.payload()));
+                                }
+                            },
+                            [](auto &) {}
+                        });
+                    } else {
+                         auto pv_opt = co_await wm_client->async_recv(as::use_awaitable);
+                         if(!pv_opt) {
+                            log("Connection closed by broker.", LogLevel::INFO);
+                            notifyDisconnected();
+                            break;
+                         }
+                         pv_opt->visit(am::overload{
+                            [&](am::v5::publish_packet &p) {
+                                std::lock_guard<std::mutex> lock(m_mutex);
+                                if(m_message_callback) {
+                                    m_message_callback(p.topic(), std::string(p.payload()));
+                                }
+                            },
+                            [](auto &) {}
+                        });
                     }
-
-                    pv_opt->visit(am::overload{
-                        [&](client_t::publish_packet &p) {
-                            std::lock_guard<std::mutex> lock(m_mutex);
-                            if(m_message_callback) {
-                                m_message_callback(p.topic(), std::string(p.payload()));
-                            }
-                        },
-                        [](auto &) {}  // Ignore other packet types
-                    });
 
                 } catch(const std::exception &e) {
                     log("MQTT receive loop error: " + std::string(e.what()),
@@ -172,7 +249,11 @@ MQTTHandler::disconnect() {
         // Lock once to safely manage state and client operations
         std::lock_guard<std::mutex> lock(m_mutex);
         if(m_connected) {
-            m_client->async_disconnect();
+            if (m_protocol) {
+                m_client->async_disconnect();
+            } else {
+                wm_client->async_disconnect();
+            }
             m_connected = false;
             if(m_disconnect_callback) {
                 // Always post callbacks to avoid deadlocks or re-entrancy issues
@@ -182,94 +263,6 @@ MQTTHandler::disconnect() {
         }
     });
 }
-
-// bool MQTTHandler::publish(const std::string &topic, const std::string &payload) {
-//     log("MQTTHandler::publish called for topic: " + topic + " with payload size: " +
-//     std::to_string(payload.size()), LogLevel::INFO);
-//     {
-//         std::lock_guard<std::mutex> lock(m_mutex);
-//         if (!m_connected) {
-//             log("Cannot publish: Not connected to MQTT broker.", LogLevel::ERRORS);
-//             return false;
-//         }
-//         log("MQTT connection confirmed - proceeding with publish", LogLevel::INFO);
-//     }
-//
-//     as::post(m_ioc, [this, topic, payload]() {
-//         // log("Trace: publish task running on IO thread", LogLevel::DEBUG);
-//         as::co_spawn(m_ioc, [this, topic, payload]() -> as::awaitable<void> {
-//             try {
-//                 // Determine QoS - forcing to at_most_once (QoS 0) for now as per
-//                 debugging auto qos = am::qos::at_most_once;
-//
-//                 if (qos == am::qos::at_most_once) {
-//                     // QoS 0: No packet ID, no tracking
-//                     {
-//                          std::lock_guard<std::mutex> lock(m_mutex);
-//                          if (!m_connected) {
-//                              log("Publish coroutine (QoS 0): Client disconnected",
-//                              LogLevel::ERRORS); co_return;
-//                          }
-//                     }
-//
-//                     log("Trace: sending publish QoS 0 topic=" + topic,
-//                     LogLevel::DEBUG); co_await
-//                     m_client->async_publish(static_cast<uint16_t>(0), topic, payload,
-//                     qos, as::use_awaitable); log("Trace: Message sent (QoS 0) topic=" +
-//                     topic, LogLevel::DEBUG);
-//
-//                 } else {
-//                     // QoS 1+: Use Packet ID and tracking
-//                     async_mqtt::packet_id_type packet_id{};
-//                     {
-//                         std::lock_guard<std::mutex> lock(m_mutex);
-//                         if (!m_connected) {
-//                             log("Publish coroutine: Client disconnected before
-//                             acquire", LogLevel::ERRORS); co_return;
-//                         }
-//
-//                         auto opt_packet_id = m_client->acquire_unique_packet_id();
-//                         if (!opt_packet_id) {
-//                             log("All packet_ids in use. Queueing message.",
-//                             LogLevel::ERRORS); if (m_failed_message_callback) {
-//                                 PendingMessage pm(topic, payload);
-//                                 as::post(m_ioc, [cb=m_failed_message_callback, pm]() {
-//                                     cb({pm});
-//                                 });
-//                             }
-//                             co_return;
-//                         }
-//
-//                         packet_id = *opt_packet_id;
-//                         m_pending_messages.emplace(packet_id, PendingMessage(topic,
-//                         payload));
-//                     }
-//
-//                     log("Trace: sending publish packet_id=" + std::to_string(packet_id)
-//                     + " topic=" + topic, LogLevel::DEBUG);
-//
-//                     co_await m_client->async_publish(packet_id, topic, payload,
-//                                                      qos,
-//                                                      as::use_awaitable);
-//
-//                     {
-//                         std::lock_guard<std::mutex> lock(m_mutex);
-//                         m_pending_messages.erase(packet_id);
-//                     }
-//
-//                     log("Trace: Message delivered (PUBACK) packet_id=" +
-//                     std::to_string(packet_id), LogLevel::DEBUG);
-//                 }
-//             } catch (const std::exception& e) {
-//                 log("MQTT publish error: " + std::string(e.what()), LogLevel::ERRORS);
-//                 notifyDisconnected();
-//             }
-//             co_return;
-//         }, as::detached);
-//     });
-//
-//     return true;
-// }
 
 bool
 MQTTHandler::publish(const std::string &topic, const std::string &payload) {
@@ -297,20 +290,25 @@ MQTTHandler::publish(const std::string &topic, const std::string &payload) {
                     co_return;
                 }
 
-                // log("Trace: sending publish QoS 0 topic=" + topic, LogLevel::DEBUG);
+                auto completion_handler = [this, topic](am::error_code ec, auto const & /*pubres*/) {
+                    if(ec) {
+                        log("MQTT publish error: " + ec.message(), LogLevel::ERRORS);
+                        notifyDisconnected();
+                    } else {
+                        // log("Trace: Message sent (QoS 0) topic=" + topic,
+                        //     LogLevel::DEBUG);
+                    }
+                };
 
-                // FIX: Added the second parameter (pubres) to the lambda signature
-                m_client->async_publish(
-                    static_cast<uint16_t>(0), topic, payload, qos,
-                    [this, topic](am::error_code ec, auto const & /*pubres*/) {
-                        if(ec) {
-                            log("MQTT publish error: " + ec.message(), LogLevel::ERRORS);
-                            notifyDisconnected();
-                        } else {
-                            // log("Trace: Message sent (QoS 0) topic=" + topic,
-                            //     LogLevel::DEBUG);
-                        }
-                    });
+                if (m_protocol) {
+                    m_client->async_publish(
+                        static_cast<uint16_t>(0), topic, payload, qos,
+                        completion_handler);
+                } else {
+                    wm_client->async_publish(
+                        static_cast<uint16_t>(0), topic, payload, qos,
+                        completion_handler);
+                }
 
             } catch(const std::exception &e) {
                 log("MQTT publish exception: " + std::string(e.what()), LogLevel::ERRORS);
@@ -337,10 +335,18 @@ MQTTHandler::subscribe(const std::string &topic) {
                 try {
                     std::vector<am::topic_subopts> sub_entry = {
                         {topic, am::qos::at_most_once}};
-                    co_await m_client->async_subscribe(
-                        am::v5::subscribe_packet{*m_client->acquire_unique_packet_id(),
-                                                 am::force_move(sub_entry)},
-                        as::use_awaitable);
+                    
+                    if (m_protocol) {
+                        co_await m_client->async_subscribe(
+                            am::v5::subscribe_packet{*m_client->acquire_unique_packet_id(),
+                                                    am::force_move(sub_entry)},
+                            as::use_awaitable);
+                    } else {
+                        co_await wm_client->async_subscribe(
+                            am::v5::subscribe_packet{*wm_client->acquire_unique_packet_id(),
+                                                    am::force_move(sub_entry)},
+                            as::use_awaitable);
+                    }
                     // log("Subscribed to topic: " + topic, LogLevel::INFO);
                 } catch(const std::exception &e) {
                     log("MQTT subscribe error: " + std::string(e.what()),
@@ -380,10 +386,17 @@ MQTTHandler::subscribeBatch(const std::vector<std::string> &topics) {
                             " topics...",
                         LogLevel::INFO);
 
-                    co_await m_client->async_subscribe(
-                        am::v5::subscribe_packet{*m_client->acquire_unique_packet_id(),
-                                                 am::force_move(sub_entries)},
-                        as::use_awaitable);
+                    if (m_protocol) {
+                        co_await m_client->async_subscribe(
+                            am::v5::subscribe_packet{*m_client->acquire_unique_packet_id(),
+                                                    am::force_move(sub_entries)},
+                            as::use_awaitable);
+                    } else {
+                        co_await wm_client->async_subscribe(
+                            am::v5::subscribe_packet{*wm_client->acquire_unique_packet_id(),
+                                                    am::force_move(sub_entries)},
+                            as::use_awaitable);
+                    }
 
                     log("Successfully subscribed to batch of " +
                             std::to_string(topics.size()) + " topics",

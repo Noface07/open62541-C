@@ -81,13 +81,12 @@ struct MappedInfospaceTag{
     int queuesize;
     int orgId;
 
-
     bool scaling;
     double rawMin;
     double rawMax;
     double scaleMin;
     double scaleMax;
-    string sourceDatatype;
+    string tagType;
     bool enableExpression;
     string expression;
 

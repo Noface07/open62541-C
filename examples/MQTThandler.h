@@ -23,6 +23,10 @@
 using client_t =
     async_mqtt::client<async_mqtt::protocol_version::v5, async_mqtt::protocol::mqtts>;
 
+using client_wt = async_mqtt::client<
+    async_mqtt::protocol_version::v5,
+    async_mqtt::protocol::mqtt>;
+
 // Structure to track pending messages
 struct PendingMessage {
     std::string topic;
@@ -45,7 +49,7 @@ class MQTTHandler {
     // --- Public API ---
     bool
     connect(const std::string &broker, const std::string &port,
-            const std::string &username, const std::string &password);
+            const std::string &username, const std::string &password , const bool &protocol);
     void
     disconnect();
     bool
@@ -87,6 +91,7 @@ class MQTTHandler {
     boost::asio::io_context &m_ioc;
     boost::asio::ssl::context &m_ssl_ctx;
     std::unique_ptr<client_t> m_client;
+    std::unique_ptr<client_wt> wm_client;
     std::thread m_mqtt_thread;
     std::atomic<bool> m_running;
 
@@ -114,6 +119,7 @@ class MQTTHandler {
     std::string m_port;
     std::string m_username;
     std::string m_password;
+    bool m_protocol;
 
     // Asio Timer for Reconnection (replaces the manual thread)
     boost::asio::steady_timer m_reconnect_timer;

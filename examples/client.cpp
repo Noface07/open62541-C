@@ -371,6 +371,7 @@ runClient(bool isService, int argc, char *argv[]) {
         int applicationEndURLPort = config["AppSettings"]["ApplicationEndURLPort"].get<int>();
 
         // Extract MqttConfig
+        boolean protocol = config["MqttConfig"]["MqttSettings"][0]["UseTLS"].get<bool>();
         std::string brokerAddress = config["MqttConfig"]["MqttSettings"][0]["BrokerAddress"].get<std::string>();
         int brokerPort = config["MqttConfig"]["MqttSettings"][0]["BrokerPort"].get<int>();
         std::string mqttUsername = config["MqttConfig"]["MqttSettings"][0]["Username"].get<std::string>();
@@ -778,8 +779,13 @@ runClient(bool isService, int argc, char *argv[]) {
     }
 
     // Connect to MQTT broker (non-blocking)
-    log("Attempting to connect to MQTT broker...", LogLevel::INFO);
-    if(!g_mqttHandler->connect(brokerAddress, std::to_string(brokerPort), mqttUsername, mqttPassword)) {
+    //log("Attempting to connect to MQTT broker...", LogLevel::INFO);
+    //if(protocol) {
+    //    log("Using MQTT over TLS", LogLevel::INFO);
+    //} else {
+    //    log("Using MQTT over TCP", LogLevel::INFO);
+    //}
+    if(!g_mqttHandler->connect(brokerAddress, std::to_string(brokerPort), mqttUsername, mqttPassword , protocol)) {
         log("Failed to initiate MQTT broker connection", LogLevel::ERRORS);
         return EXIT_FAILURE;
     } else {
