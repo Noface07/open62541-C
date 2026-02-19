@@ -55,6 +55,10 @@ extern void enqueueServerJob(const std::function<void(UA_Server*)>& fn, ServerJo
 // GLOBAL API CACHE (In-Memory)
 // ============================================================================
 #include "RedisClient.h"
+#include "SqliteQueueService.h"
+
+// Extern: SqliteQueueService from server.cpp for config cache fallback
+extern SqliteQueueService *g_sqliteService;
 
 
 // ============================================================================
@@ -203,6 +207,24 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
         }
 
         if(!cacheHit) {
+            // 2b. Try local database fallback
+            if(g_sqliteService) {
+                try {
+                    std::string dbData = g_sqliteService->GetConfig(cacheKey);
+                    if(!dbData.empty()) {
+                        log("💾 DB Hit for Topics (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
+                        topicResponse = json::parse(dbData);
+                        cacheHit = true;
+                    } else {
+                        log("📉 DB Miss for Topics (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
+                    }
+                } catch(const std::exception& e) {
+                    log("⚠️ DB Error for Topics: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
+        }
+
+        if(!cacheHit) {
             auto futureResponse =
                 std::async(std::launch::async, getResponse,
                                             apiHost, apiPort, bearerToken,
@@ -219,6 +241,16 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
             
             // Store in Redis (Persistent - no TTL)
             g_redisClient.setCompressed(cacheKey, topicResponse.dump(), 0);
+
+            // Also store in local database
+            if(g_sqliteService) {
+                try {
+                    g_sqliteService->SetConfig(cacheKey, topicResponse.dump());
+                    log("💾 Cached Topics to DB for OrgID: " + std::to_string(ctx->orgId), LogLevel::INFO);
+                } catch(const std::exception& e) {
+                    log("⚠️ Failed to cache Topics to DB: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
         }
 
         // Check again immediately after getting result
@@ -246,9 +278,7 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                 LogLevel::DEBUG);
         }
         
-        // ====================================================================
-        // STEP 3: Create Address Space for Topics (Via Job Queue)
-        // ====================================================================
+        
         // ====================================================================
         // STEP 3: Create Address Space for Topics (Via Job Queue - BATCHED)
         // ====================================================================
@@ -620,6 +650,24 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
         }
 
         if(!alarmCacheHit) {
+            // 2b. Try local database fallback
+            if(g_sqliteService) {
+                try {
+                    std::string dbData = g_sqliteService->GetConfig(alarmCacheKey);
+                    if(!dbData.empty()) {
+                        log("💾 DB Hit for Alarms (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
+                        alarms = ParseAlarmConfigFromJson(json::parse(dbData));
+                        alarmCacheHit = true;
+                    } else {
+                        log("📉 DB Miss for Alarms (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
+                    }
+                } catch(const std::exception& e) {
+                    log("⚠️ DB Error for Alarms: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
+        }
+
+        if(!alarmCacheHit) {
              auto futureResponse =
                 std::async(std::launch::async, getResponse,
                                             apiHost, apiPort, bearerToken,
@@ -636,6 +684,16 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
             
             // Store in Redis (Persistent - no TTL)
             g_redisClient.setCompressed(alarmCacheKey, alarmResponse.dump(), 0);
+
+            // Also store in local database
+            if(g_sqliteService) {
+                try {
+                    g_sqliteService->SetConfig(alarmCacheKey, alarmResponse.dump());
+                    log("💾 Cached Alarms to DB for OrgID: " + std::to_string(ctx->orgId), LogLevel::INFO);
+                } catch(const std::exception& e) {
+                    log("⚠️ Failed to cache Alarms to DB: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
             
             alarms = ParseAlarmConfigFromJson(alarmResponse);
         }

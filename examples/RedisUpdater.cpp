@@ -10,6 +10,7 @@
 #include "fetchAPI.h"
 #include "Encryption.h"
 #include "Logger.h" // For Logger definitions
+#include "SqliteQueueService.h"
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::ordered_json;
@@ -25,6 +26,10 @@ std::string API_HOST = "";
 std::string API_PORT = "";
 std::string DEFAULT_API_USER = "";
 std::string DEFAULT_API_PASS = "";
+
+// SQLite service for database sync
+SqliteQueueService *g_sqliteUpdater = nullptr;
+std::string DB_PATH = "OfflineData.db";
 
 // ----------------------------------------------------------------------------
 // Logger Stub
@@ -83,7 +88,14 @@ bool loadConfiguration() {
             DEFAULT_API_PASS = "123456";
         }
         
+        // Extract DB Path (same as server.cpp)
+        if (config.contains("Payload") && config["Payload"].contains("OfflineQueueOptions") 
+            && config["Payload"]["OfflineQueueOptions"].contains("DbPath")) {
+            DB_PATH = config["Payload"]["OfflineQueueOptions"]["DbPath"].get<std::string>();
+        }
+        
         std::cout << "✓ Config Loaded. API Host: " << API_HOST << ":" << API_PORT << "\n";
+        std::cout << "   DB Path: " << DB_PATH << "\n";
         return true;
         
     } catch (const std::exception& e) {
@@ -114,6 +126,15 @@ void updateOrgData(int orgId, const std::string& token) {
         std::string key = "TOPIC_LIST_" + std::to_string(orgId);
         g_redisClient.setCompressed(key, response.dump(), 0);
         std::cout << "   [Redis] Set " << key << " (Size: " << response.dump().size() << ")\n";
+        // Also save to local database
+        if (g_sqliteUpdater) {
+            try {
+                g_sqliteUpdater->SetConfig(key, response.dump());
+                std::cout << "   [DB] Set " << key << "\n";
+            } catch (const std::exception& ex) {
+                std::cerr << "   [DB Error] " << ex.what() << "\n";
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "   [Error] GetTopicList Failed: " << e.what() << "\n";
     }
@@ -130,6 +151,15 @@ void updateOrgData(int orgId, const std::string& token) {
         std::string key = "ALARMS_" + std::to_string(orgId);
         g_redisClient.setCompressed(key, response.dump(), 0);
         std::cout << "   [Redis] Set " << key << " (Size: " << response.dump().size() << ")\n";
+        // Also save to local database
+        if (g_sqliteUpdater) {
+            try {
+                g_sqliteUpdater->SetConfig(key, response.dump());
+                std::cout << "   [DB] Set " << key << "\n";
+            } catch (const std::exception& ex) {
+                std::cerr << "   [DB Error] " << ex.what() << "\n";
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "   [Error] GetAlarmsConfigDetailList Failed: " << e.what() << "\n";
     }
@@ -229,8 +259,50 @@ void updateHierarchy(int orgId, const std::string& nodeId, const std::string& to
         std::string key = "OPCUA_HIERARCHY_" + nodeId;
         g_redisClient.setCompressed(key, response.dump(), 0);
         std::cout << "   [Redis] Set " << key << " (Size: " << response.dump().size() << ")\n";
+        // Also save to local database
+        if (g_sqliteUpdater) {
+            try {
+                g_sqliteUpdater->SetConfig(key, response.dump());
+                std::cout << "   [DB] Set " << key << "\n";
+            } catch (const std::exception& ex) {
+                std::cerr << "   [DB Error] " << ex.what() << "\n";
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "   [Error] GetOpcUaHierarchy Failed: " << e.what() << "\n";
+    }
+}
+
+// Helper to update Server Configs (GetOpcUaServersWithOrgMappings)
+void updateServerConfigs(const std::string& nodeId, const std::string& token) {
+    std::cout << "\n   [API] Fetching Server Configs for NodeID " << nodeId << "...\n";
+    
+    try {
+        json body;
+        body["data"]["nodeId"] = nodeId;
+        
+        auto response = getResponse(API_HOST, API_PORT, token, body.dump(), "/api/GetOpcUaServersWithOrgMappings");
+        
+        std::string key = "SERVER_CONFIGS_" + nodeId;
+        g_redisClient.setCompressed(key, response.dump(), 0);
+        std::cout << "   [Redis] Set " << key << " (Size: " << response.dump().size() << ")\n";
+
+        // Cache the raw API response to local database
+        if (g_sqliteUpdater) {
+            try {
+                // Store the full API response - server.cpp will parse it with ServerConfigFromJSON on load
+                if(response.contains("data") && response["data"].is_array()) {
+                    g_sqliteUpdater->SetConfig(key, response["data"].dump());
+                } else {
+                    g_sqliteUpdater->SetConfig(key, response.dump());
+                }
+                std::cout << "   [DB] Set " << key << "\n";
+            } catch (const std::exception& ex) {
+                std::cerr << "   [DB Error] " << ex.what() << "\n";
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "   [Error] GetOpcUaServersWithOrgMappings Failed: " << e.what() << "\n";
     }
 }
 
@@ -246,6 +318,17 @@ int main(int argc, char* argv[]) {
     if (!g_redisClient.connect()) {
         std::cerr << "Failed to connect to Redis server.\n";
         return 1;
+    }
+
+    // Initialize SQLite for database sync
+    try {
+        OfflineQueueOptions opts;
+        opts.batchSize = 100;
+        opts.uploadIntervalSeconds = 15;
+        g_sqliteUpdater = new SqliteQueueService(DB_PATH, opts);
+        std::cout << "[DB] SQLite database initialized at " << DB_PATH << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[DB Warning] Could not initialize SQLite: " << e.what() << ". DB sync will be disabled.\n";
     }
 
     // CLI Arguments Handling
@@ -320,6 +403,15 @@ int main(int argc, char* argv[]) {
         std::string profileKey = "USER_PROFILE_" + sessionUser;
         g_redisClient.setCompressed(profileKey, profileResponse.dump(), 0);
         std::cout << "   [Redis] Set " << profileKey << "\n";
+        // Also save to local database
+        if (g_sqliteUpdater) {
+            try {
+                g_sqliteUpdater->SetConfig(profileKey, profileResponse.dump());
+                std::cout << "   [DB] Set " << profileKey << "\n";
+            } catch (const std::exception& ex) {
+                std::cerr << "   [DB Error] " << ex.what() << "\n";
+            }
+        }
 
         // 2b. Extract Org ID
         int orgId = 0;
@@ -344,7 +436,11 @@ int main(int argc, char* argv[]) {
         std::cout << "\n[Step 4] Fetching Hierarchy Data...\n";
         updateHierarchy(orgId, sessionNodeID, token);
 
-        std::cout << "\n=== SUCCESS: All data updated in Redis! ===\n";
+        // Step 5: Update Server Configs
+        std::cout << "\n[Step 5] Fetching Server Configs...\n";
+        updateServerConfigs(sessionNodeID, token);
+
+        std::cout << "\n=== SUCCESS: All data updated in Redis & DB! ==="  << "\n";
 
     } catch (const std::exception& e) {
         std::cerr << "\n❌ FAIL: " << e.what() << "\n";
@@ -353,6 +449,10 @@ int main(int argc, char* argv[]) {
     std::cout << "\nPress Enter to exit...";
     std::string dummy;
     std::getline(std::cin, dummy);
+
+    // Cleanup
+    delete g_sqliteUpdater;
+    g_sqliteUpdater = nullptr;
     
     return 0;
 }

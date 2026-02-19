@@ -331,7 +331,7 @@ mark_as_advanced(UA_ENABLE_DEBUG_SANITIZER)
 # General PubSub setup
 option(UA_ENABLE_PUBSUB "Enable the PubSub protocol" OFF)
 if(UA_ENABLE_PUBSUB)
-    find_package(nng CONFIG REQUIRED)
+    #find_package(nng CONFIG REQUIRED)
 endif()
 
 option(UA_ENABLE_PUBSUB_SKS "Enable Security Key Service support for publisher and subscriber" OFF)

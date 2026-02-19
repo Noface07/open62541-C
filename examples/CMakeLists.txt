@@ -219,10 +219,11 @@ set_target_properties(client PROPERTIES FOLDER "open62541/examples/Complex")
 # ===================================================================
 
 # --- Define the 'RedisUpdater' utility ---
-add_executable(RedisUpdater RedisUpdater.cpp RedisClient.cpp fetchAPI.cpp Encryption.cpp)
+add_executable(RedisUpdater RedisUpdater.cpp RedisClient.cpp fetchAPI.cpp Encryption.cpp SqliteQueueService.cpp)
 target_link_libraries(RedisUpdater PRIVATE
     open62541::open62541
     Boost::system
+    ${SQLITE3_TARGET}
     Threads::Threads
     nlohmann_json::nlohmann_json
     ZLIB::ZLIB

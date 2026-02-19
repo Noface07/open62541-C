@@ -121,6 +121,12 @@ class SqliteQueueService {
     void
     TriggerApiUpload();
 
+    // Config cache (ApiConfigCache table)
+    void
+    SetConfig(const std::string &key, const std::string &value);
+    std::string
+    GetConfig(const std::string &key);
+
     using TokenRefreshCallback = std::function<std::string()>;
     void
     SetTokenRefreshCallback(TokenRefreshCallback callback);

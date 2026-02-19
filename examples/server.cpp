@@ -40,6 +40,7 @@
 #include "ServerConfig.h"
 #include "ServiceUtils.h"
 #include "RedisClient.h"
+#include "SqliteQueueService.h"
 #include "InstrumentedMutex.cpp"
 
 #include <async_mqtt/all.hpp>
@@ -154,6 +155,7 @@ static std::string g_authUsername;  // From appsettings.json Authorization secti
 static std::string g_authPassword;  // From appsettings.json Authorization section
 static std::vector<OrgConfig> g_organizations;  // List of all organizations
 static UA_Server *g_server = nullptr;
+SqliteQueueService *g_sqliteService = nullptr;  // For config cache fallback (non-static for extern access from SessionWorker)
 
 // Define user credentials
 static UA_UsernamePasswordLogin usernamePasswordLogin[2] = {
@@ -328,23 +330,21 @@ customActivateSession(UA_Server *server, UA_AccessControl *ac,
     }
 
     // ========================================================================
-    // STEP 2: Get Bearer Token
+    // STEP 2: Get Bearer Token (skip if offline - DB fallback in STEP 3)
     // ========================================================================
+    std::string bearerToken;
     json tokenResponse;
     try {
         tokenResponse = getBearerToken(g_apiHost, g_apiPort, username, finalPassword);
+        if(tokenResponse.contains("access_token")) {
+            bearerToken = tokenResponse["access_token"].get<std::string>();
+            log("✓ Bearer token acquired for session activation", LogLevel::DEBUG);
+        } else {
+            log("⚠️ No access_token in response. Will try cached profile.", LogLevel::WARNING);
+        }
     } catch(const std::exception &e) {
-        log("❌ Bearer token request failed: " + std::string(e.what()), LogLevel::ERRORS);
-        return UA_STATUSCODE_BADUSERACCESSDENIED;
+        log("⚠️ Bearer token request failed (offline?): " + std::string(e.what()) + ". Will try cached profile.", LogLevel::WARNING);
     }
-
-    if(!tokenResponse.contains("access_token")) {
-        log("❌ No access_token in response", LogLevel::ERRORS);
-        return UA_STATUSCODE_BADUSERACCESSDENIED;
-    }
-
-    std::string bearerToken = tokenResponse["access_token"].get<std::string>();
-    log("✓ Bearer token acquired", LogLevel::DEBUG);
 
     // ========================================================================
     // STEP 3: Get User Profile to Extract OrgID
@@ -383,16 +383,52 @@ customActivateSession(UA_Server *server, UA_AccessControl *ac,
         }
 
         if(!cacheHit) {
-             auto futureResponse = std::async(std::launch::async, getResponse,
-                                             g_apiHost, g_apiPort, bearerToken, json_body, "/api/GetUserProfile");
-             
-             // We can wait responsive or just block here as this is connection phase
-             profileJson = futureResponse.get();
-             
-             // Store in Redis (Persistent - no TTL)
-             g_redisClient.setCompressed(cacheKey, profileJson.dump(), 0);
-             
-             profile = ParseUserProfileFromJson(profileJson);
+            // 2b. Try local database fallback
+            if(g_sqliteService) {
+                try {
+                    std::string dbData = g_sqliteService->GetConfig(cacheKey);
+                    if(!dbData.empty()) {
+                        log("💾 DB Hit for UserProfile (User: " + username + ")", LogLevel::INFO);
+                        profileJson = nlohmann::ordered_json::parse(dbData);
+                        profile = ParseUserProfileFromJson(profileJson);
+                        if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
+                            cacheHit = true;
+                        } else {
+                            log("⚠️ DB UserProfile incomplete. Falling back to API.", LogLevel::WARNING);
+                        }
+                    } else {
+                        log("📉 DB Miss for UserProfile (User: " + username + ")", LogLevel::INFO);
+                    }
+                } catch(const std::exception& e) {
+                    log("⚠️ DB Error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
+        }
+
+        if(!cacheHit) {
+            if(bearerToken.empty()) {
+                log("⚠️ No bearer token and no cached UserProfile for: " + username + ". Cannot authenticate offline.", LogLevel::WARNING);
+            } else {
+                auto futureResponse = std::async(std::launch::async, getResponse,
+                                                g_apiHost, g_apiPort, bearerToken, json_body, "/api/GetUserProfile");
+                
+                profileJson = futureResponse.get();
+                
+                // Store in Redis (Persistent - no TTL)
+                g_redisClient.setCompressed(cacheKey, profileJson.dump(), 0);
+
+                // Also store in local database
+                if(g_sqliteService) {
+                    try {
+                        g_sqliteService->SetConfig(cacheKey, profileJson.dump());
+                        log("💾 Cached UserProfile to DB for user: " + username, LogLevel::INFO);
+                    } catch(const std::exception& e) {
+                        log("⚠️ Failed to cache UserProfile to DB: " + std::string(e.what()), LogLevel::WARNING);
+                    }
+                }
+                
+                profile = ParseUserProfileFromJson(profileJson);
+            }
         }
 
     } catch(const std::exception &e) {
@@ -2278,6 +2314,16 @@ int RunServer(int argc, char **argv) {
     log("Redis Cache Prefix: " + uniquePrefix, LogLevel::INFO);
     g_redisClient.init(redisHost, redisPort, redisPassword, redisDb, uniquePrefix);
 
+    // Initialize SqliteQueueService for config cache fallback
+    try {
+        OfflineQueueOptions sqliteOpts;
+        sqliteOpts.batchSize = 100;
+        sqliteOpts.uploadIntervalSeconds = 15;
+        g_sqliteService = new SqliteQueueService(dbPath, sqliteOpts);
+        log("SqliteQueueService initialized for config cache at: " + dbPath, LogLevel::INFO);
+    } catch(const std::exception& e) {
+        log("WARNING: Failed to initialize SqliteQueueService: " + std::string(e.what()) + ". DB fallback will be unavailable.", LogLevel::WARNING);
+    }
 
     std::cout << "✓ Configuration parsed successfully" << std::endl;
     std::cout << "API Host: " << applicationEndURLHost << ":" << applicationEndURLPort << std::endl;
@@ -2291,10 +2337,13 @@ int RunServer(int argc, char **argv) {
     // Acquire bearer token for API authentication with Retry Logic
     std::string BearerToken;
     int retryDelay = 5;
+    int tokenAttempt = 0;
+    const int maxTokenRetries = 3;
     
-    while(true) {
-        std::cout << "Acquiring bearer token for API authentication..." << std::endl;
-        log("Acquiring bearer token for API authentication...", LogLevel::INFO);
+    while(tokenAttempt < maxTokenRetries) {
+        tokenAttempt++;
+        std::cout << "Acquiring bearer token (attempt " << tokenAttempt << "/" << maxTokenRetries << ")..." << std::endl;
+        log("Acquiring bearer token (attempt " + std::to_string(tokenAttempt) + "/" + std::to_string(maxTokenRetries) + ")...", LogLevel::INFO);
         
         try {
             json authResponse = getBearerToken(applicationEndURLHost, 
@@ -2316,13 +2365,20 @@ int RunServer(int argc, char **argv) {
             log("Failed to acquire bearer token: " + std::string(e.what()), LogLevel::ERRORS);
         }
         
-        std::cout << " Retrying in " << retryDelay << " seconds..." << std::endl;
-        log(" Retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::INFO);
-        std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
+        if(tokenAttempt < maxTokenRetries) {
+            std::cout << " Retrying in " << retryDelay << " seconds..." << std::endl;
+            log(" Retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::INFO);
+            std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
         
-        if(retryDelay < 15) {
-            retryDelay += 5;
+            if(retryDelay < 15) {
+                retryDelay += 5;
+            }
         }
+    }
+
+    if(BearerToken.empty()) {
+        log("WARNING: All " + std::to_string(maxTokenRetries) + " bearer token attempts failed. Running in OFFLINE mode (DB fallback only).", LogLevel::WARNING);
+        std::cout << "⚠️ Running in OFFLINE mode - using local database for configuration." << std::endl;
     }
 
     // Global logging control - DISABLED BY DEFAULT
@@ -2403,9 +2459,9 @@ int RunServer(int argc, char **argv) {
 
     std::string json_body = std::format(R"(
     {{
-        "data": {{ "nodeId": "ND01" }}
+        "data": {{ "nodeId": "{}" }}
     }}
-    )");
+    )", NodeID);
 
     std::string target = "/api/GetOpcUaServersWithOrgMappings";
 
@@ -2456,13 +2512,64 @@ int RunServer(int argc, char **argv) {
         bearerToken = g_bearerToken;
 
         std::vector<ServerConfig> configs;
+        std::string serverConfigCacheKey = "SERVER_CONFIGS_" + NodeID;
         try {
             log("Fetching server configurations...", LogLevel::INFO);
             configs = ParseServerConfig(applicationEndURLHost, std::to_string(applicationEndURLPort), 
                                         bearerToken, json_body, target);
             
+            // If API succeeded, cache the raw response to DB for offline use
+            if(!configs.empty() && g_sqliteService) {
+                try {
+                    json configsJson = json::array();
+                    for(const auto& cfg : configs) {
+                        json j;
+                        j["id"] = cfg.id;
+                        j["dataPointId"] = cfg.dataPointId;
+                        j["name"] = cfg.name;
+                        j["ip"] = cfg.ip;
+                        j["port"] = cfg.port;
+                        j["nodeId"] = cfg.nodeId;
+                        json mappingsArr = json::array();
+                        for(const auto& om : cfg.orgMappings) {
+                            json mj;
+                            mj["id"] = om.id;
+                            mj["hierarchyId"] = om.hierarchyId;
+                            mj["mapOrgId"] = om.mapOrgId;
+                            mj["orgShortCode"] = om.orgShortCode;
+                            mappingsArr.push_back(mj);
+                        }
+                        j["orgMappings"] = mappingsArr;
+                        configsJson.push_back(j);
+                    }
+                    g_sqliteService->SetConfig(serverConfigCacheKey, configsJson.dump());
+                    log("💾 Cached server configs to DB (" + std::to_string(configs.size()) + " configs)", LogLevel::INFO);
+                } catch(const std::exception& e) {
+                    log("⚠️ Failed to cache server configs to DB: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
+
+            // If API returned empty (e.g. token was empty/offline), try DB fallback
+            if(configs.empty() && g_sqliteService) {
+                log("📉 API returned no configs. Trying local database fallback...", LogLevel::INFO);
+                try {
+                    std::string dbData = g_sqliteService->GetConfig(serverConfigCacheKey);
+                    if(!dbData.empty()) {
+                        json cachedConfigs = json::parse(dbData);
+                        for(const auto& item : cachedConfigs) {
+                            configs.push_back(ServerConfigFromJSON(item));
+                        }
+                        log("💾 DB Hit! Loaded " + std::to_string(configs.size()) + " server configs from local database.", LogLevel::INFO);
+                    } else {
+                        log("📉 DB Miss for server configs.", LogLevel::INFO);
+                    }
+                } catch(const std::exception& e) {
+                    log("⚠️ DB Error for server configs: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
+
             if(configs.empty()) {
-                log("❌ No server configurations found in API response. Exiting.", LogLevel::ERRORS);
+                log("❌ No server configurations found (API + DB). Exiting.", LogLevel::ERRORS);
                 return EXIT_FAILURE;
             }
 

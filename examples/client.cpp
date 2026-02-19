@@ -296,8 +296,9 @@ std::future<std::string> getBearerTokenNow(std::string applicationEndURLHost, st
     auto fut = std::async(std::launch::async, [&]() {  // <-- capture by reference
         std::string token;
         bool tokenSuccess = false;
+        const int maxRetries = 3; // Max retries before giving up (for offline fallback)
 
-        while (!tokenSuccess) {
+        while (!tokenSuccess && attempt <= maxRetries) {
             try {
                 auto futureToken = std::async(std::launch::async, [&]() {
                     return ::getBearerToken(applicationEndURLHost, applicationEndURLPort, authUsername, authPassword);
@@ -315,7 +316,7 @@ std::future<std::string> getBearerTokenNow(std::string applicationEndURLHost, st
                             << retryDelay << " seconds..." << std::endl;
                 }
             } catch (const std::exception& e) {
-                std::cout << "Token fetch failed: " << e.what() << std::endl;
+                std::cout << "Token fetch failed (attempt " << attempt << "/" << maxRetries << "): " << e.what() << std::endl;
             }
 
             if (!tokenSuccess) {
@@ -324,7 +325,11 @@ std::future<std::string> getBearerTokenNow(std::string applicationEndURLHost, st
             }
         }
 
-        return token;
+        if (!tokenSuccess) {
+            std::cout << "WARNING: All " << maxRetries << " token attempts failed. Proceeding without token (DB fallback mode)." << std::endl;
+        }
+
+        return token;  // Returns empty string if all retries failed
     });
 
     if (blocking) {
@@ -477,9 +482,24 @@ runClient(bool isService, int argc, char *argv[]) {
 
     // Retry logic for API calls with constant 10-second intervals
     string BearerToken = getBearerTokenNow(applicationEndURLHost, std::to_string(applicationEndURLPort), authUsername, authPassword, true).get();
-    log("Bearer token obtained successfully", LogLevel::INFO);
+    if (BearerToken.empty()) {
+        log("WARNING: No bearer token available. Running in OFFLINE mode (DB fallback only).", LogLevel::WARNING);
+    } else {
+        log("Bearer token obtained successfully", LogLevel::INFO);
+    }
     
     vector<ServerInfoO> serverList;
+
+    // Initialize SqliteQueueService EARLY so we can use config cache during hierarchy fetch
+    try {
+        OfflineQueueOptions options;
+        options.batchSize = 100;
+        options.uploadIntervalSeconds = 15;
+        g_sqliteService = new SqliteQueueService(dbPath, options);
+        log("SqliteQueueService initialized (early - for config cache).", LogLevel::INFO);
+    } catch (const std::exception& e) {
+        log("WARNING: Failed to initialize SqliteQueueService early: " + std::string(e.what()) + ". DB fallback will be unavailable.", LogLevel::WARNING);
+    }
         
     // Retry ParseServerHierarchy with constant 10-second intervals (infinite retries)
     const int retryDelay = 10; // seconds
@@ -519,7 +539,31 @@ runClient(bool isService, int argc, char *argv[]) {
                 }
             }
 
-            // 2. Fallback to API if Cache Miss or Parse Failure 
+            // 2. Fallback to Database if Redis miss/fail
+            if (!cacheHit && g_sqliteService) {
+                log("Checking local database for key: " + redisKey, LogLevel::INFO);
+                try {
+                    std::string dbData = g_sqliteService->GetConfig(redisKey);
+                    if (!dbData.empty()) {
+                        log("DB Hit! Loading hierarchy for " + NodeID + " from local database.", LogLevel::INFO);
+                        json dbJson = json::parse(dbData);
+                        serverList = ParseServerHierarchyFromJson(dbJson);
+                        if (!serverList.empty()) {
+                            hierarchySuccess = true;
+                            cacheHit = true;
+                            log("Hierarchy loaded from local database successfully.", LogLevel::INFO);
+                        } else {
+                            log("Database data invalid or empty. Falling back to API.", LogLevel::WARNING);
+                        }
+                    } else {
+                        log("DB Miss for " + redisKey + ". Falling back to API...", LogLevel::INFO);
+                    }
+                } catch (const std::exception& e) {
+                    log("Error reading from database: " + std::string(e.what()) + ". Falling back to API.", LogLevel::ERRORS);
+                }
+            }
+
+            // 3. Fallback to API if both Redis and DB miss
             if (!cacheHit) {
                 std::string target = "/api/GetOpcUaHierarchy";
                 // JSON body
@@ -543,10 +587,20 @@ runClient(bool isService, int argc, char *argv[]) {
                 
                 json apiResponse = futureResponse.get();
 
-                // Cache the fresh response
+                // Cache the fresh response to Redis
                 if (!apiResponse.is_null()) {
                      g_redisClient.setCompressed(redisKey, apiResponse.dump(), 0);
                      log("Cached fresh hierarchy to Redis key: " + redisKey, LogLevel::INFO);
+
+                     // Also cache to local database
+                     if (g_sqliteService) {
+                         try {
+                             g_sqliteService->SetConfig(redisKey, apiResponse.dump());
+                             log("Cached fresh hierarchy to local database key: " + redisKey, LogLevel::INFO);
+                         } catch (const std::exception& e) {
+                             log("Failed to cache to database: " + std::string(e.what()), LogLevel::WARNING);
+                         }
+                     }
                 }
 
                 // Parse
@@ -592,20 +646,14 @@ runClient(bool isService, int argc, char *argv[]) {
     //    log("TagId " + std::to_string(entry.first) + " -> " + entry.second.first + " @ " + entry.second.second);
     //}
 
-    // Initialize SqliteQueueService
+    // Configure SqliteQueueService (service was already created before hierarchy loop)
     try {
-        OfflineQueueOptions options;
-        options.batchSize = 100; // Example value
-        options.uploadIntervalSeconds = 15; // Example value
-        // The DB file will be created in the current working directory
-        g_sqliteService = new SqliteQueueService(dbPath, options);
-        g_sqliteService->StartQueueWorker(); // Start the DB writer thread immediately
-        log("SqliteQueueService initialized.", LogLevel::INFO);
+        g_sqliteService->StartQueueWorker(); // Start the DB writer thread
+        log("SqliteQueueService queue worker started.", LogLevel::INFO);
 
         // After: g_sqliteService = new SqliteQueueService("OfflineData.db", options);
         g_sqliteService->SetApiUrl("http://164.52.221.177:5128/api/UploadBulkTagData");   // required
-        string BearerToken2 = getBearerTokenNow(applicationEndURLHost, std::to_string(applicationEndURLPort), authUsername, authPassword, true).get();
-        g_sqliteService->SetApiAuth(BearerToken2);  
+        g_sqliteService->SetApiAuth(BearerToken); // Reuse existing token (empty when offline, refreshed via callback when online)  
 
         // Set callback for token refresh on 401
         g_sqliteService->SetTokenRefreshCallback([=]() -> std::string {
@@ -1068,22 +1116,48 @@ runClient(bool isService, int argc, char *argv[]) {
             }
 
             if(!cacheHit) {
-                auto token = getBearerTokenNow(applicationEndURLHost,
-                                               std::to_string(applicationEndURLPort),
-                                               APIusername, APIpassword, true).get();
+                // Try DB fallback before API
+                if(g_sqliteService) {
+                    try {
+                        std::string dbData = g_sqliteService->GetConfig(cacheKey);
+                        if(!dbData.empty()) {
+                            log("💾 DB Hit for UserProfile: " + cacheKey, LogLevel::INFO);
+                            profileJson = nlohmann::ordered_json::parse(dbData);
+                            profile = ParseUserProfileFromJson(profileJson);
+                            if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
+                                cacheHit = true;
+                            }
+                        }
+                    } catch(const std::exception& e) {
+                        log("⚠️ DB fallback error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
+                    }
+                }
+            }
 
-                auto futureResponse = std::async(
-                    std::launch::async, getResponse, applicationEndURLHost,
-                               std::to_string(applicationEndURLPort), token, json_body,
-                               "/api/GetUserProfile");
+            if(!cacheHit) {
+                if(BearerToken.empty()) {
+                    log("⚠️ No bearer token and no cached UserProfile. Skipping API call.", LogLevel::WARNING);
+                } else {
+                    auto futureResponse = std::async(
+                        std::launch::async, getResponse, applicationEndURLHost,
+                                   std::to_string(applicationEndURLPort), BearerToken, json_body,
+                                   "/api/GetUserProfile");
 
-                // We can wait responsive or just block here as this is connection phase
-                profileJson = futureResponse.get();
+                    profileJson = futureResponse.get();
 
-                // Store in Redis (Persistent - no TTL)
-                g_redisClient.setCompressed(cacheKey, profileJson.dump(), 0);
+                    // Store in Redis (Persistent - no TTL)
+                    g_redisClient.setCompressed(cacheKey, profileJson.dump(), 0);
+                    // Also store in DB
+                    if(g_sqliteService) {
+                        try {
+                            g_sqliteService->SetConfig(cacheKey, profileJson.dump());
+                        } catch(const std::exception& e) {
+                            log("⚠️ Failed to cache UserProfile to DB: " + std::string(e.what()), LogLevel::WARNING);
+                        }
+                    }
 
-                profile = ParseUserProfileFromJson(profileJson);
+                    profile = ParseUserProfileFromJson(profileJson);
+                }
             }
 
         } catch(const std::exception &e) {

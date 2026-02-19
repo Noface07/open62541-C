@@ -144,6 +144,11 @@ SqliteQueueService::InitializeDatabase() {
                                "Payload TEXT NOT NULL,"
                                "CreatedAt TEXT NOT NULL);";
 
+    const char *createConfigCache = "CREATE TABLE IF NOT EXISTS ApiConfigCache ("
+                                    "Key TEXT PRIMARY KEY,"
+                                    "Value TEXT NOT NULL,"
+                                    "UpdatedAt TEXT NOT NULL);";
+
     char *errMsg = nullptr;
     if(sqlite3_exec(db_, createOffline, nullptr, nullptr, &errMsg) != SQLITE_OK) {
         std::string err = errMsg;
@@ -154,6 +159,11 @@ SqliteQueueService::InitializeDatabase() {
         std::string err = errMsg;
         sqlite3_free(errMsg);
         throw std::runtime_error("Failed to create LatestValues table: " + err);
+    }
+    if(sqlite3_exec(db_, createConfigCache, nullptr, nullptr, &errMsg) != SQLITE_OK) {
+        std::string err = errMsg;
+        sqlite3_free(errMsg);
+        throw std::runtime_error("Failed to create ApiConfigCache table: " + err);
     }
 }
 
@@ -726,4 +736,51 @@ SqliteQueueService::GetCurrentTimestamp() {
 void
 SqliteQueueService::SetTokenRefreshCallback(TokenRefreshCallback callback) {
     tokenRefreshCallback_ = callback;
+}
+
+// --- Config Cache Methods ---
+
+void
+SqliteQueueService::SetConfig(const std::string &key, const std::string &value) {
+    ExecuteDbCommand([&](sqlite3 *db) {
+        sqlite3_stmt *stmt;
+        const char *sql = "INSERT OR REPLACE INTO ApiConfigCache (Key, Value, UpdatedAt) "
+                          "VALUES (?, ?, ?);";
+        sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, value.c_str(), -1, SQLITE_TRANSIENT);
+        std::string ts = GetCurrentTimestamp();
+        sqlite3_bind_text(stmt, 3, ts.c_str(), -1, SQLITE_TRANSIENT);
+
+        if(sqlite3_step(stmt) != SQLITE_DONE) {
+            std::string err = sqlite3_errmsg(db);
+            sqlite3_finalize(stmt);
+            throw std::runtime_error("SetConfig failed: " + err);
+        }
+        sqlite3_finalize(stmt);
+        std::cout << "[SQLite] Config cached: " << key << " (" << value.size()
+                  << " bytes)" << std::endl;
+        return SQLITE_OK;
+    });
+}
+
+std::string
+SqliteQueueService::GetConfig(const std::string &key) {
+    std::string result;
+    ExecuteDbCommand([&](sqlite3 *db) {
+        sqlite3_stmt *stmt;
+        const char *sql = "SELECT Value FROM ApiConfigCache WHERE Key = ?;";
+        sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+
+        if(sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *text = (const char *)sqlite3_column_text(stmt, 0);
+            if(text) {
+                result = text;
+            }
+        }
+        sqlite3_finalize(stmt);
+        return SQLITE_OK;
+    });
+    return result;
 }
