@@ -26,6 +26,21 @@ static std::string base64_encode(const std::vector<unsigned char>& data) {
     return res;
 }
 
+static std::vector<unsigned char>
+base64_decode(const std::string &input) {
+    BIO *b64 = BIO_new(BIO_f_base64());
+    BIO *bmem = BIO_new_mem_buf(input.data(), (int)input.size());
+    bmem = BIO_push(b64, bmem);
+    BIO_set_flags(bmem, BIO_FLAGS_BASE64_NO_NL);
+
+    std::vector<unsigned char> buffer(input.size());
+    int decodedLen = BIO_read(bmem, buffer.data(), (int)input.size());
+    buffer.resize(decodedLen > 0 ? decodedLen : 0);
+
+    BIO_free_all(bmem);
+    return buffer;
+}
+
 std::string GetEncryptedString(std::string encryptionKey, std::string data, int encType) {
     if (encryptionKey.empty()) {
         encryptionKey = "BAKRNOCTECHONDATER"; 
@@ -80,3 +95,61 @@ std::string GetEncryptedString(std::string encryptionKey, std::string data, int 
     
     return base64Str;
 }
+
+std::string
+GetDecryptedString(std::string decryptionKey, std::string encryptedBase64, int encType) {
+    if(decryptionKey.empty()) {
+        decryptionKey = "TechDC0nf!g";
+    }
+
+    // 1. Base64 decode
+    std::vector<unsigned char> encryptedBytes = base64_decode(encryptedBase64);
+
+    // 2. Key Derivation (same as encryption)
+    unsigned char salt[] = {0x49, 0x76, 0x61, 0x6e, 0x20, 0x4d, 0x65,
+                            0x64, 0x76, 0x65, 0x64, 0x65, 0x76};
+
+    unsigned char key[32];
+    unsigned char iv[16];
+    unsigned char derived[48];
+
+    PKCS5_PBKDF2_HMAC(decryptionKey.c_str(), (int)decryptionKey.length(), salt,
+                      sizeof(salt), 1000, EVP_sha1(), 48, derived);
+
+    std::memcpy(key, derived, 32);
+    std::memcpy(iv, derived + 32, 16);
+
+    // 3. AES-256-CBC Decryption
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv);
+
+    std::vector<unsigned char> decrypted(encryptedBytes.size() + EVP_MAX_BLOCK_LENGTH);
+    int len;
+    int plaintext_len;
+
+    EVP_DecryptUpdate(ctx, decrypted.data(), &len, encryptedBytes.data(),
+                      (int)encryptedBytes.size());
+
+    plaintext_len = len;
+
+    if(EVP_DecryptFinal_ex(ctx, decrypted.data() + len, &len) <= 0) {
+        EVP_CIPHER_CTX_free(ctx);
+        log("ERROR: Decryption failed (bad padding or wrong key)", LogLevel::ERRORS);
+        return "";
+    }
+
+    plaintext_len += len;
+    decrypted.resize(plaintext_len);
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    // 4. Convert UTF-16LE bytes back to std::string
+    std::string result;
+    for(size_t i = 0; i + 1 < decrypted.size(); i += 2) {
+        result.push_back(decrypted[i]);  
+    }
+
+    log("DEBUG: Decrypted String: " + result, LogLevel::INFO);
+
+    return result;
+} 

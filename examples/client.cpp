@@ -42,6 +42,7 @@
 #include "UserProfile.h"
 #include "RedisClient.h"
 #include "alarm_enums.h"
+#include "EdgeConfigLoader.h"
 
 using namespace std;
 
@@ -375,19 +376,30 @@ runClient(bool isService, int argc, char *argv[]) {
         std::string applicationEndURLHost = config["AppSettings"]["ApplicationEndURLHost"].get<std::string>();
         int applicationEndURLPort = config["AppSettings"]["ApplicationEndURLPort"].get<int>();
 
-        // Extract MqttConfig
+        // Extract MqttConfig (broker address/port/TLS still from appsettings.json)
         boolean protocol = config["MqttConfig"]["MqttSettings"][0]["UseTLS"].get<bool>();
         std::string brokerAddress = config["MqttConfig"]["MqttSettings"][0]["BrokerAddress"].get<std::string>();
         int brokerPort = config["MqttConfig"]["MqttSettings"][0]["BrokerPort"].get<int>();
-        std::string mqttUsername = config["MqttConfig"]["MqttSettings"][0]["Username"].get<std::string>();
-        std::string mqttPassword = config["MqttConfig"]["MqttSettings"][0]["Password"].get<std::string>();
-    
-        // Extract Authorization
-        std::string authUsername = config["Authorization"]["Username"].get<std::string>();
-        std::string authPassword = config["Authorization"]["Password"].get<std::string>();
+        // MQTT username/password/clientId come from EdgeConfig (set after bearer token below)
+        std::string mqttUsername;
+        std::string mqttPassword;
 
-        //Extract NodeID
-        std::string NodeID = config["ConfigurationSettings"]["NodeID"].get<std::string>();
+        // Load credentials, NodeID, and ClientId from EdgeConfig_*.txt
+        std::cerr << "[EdgeConfig] Attempting to load EdgeConfig_*.txt ..." << std::endl;
+        EdgeConfigData edgeCfg;
+        try {
+            edgeCfg = LoadEdgeConfig();
+        } catch (const std::exception& ex) {
+            std::cerr << "\n[EdgeConfig] FATAL ERROR: " << ex.what() << std::endl;
+            std::cerr << "[EdgeConfig] Client cannot start without a valid EdgeConfig file." << std::endl;
+            std::cout << "STARTUP FAILED: EdgeConfig error — " << ex.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+        std::string authUsername = edgeCfg.username;
+        std::string authPassword = edgeCfg.password;
+
+        //Extract NodeID from EdgeConfig
+        std::string NodeID = edgeCfg.shortCode;
     
         // Extract Payload
         std::string dbPath = config["Payload"]["OfflineQueueOptions"]["DbPath"].get<std::string>();
@@ -487,6 +499,12 @@ runClient(bool isService, int argc, char *argv[]) {
     } else {
         log("Bearer token obtained successfully", LogLevel::INFO);
     }
+
+    // Derive MQTT credentials from EdgeConfig now that bearer token is known
+    SetEdgeConfigMqttPassword(edgeCfg, BearerToken);
+    mqttUsername = edgeCfg.mqttUsername;
+    mqttPassword = edgeCfg.mqttPassword;
+    log("MQTT credentials set from EdgeConfig (ClientId=" + edgeCfg.clientId + ")", LogLevel::INFO);
     
     vector<ServerInfoO> serverList;
 
@@ -761,6 +779,10 @@ runClient(bool isService, int argc, char *argv[]) {
             
             for (const auto& msg : failedMessages) {
                 try {
+                    if (msg.payload.empty()){
+                        log("Empty payload received on topic: " + msg.topic, LogLevel::INFO);
+                        continue;
+                    }
                     // Parse the JSON payload to extract the MqttPayload data
                     nlohmann::json payload = nlohmann::json::parse(msg.payload);
                     if (payload.contains("Data") && payload["Data"].is_array() && !payload["Data"].empty()) {
@@ -810,15 +832,36 @@ runClient(bool isService, int argc, char *argv[]) {
         g_mqttHandler->setOnDisconnectCallback(onMqttDisconnect);
         g_mqttHandler->setOnFailedMessageCallback(onFailedMessages);
 
+        // Register token refresh callback: called before every MQTT reconnect attempt.
+        // Re-fetches the bearer token so an expired JWT never causes permanent not_authorized.
+        g_mqttHandler->setPasswordRefreshCallback(
+            [applicationEndURLHost, applicationEndURLPort, &edgeCfg]() -> std::string {
+                try {
+                    log("MQTT token refresh: fetching new bearer token ...", LogLevel::INFO);
+                    std::string freshToken = getBearerTokenNow(
+                        applicationEndURLHost,
+                        std::to_string(applicationEndURLPort),
+                        edgeCfg.username,
+                        edgeCfg.password,
+                        true).get();
+                    if(freshToken.empty()) {
+                        log("MQTT token refresh: empty token returned.", LogLevel::WARNING);
+                        return "";
+                    }
+                    // Wrap in JSON exactly as the broker expects
+                    nlohmann::json pw;
+                    pw["token"] = freshToken;
+                    log("MQTT token refresh: new token obtained.", LogLevel::INFO);
+                    return pw.dump();
+                } catch(const std::exception& e) {
+                    log("MQTT token refresh failed: " + std::string(e.what()), LogLevel::ERRORS);
+                    return "";
+                }
+            });
+
         // ... existing code ...
 
-        // Fix other errors reported by user (lines ~1198, ~1204, ~1264)
-        // Need to locate where UpdateType::TELEMETRY etc. are used and fix typos/scope.
-        // Assuming context is inside a loop processing messages or similar.
-        // The error log indicates specific lines. I will replace the whole block around these lines if possible or target them.
-        
-        // Wait, I am replacing lines 714-750 first block.
-        // And then I will do another replacement for lines ~1198.
+
 
 
     } catch (const std::exception& e) {
@@ -833,7 +876,7 @@ runClient(bool isService, int argc, char *argv[]) {
     //} else {
     //    log("Using MQTT over TCP", LogLevel::INFO);
     //}
-    if(!g_mqttHandler->connect(brokerAddress, std::to_string(brokerPort), mqttUsername, mqttPassword , protocol)) {
+    if(!g_mqttHandler->connect(brokerAddress, std::to_string(brokerPort), mqttUsername, mqttPassword, protocol, edgeCfg.clientId)) {
         log("Failed to initiate MQTT broker connection", LogLevel::ERRORS);
         return EXIT_FAILURE;
     } else {
@@ -1260,6 +1303,11 @@ runClient(bool isService, int argc, char *argv[]) {
         //log("Received MQTT message on topic: " + topic, LogLevel::DEBUG);
 
         // Parse and validate JSON payload
+        if (payload.empty()) {
+            log("Empty payload received on topic: " + topic, LogLevel::INFO);
+            return;
+        }
+
         json json_payload;
         try {
             json_payload = json::parse(payload);

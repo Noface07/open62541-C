@@ -301,6 +301,7 @@ SqliteQueueService::ApiUploadWorkerLoop() {
 
             std::vector<ApiTagData> apiTagDataList;
             for(const auto &msg : messages) {
+                if (msg.payload.empty()) continue;
                 MqttPayload payload = nlohmann::json::parse(msg.payload);
 
                 long orgId = 0;
@@ -530,6 +531,7 @@ SqliteQueueService::PublishLatestValuesToMqtt(
                   << " latest values to MQTT..." << std::endl;
         int errorCount = 0;
         for(const auto &value : latestValues) {
+            if (value.payload.empty()) continue;
             try {
                 std::cout << "[SQLite] Publishing latest value for topic: " << value.topic
                           << std::endl;

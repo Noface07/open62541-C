@@ -55,14 +55,17 @@ MQTTHandler::~MQTTHandler() {
 
 bool
 MQTTHandler::connect(const std::string &broker, const std::string &port,
-                     const std::string &username, const std::string &password , const bool &protocol) {
+                     const std::string &username, const std::string &password,
+                     const bool &protocol,
+                     const std::string &clientId) {
     // Store connection details for auto-reconnect
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_broker = broker;
-    m_port = port;
+    m_broker   = broker;
+    m_port     = port;
     m_username = username;
     m_password = password;
     m_protocol = protocol;
+    m_clientId = clientId;   // Store ClientID from EdgeConfig
 
     // Post the initial connection attempt to the Asio thread
     as::post(m_ioc, [this]() { try_reconnect(); });
@@ -73,6 +76,23 @@ void
 MQTTHandler::try_reconnect() {
     if(isConnected() || m_is_connecting.exchange(true)) {
         return;
+    }
+
+    // Refresh the MQTT password (JWT token) before every connect attempt.
+    // This ensures an expired token never causes a permanent not_authorized loop.
+    if(m_passwordRefreshCallback) {
+        try {
+            std::string freshPassword = m_passwordRefreshCallback();
+            if(!freshPassword.empty()) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_password = freshPassword;
+                log("MQTT password refreshed before reconnect.", LogLevel::INFO);
+            } else {
+                log("MQTT password refresh returned empty — using existing password.", LogLevel::WARNING);
+            }
+        } catch(const std::exception& e) {
+            log("MQTT password refresh failed: " + std::string(e.what()) + " — using existing password.", LogLevel::WARNING);
+        }
     }
 
     log("Attempting to connect to MQTT broker...", LogLevel::INFO);
@@ -106,9 +126,9 @@ MQTTHandler::try_reconnect() {
                             LogLevel::WARNING);
                     }
 
-                    // 3. Start the MQTT layer handshake
+                    // 3. Start the MQTT layer handshake (MQTT v5)
                     auto connack_opt = co_await m_client->async_start(
-                        am::v5::connect_packet{true, 0x1234, "", std::nullopt, m_username,
+                        am::v5::connect_packet{true, 0x1234, m_clientId, std::nullopt, m_username,
                                                m_password},
                         as::use_awaitable);
 
@@ -159,9 +179,9 @@ MQTTHandler::try_reconnect() {
                             LogLevel::WARNING);
                     }
 
-                    // 3. Start the MQTT layer handshake
+                    // 3. Start the MQTT layer handshake (MQTT v5)
                     auto connack_opt = co_await wm_client->async_start(
-                        am::v5::connect_packet{true, 0x1234, "", std::nullopt, m_username,
+                        am::v5::connect_packet{true, 0x1234, m_clientId, std::nullopt, m_username,
                                                m_password},
                         as::use_awaitable);
 
@@ -555,4 +575,10 @@ MQTTHandler::processPendingMessages() {
             ++it;
         }
     }
+}
+
+void
+MQTTHandler::setPasswordRefreshCallback(std::function<std::string()> cb) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_passwordRefreshCallback = std::move(cb);
 }

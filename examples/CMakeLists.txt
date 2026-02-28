@@ -179,6 +179,7 @@ set(CLIENT_LIB_SOURCES
     Encryption.cpp
     Monitoring.cpp
     RedisClient.cpp
+    EdgeConfigLoader.cpp
 )
 
 # --- Define the 'client' executable ---

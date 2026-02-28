@@ -41,6 +41,7 @@
 #include "ServiceUtils.h"
 #include "RedisClient.h"
 #include "SqliteQueueService.h"
+#include "EdgeConfigLoader.h"
 #include "InstrumentedMutex.cpp"
 
 #include <async_mqtt/all.hpp>
@@ -823,12 +824,13 @@ client_st amcl_s{ioc.get_executor(), mqtt_ssl_ctx};
 using client_wt = am::client<am::protocol_version::v5, am::protocol::mqtt>;
 client_wt amcl_w{ioc.get_executor()};
 
-// Global MQTT config variables (populated from appsettings.json)
+// Global MQTT config variables (populated from appsettings.json + EdgeConfig)
 bool g_use_tls = false;
 std::string g_broker_address;
 int g_broker_port = 1883;
 std::string g_mqtt_username;
 std::string g_mqtt_password;
+std::string g_mqtt_client_id;   // MQTT ClientID from EdgeConfig
 
 // MQTT connection state and message queue for reconnection
 std::atomic<bool> g_mqtt_connected{false};
@@ -1347,21 +1349,38 @@ void start_mqtt_client(UA_Server *server) {
                 }
                 
                 try {
-               
-                    
+                    // Refresh the JWT token before every connect attempt.
+                    // This prevents permanent not_authorized when the token expires.
+                    try {
+                        log("MQTT token refresh: fetching new bearer token ...", LogLevel::INFO);
+                        json tokenResp = getBearerToken(g_apiHost, g_apiPort,
+                                                        g_authUsername, g_authPassword);
+                        if(tokenResp.contains("access_token")) {
+                            std::string freshToken = tokenResp["access_token"].get<std::string>();
+                            g_bearerToken    = freshToken;
+                            nlohmann::json pw;
+                            pw["token"]      = freshToken;
+                            g_mqtt_password  = pw.dump();
+                            log("MQTT token refresh: new token obtained.", LogLevel::INFO);
+                        } else {
+                            log("MQTT token refresh: no access_token in response, using existing password.", LogLevel::WARNING);
+                        }
+                    } catch(const std::exception& e) {
+                        log("MQTT token refresh failed: " + std::string(e.what()) + " — using existing password.", LogLevel::WARNING);
+                    }
 
                     log("Attempting to connect to MQTT broker: " + g_broker_address + ":" + std::to_string(g_broker_port) + " (TLS: " + (g_use_tls ? "true" : "false") + ")", LogLevel::INFO);
                     
                     if(g_use_tls) {
                         co_await amcl_s.async_underlying_handshake(g_broker_address, std::to_string(g_broker_port), as::use_awaitable);
                         auto connack_opt = co_await amcl_s.async_start(
-                            am::v5::connect_packet{ true, 2, "", std::nullopt, g_mqtt_username, g_mqtt_password },
+                            am::v5::connect_packet{ true, 0x1234, g_mqtt_client_id, std::nullopt, g_mqtt_username, g_mqtt_password },
                             as::use_awaitable);
                         if(!connack_opt) throw std::runtime_error("Failed to start MQTTS session");
                     } else {
                         co_await amcl_w.async_underlying_handshake(g_broker_address, std::to_string(g_broker_port), as::use_awaitable);
                         auto connack_opt = co_await amcl_w.async_start(
-                            am::v5::connect_packet{ true, 2, "", std::nullopt, g_mqtt_username, g_mqtt_password },
+                            am::v5::connect_packet{ true, 0x1234, g_mqtt_client_id, std::nullopt, g_mqtt_username, g_mqtt_password },
                             as::use_awaitable);
                         if(!connack_opt) throw std::runtime_error("Failed to start MQTT session");
                     }
@@ -1416,6 +1435,12 @@ void start_mqtt_client(UA_Server *server) {
                                     [&](client_st::publish_packet &p) {
                                     std::string topic = p.topic();
                                     std::string payload = p.payload();
+
+                                    if (payload.empty())
+                                    {
+                                        log("Empty payload received on topic: " + topic, LogLevel::INFO);
+                                        return;
+                                    }
 
                                     /* Check if this is a trigger topic for alarm conditions (.alarm.pub suffix) */
                                     std::string baseTopic = topic;
@@ -1816,6 +1841,11 @@ void start_mqtt_client(UA_Server *server) {
                                     [&](client_wt::publish_packet &p) {
                                         std::string topic = p.topic();
                                         std::string payload = p.payload();
+
+                                        if (payload.empty()){
+                                            log("Empty payload received on topic: " + topic, LogLevel::INFO);
+                                            return;
+                                        }
 
                                         /* Check if this is a trigger topic for alarm conditions (.alarm.pub suffix) */
                                         std::string baseTopic = topic;
@@ -2259,41 +2289,67 @@ int RunServer(int argc, char **argv) {
 
     // Parse JSON
     nlohmann::json Settingsconfig;
-    file >> Settingsconfig;
+    try {
+        std::cerr << "[server] Parsing appsettings.json ..." << std::endl;
+        std::string jsonStr((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+        Settingsconfig = nlohmann::json::parse(jsonStr,
+                                               /*callback=*/nullptr,
+                                               /*allow_exceptions=*/true,
+                                               /*ignore_comments=*/true);
+        std::cerr << "[server] JSON parsed OK." << std::endl;
+    } catch (const std::exception& ex) {
+        std::cerr << "[server] FATAL: appsettings.json parse error: " << ex.what() << std::endl;
+        return EXIT_FAILURE;
+    }
 
     // Extract values
-    std::cout << "Extracting configuration values..." << std::endl;
+    std::string applicationEndURL, applicationEndURLHost;
+    int applicationEndURLPort = 0;
+    bool protocol = false;
+    std::string brokerAddress;
+    int brokerPort = 15776;
 
-    // Extract AppSettings
-    std::string applicationEndURL =
-        Settingsconfig["AppSettings"]["ApplicationEndURL"].get<std::string>();
-    std::string applicationEndURLHost =
-        Settingsconfig["AppSettings"]["ApplicationEndURLHost"].get<std::string>();
-    int applicationEndURLPort =
-        Settingsconfig["AppSettings"]["ApplicationEndURLPort"].get<int>();
+    try {
+        std::cerr << "[server] Extracting AppSettings ..." << std::endl;
+        applicationEndURL     = Settingsconfig["AppSettings"]["ApplicationEndURL"].get<std::string>();
+        applicationEndURLHost = Settingsconfig["AppSettings"]["ApplicationEndURLHost"].get<std::string>();
+        applicationEndURLPort = Settingsconfig["AppSettings"]["ApplicationEndURLPort"].get<int>();
+        std::cerr << "[server] AppSettings OK." << std::endl;
 
-    // Extract MqttConfig - UseTLS is inside MqttSettings[0]
-    bool protocol = Settingsconfig["MqttConfig"]["MqttSettings"][0]["UseTLS"].get<bool>();
-    g_use_tls = protocol; // Store to global
-    std::string brokerAddress =
-        Settingsconfig["MqttConfig"]["MqttSettings"][0]["BrokerAddress"]
-            .get<std::string>();
-    g_broker_address = brokerAddress; // Store to global
-    int brokerPort =
-        Settingsconfig["MqttConfig"]["MqttSettings"][0]["BrokerPort"].get<int>();
-    g_broker_port = brokerPort; // Store to global
-    std::string mqttUsername =
-        Settingsconfig["MqttConfig"]["MqttSettings"][0]["Username"].get<std::string>();
-    g_mqtt_username = mqttUsername; // Store to global
-    std::string mqttPassword =
-        Settingsconfig["MqttConfig"]["MqttSettings"][0]["Password"].get<std::string>();
-    g_mqtt_password = mqttPassword; // Store to global
+        std::cerr << "[server] Extracting MqttConfig ..." << std::endl;
+        protocol      = Settingsconfig["MqttConfig"]["MqttSettings"][0]["UseTLS"].get<bool>();
+        brokerAddress = Settingsconfig["MqttConfig"]["MqttSettings"][0]["BrokerAddress"].get<std::string>();
+        brokerPort    = Settingsconfig["MqttConfig"]["MqttSettings"][0]["BrokerPort"].get<int>();
+        std::cerr << "[server] MqttConfig OK — broker=" << brokerAddress << ":" << brokerPort << std::endl;
+    } catch (const std::exception& ex) {
+        std::cerr << "[server] FATAL: appsettings.json key extraction error: " << ex.what() << std::endl;
+        return EXIT_FAILURE;
+    }
 
-    // Extract Authorization
-    std::string authUsername =
-        Settingsconfig["Authorization"]["Username"].get<std::string>();
-    std::string authPassword =
-        Settingsconfig["Authorization"]["Password"].get<std::string>();
+    g_use_tls        = protocol;
+    g_broker_address = brokerAddress;
+    g_broker_port    = brokerPort;
+
+    // MQTT username/password and ClientId now come from EdgeConfig (set below after bearer token)
+    // Temporary placeholders — will be overwritten after EdgeConfig is loaded
+    std::string mqttUsername;
+    std::string mqttPassword;
+
+    // Extract Authorization & NodeID — now sourced from EdgeConfig file
+    std::cerr << "[EdgeConfig] Attempting to load EdgeConfig_ND07_Server_*.txt ..." << std::endl;
+    EdgeConfigData edgeCfg;
+    try {
+        edgeCfg = LoadEdgeConfig("EdgeConfig_Server_");
+    } catch (const std::exception& ex) {
+        std::cerr << "\n[EdgeConfig] FATAL ERROR: " << ex.what() << std::endl;
+        std::cerr << "[EdgeConfig] Server cannot start without a valid EdgeConfig file." << std::endl;
+        std::cout << "STARTUP FAILED: EdgeConfig error — " << ex.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    std::string authUsername = edgeCfg.username;
+    std::string authPassword = edgeCfg.password;
+    std::string NodeID       = edgeCfg.shortCode;
 
     // Extract Payload
     std::string dbPath =
@@ -2301,8 +2357,6 @@ int RunServer(int argc, char **argv) {
     int retentionDays =
         Settingsconfig["Payload"]["OfflineQueueOptions"]["RetentionDays"].get<int>();
 
-    // Extract ConfigurationSettings
-    std::string NodeID = Settingsconfig["ConfigurationSettings"]["NodeID"].get<std::string>();
 
     // Extract RedisConfig
     std::string redisHost = Settingsconfig["RedisConfig"]["Host"].get<std::string>();
@@ -2380,6 +2434,15 @@ int RunServer(int argc, char **argv) {
         log("WARNING: All " + std::to_string(maxTokenRetries) + " bearer token attempts failed. Running in OFFLINE mode (DB fallback only).", LogLevel::WARNING);
         std::cout << "⚠️ Running in OFFLINE mode - using local database for configuration." << std::endl;
     }
+
+    // Derive MQTT credentials from EdgeConfig now that bearer token is known
+    SetEdgeConfigMqttPassword(edgeCfg, BearerToken);
+    mqttUsername      = edgeCfg.mqttUsername;
+    mqttPassword      = edgeCfg.mqttPassword;
+    g_mqtt_username   = mqttUsername;
+    g_mqtt_password   = mqttPassword;
+    g_mqtt_client_id  = edgeCfg.clientId;
+    log("MQTT credentials set from EdgeConfig (ClientId=" + edgeCfg.clientId + ")", LogLevel::INFO);
 
     // Global logging control - DISABLED BY DEFAULT
     g_logging_enabled = true;   // Keep file logging enabled
@@ -2608,6 +2671,10 @@ int RunServer(int argc, char **argv) {
     // 0. Set Global Bearer Token
     g_bearerToken = bearerToken;
     log("✓ Global Bearer Token set", LogLevel::DEBUG);
+
+    // Append the instance ID to the MQTT Client ID to ensure uniqueness across spawned instances
+    g_mqtt_client_id = g_mqtt_client_id + "_" + std::to_string(current_config.id);
+    log("Dynamic MQTT Client ID set to: " + g_mqtt_client_id, LogLevel::INFO);
 
     // 1. Override Port
     if(current_config.port > 0) {

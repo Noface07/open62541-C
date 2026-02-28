@@ -49,7 +49,9 @@ class MQTTHandler {
     // --- Public API ---
     bool
     connect(const std::string &broker, const std::string &port,
-            const std::string &username, const std::string &password , const bool &protocol);
+            const std::string &username, const std::string &password,
+            const bool &protocol,
+            const std::string &clientId = "");
     void
     disconnect();
     bool
@@ -71,6 +73,13 @@ class MQTTHandler {
     void
     setOnFailedMessageCallback(
         std::function<void(const std::vector<PendingMessage> &)> cb);
+
+    // --- Token Refresh ---
+    // Set a callback that returns a fresh MQTT password.
+    // Called automatically before every reconnect attempt so an expired JWT
+    // never causes a permanent not_authorized loop.
+    void
+    setPasswordRefreshCallback(std::function<std::string()> cb);
 
   private:
     // --- Internal Methods ---
@@ -119,7 +128,12 @@ class MQTTHandler {
     std::string m_port;
     std::string m_username;
     std::string m_password;
+    std::string m_clientId;   // MQTT CONNECT client identifier (from EdgeConfig)
     bool m_protocol;
+
+    // Optional callback to refresh the MQTT password before each reconnect.
+    // Returns a fresh password string (e.g. new JSON-wrapped JWT token).
+    std::function<std::string()> m_passwordRefreshCallback;
 
     // Asio Timer for Reconnection (replaces the manual thread)
     boost::asio::steady_timer m_reconnect_timer;

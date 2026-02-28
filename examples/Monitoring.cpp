@@ -510,8 +510,8 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
     // monRequest.requestedParameters.queueSize = myContext->infoSpace.queuesize; // Queue
     // size for notifications
     monRequest.requestedParameters.queueSize = 10000;  // Queue size for notifications
-    monRequest.requestedParameters.discardOldest =
-        false;  // Discard oldest when queue is full
+    
+    monRequest.requestedParameters.discardOldest = false;  // Discard oldest when queue is full
 
     // Configure the monitoring filter
     UA_DataChangeFilter filter;
