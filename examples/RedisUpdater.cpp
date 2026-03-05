@@ -1,4 +1,8 @@
+#ifdef _WIN32
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601 // Prevent boost/asio warning
+#endif
+#endif
 #include <iostream>
 #include <fstream>
 #include <string>

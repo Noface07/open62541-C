@@ -56,11 +56,15 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
 #include <nlohmann/json.hpp>
-#include <windows.h>
-
 #ifdef _WIN32
+#include <windows.h>
 #include <malloc.h> // For _heapmin
 #include <direct.h>  // For _getcwd
+#else
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <limits.h>
 #endif
 
 using namespace std;
@@ -75,8 +79,10 @@ using tcp = boost::asio::ip::tcp;
  UA_Boolean running = true;
 
 // Service Globals
+#ifdef _WIN32
 SERVICE_STATUS g_ServiceStatus;
 SERVICE_STATUS_HANDLE g_StatusHandle;
+#endif
 
 // MQTT Subscription Queue Globals
 std::mutex g_sub_mutex;
@@ -500,6 +506,7 @@ customActivateSession(UA_Server *server, UA_AccessControl *ac,
 //----------------------HELPER------------------//
 // ============================================================================
 // Helper to spawn a child server instance with configuration passed via Stdin
+#ifdef _WIN32
 void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config, const std::string& bearerToken, bool headless, HANDLE hJob) {
     // 0. Get Absolute Path of Self (Robust against CWD changes)
     char selfPath[MAX_PATH];
@@ -606,6 +613,81 @@ void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 }
+#else
+void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config, const std::string& bearerToken, bool headless, void* hJob) {
+    // 0. Get Absolute Path of Self (Robust against CWD changes)
+    char selfPath[PATH_MAX];
+    ssize_t count = readlink("/proc/self/exe", selfPath, PATH_MAX);
+    if (count < 0) {
+        log("SpawnChild: Failed to get self path", LogLevel::ERRORS);
+        return;
+    }
+    selfPath[count] = '\0';
+    std::string executablePath = std::string(selfPath);
+
+    // 1. Serialize Config to JSON
+    json j;
+    j["bearerToken"] = bearerToken; // Pass token to child
+    j["config"]["id"] = config.id;
+    j["config"]["name"] = config.name;
+    j["config"]["ip"] = config.ip;
+    j["config"]["port"] = config.port;
+    j["config"]["nodeId"] = config.nodeId;
+    j["config"]["orgMappings"] = json::array();
+    for(const auto& org : config.orgMappings) {
+        j["config"]["orgMappings"].push_back({
+            {"id", org.id},
+            {"hierarchyId", org.hierarchyId},
+            {"mapOrgId", org.mapOrgId},
+            {"orgShortCode", org.orgShortCode}
+        });
+    }
+
+    std::string jsonStr = j.dump();
+
+    // 2. Create Pipe for Stdin
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        log("SpawnChild: pipe failed", LogLevel::ERRORS);
+        return;
+    }
+
+    // 3. Fork Process
+    pid_t pid = fork();
+    if (pid == -1) {
+        log("SpawnChild: fork failed", LogLevel::ERRORS);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return;
+    }
+
+    if (pid == 0) {
+        // Child Process
+        close(pipefd[1]); // Close write end
+        dup2(pipefd[0], STDIN_FILENO); // Redirect stdin
+        close(pipefd[0]);
+
+        execl(executablePath.c_str(), executablePath.c_str(), "--child", NULL);
+        // If execl fails:
+        log("SpawnChild: execl failed", LogLevel::ERRORS);
+        exit(EXIT_FAILURE);
+    } else {
+        // Parent Process
+        close(pipefd[0]); // Close read end
+        
+        // 5. Write Data to Pipe
+        ssize_t written = write(pipefd[1], jsonStr.c_str(), jsonStr.size());
+        if (written < 0 || written != (ssize_t)jsonStr.size()) {
+            log("SpawnChild: Write to bad pipe", LogLevel::ERRORS);
+        }
+
+        // 6. Close Pipe (sends EOF to child)
+        close(pipefd[1]);
+        
+        log("✓ Spawned Child Instance for '" + config.name + "' (PID: " + std::to_string(pid) + ")", LogLevel::INFO);
+    }
+}
+#endif
 
 
 /**
@@ -2647,6 +2729,7 @@ int RunServer(int argc, char **argv) {
 
             // 2. Spawn Children (Instances 1..N)
             // Create Job Object to ensure child processes are terminated when parent exits
+#ifdef _WIN32
             HANDLE hJob = CreateJobObject(NULL, NULL);
             if (hJob) {
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
@@ -2655,6 +2738,9 @@ int RunServer(int argc, char **argv) {
             } else {
                 log("Failed to create Job Object. Child termination relies on manual cleanup.", LogLevel::ERRORS);
             }
+#else
+            void* hJob = nullptr;
+#endif
 
             for(size_t i = 1; i < configs.size(); i++) {
                 log("🚀 Spawning child instance details for: " + configs[i].name, LogLevel::INFO);

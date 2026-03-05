@@ -58,20 +58,24 @@ endif()
 message(STATUS "Using SQLite target: ${SQLITE3_TARGET}")
 find_package(nlohmann_json 3.2.0 REQUIRED CONFIG)
 # --- HARD OVERRIDE FOR ZLIB ---
-message(STATUS "FORCING ZLIB paths for vcpkg x64-windows...")
-
-set(ZLIB_FOUND TRUE)
-set(ZLIB_INCLUDE_DIR "D:/VCPKG/vcpkg/installed/x64-windows/include")
-set(ZLIB_LIBRARY "D:/VCPKG/vcpkg/installed/x64-windows/lib/zlib.lib")
-
-# This creates the logical name "ZLIB::ZLIB" that your other targets expect
-if(NOT TARGET ZLIB::ZLIB)
-    add_library(ZLIB::ZLIB UNKNOWN IMPORTED)
-    set_target_properties(ZLIB::ZLIB PROPERTIES
-        IMPORTED_LOCATION "${ZLIB_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${ZLIB_INCLUDE_DIR}"
-    )
-    message(STATUS "ZLIB::ZLIB target created manually.")
+if(WIN32)
+    message(STATUS "FORCING ZLIB paths for vcpkg x64-windows...")
+    
+    set(ZLIB_FOUND TRUE)
+    set(ZLIB_INCLUDE_DIR "D:/VCPKG/vcpkg/installed/x64-windows/include")
+    set(ZLIB_LIBRARY "D:/VCPKG/vcpkg/installed/x64-windows/lib/zlib.lib")
+    
+    # This creates the logical name "ZLIB::ZLIB" that your other targets expect
+    if(NOT TARGET ZLIB::ZLIB)
+        add_library(ZLIB::ZLIB UNKNOWN IMPORTED)
+        set_target_properties(ZLIB::ZLIB PROPERTIES
+            IMPORTED_LOCATION "${ZLIB_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ZLIB_INCLUDE_DIR}"
+        )
+        message(STATUS "ZLIB::ZLIB target created manually.")
+    endif()
+else()
+    find_package(ZLIB REQUIRED)
 endif()
 find_package(Threads REQUIRED)
 

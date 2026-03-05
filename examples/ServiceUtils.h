@@ -1,5 +1,7 @@
 #pragma once
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <iostream>
 #include <string>
 
@@ -15,6 +17,7 @@ int RunServer(int argc, char **argv);
 // Use inline to prevent linker errors if included in multiple places
 
 inline bool InstallService(const std::string& serviceName, const std::string& displayName) {
+#ifdef _WIN32
     std::string path;
     char buffer[MAX_PATH];
     if (GetModuleFileNameA(NULL, buffer, MAX_PATH) > 0) {
@@ -58,9 +61,14 @@ inline bool InstallService(const std::string& serviceName, const std::string& di
     CloseServiceHandle(hService);
     CloseServiceHandle(hSCManager);
     return true;
+#else
+    std::cerr << "Service installation is only supported on Windows. On Linux, please use systemd." << std::endl;
+    return false;
+#endif
 }
 
 inline bool UninstallService(const std::string& serviceName) {
+#ifdef _WIN32
     SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
     if (!hSCManager) {
         std::cerr << "OpenSCManager failed: " << GetLastError() << std::endl;
@@ -85,4 +93,8 @@ inline bool UninstallService(const std::string& serviceName) {
     CloseServiceHandle(hService);
     CloseServiceHandle(hSCManager);
     return true;
+#else
+    std::cerr << "Service uninstallation is only supported on Windows." << std::endl;
+    return false;
+#endif
 }
