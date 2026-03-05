@@ -24,6 +24,6 @@ struct ServerConfig{
     int port;
     string nodeId;
 
-    vector<orgMappings> orgMappings;
+    vector<orgMappings> orgMappingList;
 };
 

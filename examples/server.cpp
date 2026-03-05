@@ -528,7 +528,7 @@ void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config
     
     // Serialize orgMappings
     j["config"]["orgMappings"] = json::array();
-    for(const auto& org : config.orgMappings) {
+    for(const auto& org : config.orgMappingList) {
         j["config"]["orgMappings"].push_back({
             {"id", org.id},
             {"hierarchyId", org.hierarchyId},
@@ -634,7 +634,7 @@ void SpawnChildServer(const std::string& ignoredPath, const ServerConfig& config
     j["config"]["port"] = config.port;
     j["config"]["nodeId"] = config.nodeId;
     j["config"]["orgMappings"] = json::array();
-    for(const auto& org : config.orgMappings) {
+    for(const auto& org : config.orgMappingList) {
         j["config"]["orgMappings"].push_back({
             {"id", org.id},
             {"hierarchyId", org.hierarchyId},
@@ -952,9 +952,23 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
             [topic, payload]() -> as::awaitable<void> {
                 try {
                     if(g_use_tls) {
-                        co_await amcl_s.async_publish(topic, payload, am::qos::at_most_once);
+                        co_await amcl_s.async_publish(
+                            am::v5::publish_packet{
+                                static_cast<uint16_t>(0),
+                                am::allocate_buffer(topic),
+                                am::allocate_buffer(payload),
+                                am::qos::at_most_once
+                            },
+                            as::use_awaitable);
                     } else {
-                        co_await amcl_w.async_publish(topic, payload, am::qos::at_most_once);
+                        co_await amcl_w.async_publish(
+                            am::v5::publish_packet{
+                                static_cast<uint16_t>(0),
+                                am::allocate_buffer(topic),
+                                am::allocate_buffer(payload),
+                                am::qos::at_most_once
+                            },
+                            as::use_awaitable);
                     }
                 } catch(const std::exception &e) {
                     log("[MQTT-PUB] ✗ Publish error to '" + topic + "': " + e.what(), LogLevel::ERRORS);
@@ -2676,7 +2690,7 @@ int RunServer(int argc, char **argv) {
                         j["port"] = cfg.port;
                         j["nodeId"] = cfg.nodeId;
                         json mappingsArr = json::array();
-                        for(const auto& om : cfg.orgMappings) {
+                        for(const auto& om : cfg.orgMappingList) {
                             json mj;
                             mj["id"] = om.id;
                             mj["hierarchyId"] = om.hierarchyId;
@@ -2786,9 +2800,9 @@ int RunServer(int argc, char **argv) {
     // 2. Map Organizations
     // Replace legacy ParseOrgConfig call
     vector<OrgConfig> orgs;
-    if(!current_config.orgMappings.empty()) {
-        log("Mapping " + std::to_string(current_config.orgMappings.size()) + " organizations from config...", LogLevel::INFO);
-        for(const auto& map : current_config.orgMappings) {
+    if(!current_config.orgMappingList.empty()) {
+        log("Mapping " + std::to_string(current_config.orgMappingList.size()) + " organizations from config...", LogLevel::INFO);
+        for(const auto& map : current_config.orgMappingList) {
             OrgConfig org;
             org.id = map.id; // Critical for routing
             org.shortCode = map.orgShortCode; // Critical for topics?

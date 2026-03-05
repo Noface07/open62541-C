@@ -270,9 +270,9 @@ MQTTHandler::disconnect() {
         std::lock_guard<std::mutex> lock(m_mutex);
         if(m_connected) {
             if (m_protocol) {
-                m_client->async_disconnect();
+                m_client->async_disconnect([](am::error_code /*ec*/) {});
             } else {
-                wm_client->async_disconnect();
+                wm_client->async_disconnect([](am::error_code /*ec*/) {});
             }
             m_connected = false;
             if(m_disconnect_callback) {
@@ -310,23 +310,30 @@ MQTTHandler::publish(const std::string &topic, const std::string &payload) {
                     co_return;
                 }
 
-                auto completion_handler = [this, topic](am::error_code ec, auto const & /*pubres*/) {
+                auto completion_handler = [this](am::error_code ec) {
                     if(ec) {
                         log("MQTT publish error: " + ec.message(), LogLevel::ERRORS);
                         notifyDisconnected();
-                    } else {
-                        // log("Trace: Message sent (QoS 0) topic=" + topic,
-                        //     LogLevel::DEBUG);
                     }
                 };
 
                 if (m_protocol) {
                     m_client->async_publish(
-                        static_cast<uint16_t>(0), topic, payload, qos,
+                        am::v5::publish_packet{
+                            static_cast<uint16_t>(0),
+                            am::allocate_buffer(topic),
+                            am::allocate_buffer(payload),
+                            qos
+                        },
                         completion_handler);
                 } else {
                     wm_client->async_publish(
-                        static_cast<uint16_t>(0), topic, payload, qos,
+                        am::v5::publish_packet{
+                            static_cast<uint16_t>(0),
+                            am::allocate_buffer(topic),
+                            am::allocate_buffer(payload),
+                            qos
+                        },
                         completion_handler);
                 }
 

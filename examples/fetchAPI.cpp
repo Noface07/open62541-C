@@ -844,12 +844,12 @@ ServerConfigFromJSON(const json &item) {
                         mapping.hierarchyId = entry.value("hierarchyId", 0);
                         mapping.mapOrgId = entry.value("mapOrgId", 0);
                         mapping.orgShortCode = entry.value("orgShortCode", std::string{});
-                        serverConfig.orgMappings.push_back(std::move(mapping));
-                        log("DEBUG: Parsed OrgMapping - ShortCode: " +
-                                serverConfig.orgMappings.back().orgShortCode + ", ID: " +
-                                std::to_string(serverConfig.orgMappings.back().id) +
-                                ", MapOrgID: " +
-                                std::to_string(serverConfig.orgMappings.back().mapOrgId),
+                        serverConfig.orgMappingList.push_back(std::move(mapping));
+                        log("Mapped org: " +
+                                serverConfig.orgMappingList.back().orgShortCode + ", ID: " +
+                                std::to_string(serverConfig.orgMappingList.back().id) +
+                                ", MapOrgId: " +
+                                std::to_string(serverConfig.orgMappingList.back().mapOrgId),
                             LogLevel::INFO);
                     } catch(const std::exception &e) {
                         log(std::string("Error parsing orgMappings array entry: ") +
@@ -864,12 +864,12 @@ ServerConfigFromJSON(const json &item) {
                     mapping.hierarchyId = om.value("hierarchyId", 0);
                     mapping.mapOrgId = om.value("mapOrgId", 0);
                     mapping.orgShortCode = om.value("orgShortCode", std::string{});
-                    serverConfig.orgMappings.push_back(std::move(mapping));
-                    log("DEBUG: Parsed OrgMapping - ShortCode: " +
-                            serverConfig.orgMappings.back().orgShortCode + ", ID: " +
-                            std::to_string(serverConfig.orgMappings.back().id) +
-                            ", MapOrgID: " +
-                            std::to_string(serverConfig.orgMappings.back().mapOrgId),
+                    serverConfig.orgMappingList.push_back(std::move(mapping));
+                    log("Mapped org: " +
+                            serverConfig.orgMappingList.back().orgShortCode + ", ID: " +
+                            std::to_string(serverConfig.orgMappingList.back().id) +
+                            ", MapOrgId: " +
+                            std::to_string(serverConfig.orgMappingList.back().mapOrgId),
                         LogLevel::INFO);
                 } catch(const std::exception &e) {
                     log(std::string("Error parsing orgMappings object: ") + e.what(),

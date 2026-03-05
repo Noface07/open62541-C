@@ -25,6 +25,7 @@
      #include <dirent.h> // for Directory functions
  #else
      #include <unistd.h>  // For usleep(), readlink, chdir
+     #include <dirent.h>  // For opendir, readdir, closedir, DIR, dirent
      #include <sys/file.h> // flock
      #include <fcntl.h>    // open
      #include <limits.h>   // PATH_MAX
@@ -377,7 +378,7 @@ runClient(bool isService, int argc, char *argv[]) {
         int applicationEndURLPort = config["AppSettings"]["ApplicationEndURLPort"].get<int>();
 
         // Extract MqttConfig (broker address/port/TLS still from appsettings.json)
-        boolean protocol = config["MqttConfig"]["MqttSettings"][0]["UseTLS"].get<bool>();
+        bool protocol = config["MqttConfig"]["MqttSettings"][0]["UseTLS"].get<bool>();
         std::string brokerAddress = config["MqttConfig"]["MqttSettings"][0]["BrokerAddress"].get<std::string>();
         int brokerPort = config["MqttConfig"]["MqttSettings"][0]["BrokerPort"].get<int>();
         // MQTT username/password/clientId come from EdgeConfig (set after bearer token below)
