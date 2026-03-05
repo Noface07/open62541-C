@@ -26,7 +26,7 @@ struct UA_NodeId_less_than {
 /**
  * @brief Custom Hash and Equality for UA_NodeId to be used in std::unordered_map
  */
-struct UA_NodeId_hash {
+struct UA_NodeId_Hasher {
     std::size_t operator()(const UA_NodeId& id) const {
         // Simple hash combining namespace and identifier
         std::size_t h1 = std::hash<UA_UInt16>{}(id.namespaceIndex);
@@ -327,7 +327,7 @@ extern std::unordered_map<std::string, std::unordered_map<std::string, BranchSta
 
 // Optimization Maps
 extern std::unordered_map<std::string, AlarmConditionCache> g_alarmConditionCache;
-extern std::unordered_map<UA_NodeId, std::string, UA_NodeId_hash, UA_NodeId_KeyEqual> g_nodeIdToGuidMap;
+extern std::unordered_map<UA_NodeId, std::string, UA_NodeId_Hasher, UA_NodeId_KeyEqual> g_nodeIdToGuidMap;
 extern std::shared_mutex g_cache_mutex;
 
 

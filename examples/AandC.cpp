@@ -19,7 +19,7 @@ std::unordered_map<std::string, std::unordered_map<std::string, AlarmBranchInfo>
 std::unordered_map<std::string, std::unordered_map<std::string, BranchState>> g_branchStates;
 
 std::unordered_map<std::string, AlarmConditionCache> g_alarmConditionCache;
-std::unordered_map<UA_NodeId, std::string, UA_NodeId_hash, UA_NodeId_KeyEqual> g_nodeIdToGuidMap;
+std::unordered_map<UA_NodeId, std::string, UA_NodeId_Hasher, UA_NodeId_KeyEqual> g_nodeIdToGuidMap;
 std::shared_mutex g_cache_mutex;
 
 

@@ -62,6 +62,7 @@
 #include <direct.h>  // For _getcwd
 #else
 #include <unistd.h>
+#include <dirent.h>  // For opendir, readdir, closedir, DIR, dirent
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <limits.h>
