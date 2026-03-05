@@ -71,7 +71,7 @@ inline std::string generateLogFilename() {
 #if defined(_WIN32)
     localtime_s(&tm_buf, &t);
 #else
-    localtime_r(&tm_buf, &t);
+    localtime_r(&t, &tm_buf);
 #endif
     
     // Use strftime for Windows to avoid put_time issues
@@ -181,7 +181,7 @@ inline void log(const std::string &msg, LogLevel level = LogLevel::INFO) {
 #if defined(_WIN32)
     localtime_s(&tm_buf, &t);
 #else
-    localtime_r(&tm_buf, &t);
+    localtime_r(&t, &tm_buf);
 #endif
 
     const char *lvl = level == LogLevel::INFO ? "INFO" : (level == LogLevel::DEBUG ? "DEBUG" : (level == LogLevel::WARNING ? "WARNING" : "ERROR"));
