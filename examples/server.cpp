@@ -3143,6 +3143,7 @@ int RunServer(int argc, char **argv) {
 // WINDOWS SERVICE IMPLEMENTATION
 // ========================================================================
 
+#ifdef _WIN32
 void WINAPI ServiceCtrlHandler(DWORD CtrlCode) {
     switch (CtrlCode) {
     case SERVICE_CONTROL_STOP:
@@ -3215,6 +3216,7 @@ void WINAPI ServiceMain(DWORD argc, LPSTR *argv) {
     g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 }
+#endif
 
 // ========================================================================
 // ENTRY POINT
@@ -3249,6 +3251,7 @@ int main(int argc, char **argv) {
     }
 
     if(tryService) {
+#ifdef _WIN32
         SERVICE_TABLE_ENTRYA ServiceTable[] = {
             { (LPSTR)SERVICE_NAME, (LPSERVICE_MAIN_FUNCTIONA)ServiceMain },
             { NULL, NULL }
@@ -3263,6 +3266,10 @@ int main(int argc, char **argv) {
             std::cerr << "Run without --service to start in console mode." << std::endl;
             return 1;
         }
+#else
+        std::cerr << "Windows services are not supported on Linux. Please run without --service." << std::endl;
+        return 1;
+#endif
     }
 
     // 3. Normal Console / Child Mode
