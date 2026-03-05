@@ -310,7 +310,7 @@ MQTTHandler::publish(const std::string &topic, const std::string &payload) {
                     co_return;
                 }
 
-                auto completion_handler = [this](am::error_code ec) {
+                auto completion_handler = [this](am::error_code ec, auto pubres) {
                     if(ec) {
                         log("MQTT publish error: " + ec.message(), LogLevel::ERRORS);
                         notifyDisconnected();
