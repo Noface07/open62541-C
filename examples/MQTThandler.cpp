@@ -320,18 +320,16 @@ MQTTHandler::publish(const std::string &topic, const std::string &payload) {
                 if (m_protocol) {
                     m_client->async_publish(
                         am::v5::publish_packet{
-                            static_cast<uint16_t>(0),
-                            am::allocate_buffer(topic),
-                            am::allocate_buffer(payload),
+                            topic,
+                            payload,
                             qos
                         },
                         completion_handler);
                 } else {
                     wm_client->async_publish(
                         am::v5::publish_packet{
-                            static_cast<uint16_t>(0),
-                            am::allocate_buffer(topic),
-                            am::allocate_buffer(payload),
+                            topic,
+                            payload,
                             qos
                         },
                         completion_handler);

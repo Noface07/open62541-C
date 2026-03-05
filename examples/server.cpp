@@ -954,18 +954,16 @@ publish_to_mqtt(const std::string &topic, const std::string &payload) {
                     if(g_use_tls) {
                         co_await amcl_s.async_publish(
                             am::v5::publish_packet{
-                                static_cast<uint16_t>(0),
-                                am::allocate_buffer(topic),
-                                am::allocate_buffer(payload),
+                                topic,
+                                payload,
                                 am::qos::at_most_once
                             },
                             as::use_awaitable);
                     } else {
                         co_await amcl_w.async_publish(
                             am::v5::publish_packet{
-                                static_cast<uint16_t>(0),
-                                am::allocate_buffer(topic),
-                                am::allocate_buffer(payload),
+                                topic,
+                                payload,
                                 am::qos::at_most_once
                             },
                             as::use_awaitable);
