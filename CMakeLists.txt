@@ -1382,6 +1382,23 @@ add_library(open62541 $<TARGET_OBJECTS:open62541-object> $<TARGET_OBJECTS:open62
 add_dependencies(open62541-object open62541-code-generation)
 add_dependencies(open62541-plugins open62541-code-generation)
 
+# Visual Studio: open62541-object is linked with lib.exe from all .obj files. MSBuild can
+# schedule that step before the compile of huge generated sources (e.g.
+# namespace0_generated.c) finishes, or race other tools touching the same .obj — LNK1104
+# "cannot open file ... namespace0_generated.obj". Direct ProjectReference edges to each
+# generator strengthen ordering beyond the umbrella open62541-code-generation target.
+if(CMAKE_GENERATOR MATCHES "Visual Studio")
+    add_dependencies(
+        open62541-object
+        open62541-generator-types
+        open62541-generator-transport
+        open62541-generator-statuscode
+        open62541-generator-namespace)
+    if(UA_ENABLE_NODESET_INJECTOR)
+        add_dependencies(open62541-object open62541-generator-nodesetinjector)
+    endif()
+endif()
+
 # Define which code we want to coverage-track
 if(UA_ENABLE_COVERAGE)
     add_coverage(open62541-object)

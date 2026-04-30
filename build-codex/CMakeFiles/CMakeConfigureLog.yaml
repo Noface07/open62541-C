@@ -1,0 +1,135 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-3.27/Modules/CMakeDetermineSystem.cmake:211 (message)"
+      - "CMakeLists.txt:9 (project)"
+    message: |
+      The system is: Windows - 10.0.26200 - AMD64
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-3.27/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "C:/Program Files/CMake/share/cmake-3.27/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "C:/Program Files/CMake/share/cmake-3.27/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:9 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" failed.
+      Compiler:  
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      1
+      MSBuild version 17.14.19+164abd434 for .NET Framework
+      Build started 08-04-2026 11:53:55.
+      
+      Project "D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj" on node 1 (default targets).
+      PrepareForBuild:
+        Creating directory "Debug\\".
+        Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+        Creating directory "Debug\\CompilerIdC.tlog\\".
+      InitializeBuildStatus:
+        Creating "Debug\\CompilerIdC.tlog\\unsuccessfulbuild" because "AlwaysCreate" was specified.
+        Touching "Debug\\CompilerIdC.tlog\\unsuccessfulbuild".
+      VcpkgTripletSelection:
+        Using triplet "x64-windows" from "D:\\VCPKG\\vcpkg\\installed\\x64-windows\\"
+        Using normalized configuration "Release"
+      ClCompile:
+        C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\HostX64\\x64\\CL.exe /c /I"D:\\VCPKG\\vcpkg\\installed\\x64-windows\\include" /nologo /W0 /WX- /diagnostics:column /Od /D _MBCS /Gm- /EHsc /RTC1 /MDd /GS /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /Fo"Debug\\\\" /Fd"Debug\\vc143.pdb" /external:W0 /Gd /TC /FC /errorReport:queue CMakeCCompilerId.c
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001: Invalid command line switch for "CL.exe". System.ArgumentException: Item has already been added. Key in dictionary: 'Path'  Key being added: 'PATH' [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at System.Collections.Hashtable.Insert(Object key, Object nvalue, Boolean add) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at System.Diagnostics.ProcessStartInfo.get_EnvironmentVariables() [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.GetProcessStartInfo(String pathToTool, String commandLineCommands, String responseFileSwitch) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.TrackedVCToolTask.TrackerExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.TrackedVCToolTask.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.CL.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.Execute() [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      Done Building Project "D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj" (default targets) -- FAILED.
+      
+      Build FAILED.
+      
+      "D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj" (default target) (1) ->
+      (ClCompile target) -> 
+        C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001: Invalid command line switch for "CL.exe". System.ArgumentException: Item has already been added. Key in dictionary: 'Path'  Key being added: 'PATH' [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at System.Collections.Hashtable.Insert(Object key, Object nvalue, Boolean add) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at System.Diagnostics.ProcessStartInfo.get_EnvironmentVariables() [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.GetProcessStartInfo(String pathToTool, String commandLineCommands, String responseFileSwitch) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.TrackedVCToolTask.TrackerExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.TrackedVCToolTask.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.CL.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.Execute() [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      
+          0 Warning(s)
+          1 Error(s)
+      
+      Time Elapsed 00:00:00.29
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-3.27/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "C:/Program Files/CMake/share/cmake-3.27/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "C:/Program Files/CMake/share/cmake-3.27/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:9 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" failed.
+      Compiler:  
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      1
+      MSBuild version 17.14.19+164abd434 for .NET Framework
+      Build started 08-04-2026 11:53:56.
+      
+      Project "D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj" on node 1 (default targets).
+      PrepareForBuild:
+        Creating directory "Debug\\".
+        Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+        Creating directory "Debug\\CompilerIdC.tlog\\".
+      InitializeBuildStatus:
+        Creating "Debug\\CompilerIdC.tlog\\unsuccessfulbuild" because "AlwaysCreate" was specified.
+        Touching "Debug\\CompilerIdC.tlog\\unsuccessfulbuild".
+      VcpkgTripletSelection:
+        Using triplet "x64-windows" from "D:\\VCPKG\\vcpkg\\installed\\x64-windows\\"
+        Using normalized configuration "Release"
+      ClCompile:
+        C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\HostX64\\x64\\CL.exe /c /I"D:\\VCPKG\\vcpkg\\installed\\x64-windows\\include" /nologo /W0 /WX- /diagnostics:column /Od /D _MBCS /Gm- /EHsc /RTC1 /MDd /GS /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /Fo"Debug\\\\" /Fd"Debug\\vc143.pdb" /external:W0 /Gd /TC /FC /errorReport:queue CMakeCCompilerId.c
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001: Invalid command line switch for "CL.exe". System.ArgumentException: Item has already been added. Key in dictionary: 'Path'  Key being added: 'PATH' [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at System.Collections.Hashtable.Insert(Object key, Object nvalue, Boolean add) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at System.Diagnostics.ProcessStartInfo.get_EnvironmentVariables() [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.GetProcessStartInfo(String pathToTool, String commandLineCommands, String responseFileSwitch) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.TrackedVCToolTask.TrackerExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.TrackedVCToolTask.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.CL.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.Execute() [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      Done Building Project "D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj" (default targets) -- FAILED.
+      
+      Build FAILED.
+      
+      "D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj" (default target) (1) ->
+      (ClCompile target) -> 
+        C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001: Invalid command line switch for "CL.exe". System.ArgumentException: Item has already been added. Key in dictionary: 'Path'  Key being added: 'PATH' [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at System.Collections.Hashtable.Insert(Object key, Object nvalue, Boolean add) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at System.Diagnostics.ProcessStartInfo.get_EnvironmentVariables() [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.GetProcessStartInfo(String pathToTool, String commandLineCommands, String responseFileSwitch) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.TrackedVCToolTask.TrackerExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.TrackedVCToolTask.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.CPPTasks.CL.ExecuteTool(String pathToTool, String responseFileCommands, String commandLineCommands) [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Microsoft\\VC\\v170\\Microsoft.CppCommon.targets(787,5): error MSB6001:    at Microsoft.Build.Utilities.ToolTask.Execute() [D:\\OPC UA Server\\OPCUA- open 62451\\open62541-C\\build-codex\\CMakeFiles\\3.27.9\\CompilerIdC\\CompilerIdC.vcxproj]
+      
+          0 Warning(s)
+          1 Error(s)
+      
+      Time Elapsed 00:00:00.25
+      
+      
+...

@@ -21,10 +21,20 @@ using TaskScheduler = std::function<void(std::function<void()>)>;
 
  * @param attempt The current retry attempt number (default 0).
  */
+/**
+ * @brief Data-change callback invoked by the OPC UA stack for each monitored item update.
+ * Exported so batch-registration code in client.cpp can pass it as the per-item handler.
+ */
+void handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
+                              UA_UInt32 monId, void *monContext, UA_DataValue *value);
+
+/**
+ * @brief Sets up a monitored item for data changes on a specific OPC UA node.
+ */
 void MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
-            const char *nodeIdStr, int tagID, MyMonitorContext *myContext,
-            const char *overrideNamespaceUri,
-            TaskScheduler scheduler = nullptr, int attempt = 0);
+                 const char *nodeIdStr, int tagID, MyMonitorContext *myContext,
+                 const char *overrideNamespaceUri,
+                 TaskScheduler scheduler = nullptr, int attempt = 0);
 
 
 /**

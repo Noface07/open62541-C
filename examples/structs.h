@@ -3,12 +3,14 @@
 #include <vector>
 #include <string>
 #include <optional>
+#include <functional>
 #include "SqliteQueueService.h"
-#include <queue>
+#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include "MQTThandler.h" // Needed for MQTThandler pointer in AsyncPublisher
 
 using namespace std;
@@ -22,8 +24,17 @@ struct AsyncMessage {
 };
 
 class AsyncPublisher {
+    static constexpr size_t MAX_PENDING = 50000;
+
+    /** When MQTT is down, spill queued topic+wrapperJson to SQLite; return false to
+     * re-queue the message in RAM. */
+    using MqttDownSpillFn =
+        std::function<bool(const std::string &, const std::string &)>;
+
 public:
-    AsyncPublisher(MQTTHandler* handler) : mqttHandler(handler), running(true) {
+    explicit AsyncPublisher(MQTTHandler *handler,
+                            MqttDownSpillFn mqttDownSpill = nullptr)
+        : mqttHandler(handler), mqttDownSpill_(std::move(mqttDownSpill)), running(true) {
         worker = std::thread(&AsyncPublisher::processQueue, this);
     }
 
@@ -36,7 +47,9 @@ public:
     void enqueue(std::string topic, std::string payload) {
         {
             std::lock_guard<std::mutex> lock(queueMutex);
-            messageQueue.push({topic, payload});
+            if(messageDeque.size() >= MAX_PENDING)
+                messageDeque.pop_front();
+            messageDeque.push_back({std::move(topic), std::move(payload)});
         }
         cv.notify_one();
     }
@@ -45,29 +58,64 @@ private:
     void processQueue() {
         while (running) {
             std::unique_lock<std::mutex> lock(queueMutex);
-            cv.wait(lock, [this] { return !messageQueue.empty() || !running; });
+            /* wait_for: when MQTT is down we re-queue below; without a timeout the
+             * thread would sleep until another enqueue() even though the broker
+             * may have reconnected. */
+            cv.wait_for(lock, std::chrono::milliseconds(500),
+                        [this] { return !messageDeque.empty() || !running; });
 
-            while (!messageQueue.empty()) {
-                // Process batch or single? Single for now as per design
-                AsyncMessage msg = messageQueue.front();
-                messageQueue.pop();
-                
-                lock.unlock(); // Improve concurrency
-                
-                if (mqttHandler && mqttHandler->isConnected()) {
-                    mqttHandler->publish(msg.topic, msg.payload);
+            if (!running && messageDeque.empty()) break;
+
+            std::deque<AsyncMessage> localBatch;
+            std::swap(messageDeque, localBatch);
+            lock.unlock();
+
+            if (localBatch.empty()) continue;
+
+            if (mqttHandler && mqttHandler->isConnected()) {
+                std::vector<std::pair<std::string, std::string>> batchMsgs;
+                batchMsgs.reserve(localBatch.size());
+
+                while (!localBatch.empty()) {
+                    AsyncMessage msg = std::move(localBatch.front());
+                    localBatch.pop_front();
+                    batchMsgs.push_back({std::move(msg.topic), std::move(msg.payload)});
                 }
-                
-                if(running) lock.lock(); 
+                mqttHandler->publishBatch(std::move(batchMsgs));
+            } else if (mqttDownSpill_) {
+                std::deque<AsyncMessage> toRequeue;
+                while (!localBatch.empty()) {
+                    AsyncMessage msg = std::move(localBatch.front());
+                    localBatch.pop_front();
+                    if (!mqttDownSpill_(msg.topic, msg.payload))
+                        toRequeue.push_back(std::move(msg));
+                }
+                if (!toRequeue.empty()) {
+                    std::lock_guard<std::mutex> relock(queueMutex);
+                    for (auto it = toRequeue.rbegin(); it != toRequeue.rend(); ++it) {
+                        if (messageDeque.size() >= MAX_PENDING)
+                            messageDeque.pop_front();
+                        messageDeque.push_front(std::move(*it));
+                    }
+                }
+            } else {
+                /* No spill: hold in RAM until MQTT returns. */
+                std::lock_guard<std::mutex> relock(queueMutex);
+                for (auto it = localBatch.rbegin(); it != localBatch.rend(); ++it) {
+                    if (messageDeque.size() >= MAX_PENDING)
+                        messageDeque.pop_front();
+                    messageDeque.push_front(std::move(*it));
+                }
             }
         }
     }
 
-    std::queue<AsyncMessage> messageQueue;
+    std::deque<AsyncMessage> messageDeque;
     std::mutex queueMutex;
     std::condition_variable cv;
     std::thread worker;
-    MQTTHandler* mqttHandler;
+    MQTTHandler *mqttHandler;
+    MqttDownSpillFn mqttDownSpill_;
     std::atomic<bool> running;
 };
 
@@ -172,6 +220,7 @@ struct MyMonitorContext {
     SqliteQueueService* sqliteService;
     std::shared_ptr<ExprTkContext> exprContext;
     std::shared_ptr<AsyncPublisher> asyncPublisher; // Helper for non-blocking publish
+    std::function<void(std::function<void()>)> postWorkerTask;
     // unordered_map<int, string> TopicMapping;
     // json payload;
     // Add more fields as needed

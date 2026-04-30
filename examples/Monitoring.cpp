@@ -1,4 +1,4 @@
-﻿#include <open62541/client_config_default.h>
+#include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
 #include <open62541/plugin/log_stdout.h>
 
@@ -26,7 +26,7 @@
 #include <nlohmann/json.hpp>
 
 using namespace std;
-using json = nlohmann::ordered_json;
+using json = nlohmann::json;
 
 #ifdef UA_ENABLE_SUBSCRIPTIONS
 
@@ -48,7 +48,7 @@ ScaleValue(double rawValue, double rawMin, double rawMax, double scaleMin,
 
 // Removed EvaluateExpression - logic moved to pre-compiled context
 
-static void
+void
 handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
                          UA_UInt32 monId, void *monContext, UA_DataValue *value) {
     auto *myContext = static_cast<MyMonitorContext *>(monContext);
@@ -56,6 +56,27 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
         log("Monitoring context is null!", LogLevel::ERRORS);
         return;
     }
+
+    if (!myContext->postWorkerTask) {
+        log("postWorkerTask is not configured!", LogLevel::ERRORS);
+        return;
+    }
+
+    UA_DataValue *copiedValue = UA_DataValue_new();
+    UA_DataValue_copy(value, copiedValue);
+
+    myContext->postWorkerTask([myContext, copiedValue]() {
+        // Redefine locally so existing code works unchanged
+        UA_DataValue *value = copiedValue;
+
+        // Cleanup struct ensures memory is freed even if exceptions occur
+        struct ValueCleanup {
+            UA_DataValue* ptr;
+            ~ValueCleanup() {
+                UA_DataValue_clear(ptr);
+                UA_DataValue_delete(ptr);
+            }
+        } cleanup{copiedValue};
 
     MqttPayload p;
     // p.datapointId = myContext->infoSpace.tagId; // Assuming tagId is int? Check struct
@@ -284,29 +305,29 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
     p.timeStamp = buffer;  // Allocation here is hard to avoid without changing
                            // MqttPayload to use char array
 
-    // Publish or queue
-    // Direct check avoids function call overhead if simple getter
-    // Publish or queue
-    // Async Path (Preferred)
-    if(myContext->asyncPublisher) {
-        json data = {{"TagId", p.tagId},
-                     {"Value", p.value},
-                     {"TagType", p.tagType},
-                     {"TimeStamp", p.timeStamp},
-                     {"Source", p.source},
-                     {"DatapointId", p.datapointId},
-                     {"InfoId", p.infoId},
-                     {"Quality", p.quality},
-                     {"UpdateType", static_cast<int>(UpdateType::Telemetry)}};
+    const std::string topic = myContext->infoSpace.namespaces;
+    long orgId = myContext->infoSpace.orgId > 0 ? (long)myContext->infoSpace.orgId : 1;
 
-        json payload;
-        payload["Data"] = json::array({data});
+    json data = {{"TagId", p.tagId},
+                 {"Value", p.value},
+                 {"TagType", p.tagType},
+                 {"TimeStamp", p.timeStamp},
+                 {"Source", p.source},
+                 {"DatapointId", p.datapointId},
+                 {"InfoId", p.infoId},
+                 {"Quality", p.quality},
+                 {"UpdateType", static_cast<int>(UpdateType::Telemetry)}};
 
-        myContext->asyncPublisher->enqueue(myContext->infoSpace.namespaces,
-                                           payload.dump());
-    }
-    // Fallback: Synchronous (Blocking) Path
-    else if(myContext->mqttHandler && myContext->mqttHandler->isConnected()) {
+    json payload;
+    payload["Data"] = json::array({data});
+
+    /* MQTT down: persist directly to SQLite (same path as offline queue / bulk API). */
+    if(myContext->mqttHandler && !myContext->mqttHandler->isConnected() &&
+       myContext->sqliteService) {
+        myContext->sqliteService->EnqueueMessage(topic, p, orgId);
+    } else if(myContext->asyncPublisher) {
+        myContext->asyncPublisher->enqueue(topic, payload.dump());
+    } else if(myContext->mqttHandler && myContext->mqttHandler->isConnected()) {
         // Construct JSON manually or use library - library adds overhead but ensures
         // correctness. Assuming nlohmann::json is efficient enough. Improvement: Reuse a
         // thread-local json object to avoid repeated allocations? For now, struct
@@ -318,22 +339,21 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
         // TODO: Add macro based logging to avoid string construction if level not met.
         // Keeping existing log logic for safety.
 
-        json data = {{"TagId", p.tagId},     {"Value", p.value},
-                     {"TagType", p.tagType}, {"TimeStamp", p.timeStamp},
-                     {"Source", p.source},   {"DatapointId", p.datapointId},
-                     {"InfoId", p.infoId},   {"Quality", p.quality},
-                     {"UpdateType", 1}};
+        json dataSync = {{"TagId", p.tagId},     {"Value", p.value},
+                         {"TagType", p.tagType}, {"TimeStamp", p.timeStamp},
+                         {"Source", p.source},   {"DatapointId", p.datapointId},
+                         {"InfoId", p.infoId},   {"Quality", p.quality},
+                         {"UpdateType", 1}};
 
-        json payload;
-        payload["Data"] = json::array({data});
+        json payloadSync;
+        payloadSync["Data"] = json::array({dataSync});
 
-        myContext->mqttHandler->publish(myContext->infoSpace.namespaces, payload.dump());
+        myContext->mqttHandler->publish(topic, payloadSync.dump());
 
     } else if(myContext->sqliteService) {
-        long orgId = 1;
-        myContext->sqliteService->EnqueueMessage(myContext->infoSpace.namespaces, p,
-                                                 orgId);
+        myContext->sqliteService->EnqueueMessage(topic, p, orgId);
     }
+    });
 }
 
 #endif
@@ -517,7 +537,7 @@ MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
     UA_DataChangeFilter filter;
 
     if(myContext->infoSpace.deadband > 0) {
-        filter.deadbandType = UA_DEADBANDTYPE_PERCENT;
+        filter.deadbandType = UA_DEADBANDTYPE_ABSOLUTE;
         filter.deadbandValue = myContext->infoSpace.deadband;
     } else {
         filter.deadbandType = UA_DEADBANDTYPE_NONE;

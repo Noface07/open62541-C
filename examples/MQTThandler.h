@@ -57,6 +57,8 @@ class MQTTHandler {
     bool
     publish(const std::string &topic, const std::string &payload);
     bool
+    publishBatch(std::vector<std::pair<std::string, std::string>> messages);
+    bool
     subscribe(const std::string &topic);
     bool
     subscribeBatch(const std::vector<std::string> &topics);

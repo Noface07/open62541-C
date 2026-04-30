@@ -179,6 +179,7 @@ endmacro()
 set(CLIENT_LIB_SOURCES
     MQTThandler.cpp
     SqliteQueueService.cpp
+    TelemetrySpill.cpp
     fetchAPI.cpp
     Encryption.cpp
     Monitoring.cpp

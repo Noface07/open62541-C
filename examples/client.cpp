@@ -6,10 +6,12 @@
  #include <open62541/client_subscriptions.h>
  #include <open62541/plugin/log_stdout.h>
  
- #include <atomic>
- #include <chrono>
- #include <csignal>
- #include <functional>
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <csignal>
+#include <functional>
  #include <future>
  #include <iomanip>
  #include <iostream>
@@ -44,6 +46,7 @@
 #include "RedisClient.h"
 #include "alarm_enums.h"
 #include "EdgeConfigLoader.h"
+#include "TelemetrySpill.h"
 
 using namespace std;
 
@@ -83,6 +86,78 @@ static void LogEventWord(WORD type, const char *msg);
 
 static void SetWorkingDirectoryToExe();
 
+struct ClientCliOptions {
+    bool debug = false;
+    std::string instanceId;
+};
+
+static std::string
+sanitizeInstanceId(const std::string &raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for(unsigned char ch : raw) {
+        if(std::isalnum(ch) || ch == '_' || ch == '-') {
+            out.push_back(static_cast<char>(ch));
+        } else {
+            out.push_back('_');
+        }
+    }
+
+    // Keep names bounded to avoid overly long mutex/file names.
+    constexpr size_t MAX_LEN = 48;
+    if(out.size() > MAX_LEN)
+        out.resize(MAX_LEN);
+
+    return out;
+}
+
+static ClientCliOptions
+parseClientCliOptions(int argc, char *argv[]) {
+    ClientCliOptions opts;
+    std::string rawInstanceId;
+
+    for(int i = 1; i < argc; ++i) {
+        std::string arg = argv[i] ? argv[i] : "";
+        if(arg == "--debug") {
+            opts.debug = true;
+            continue;
+        }
+
+        if(arg == "--instance-id") {
+            if(i + 1 < argc && argv[i + 1]) {
+                rawInstanceId = argv[++i];
+            } else {
+                std::cerr << "WARNING: --instance-id provided without a value."
+                          << std::endl;
+            }
+            continue;
+        }
+
+        const std::string prefix = "--instance-id=";
+        if(arg.rfind(prefix, 0) == 0) {
+            rawInstanceId = arg.substr(prefix.size());
+        }
+    }
+
+    opts.instanceId = sanitizeInstanceId(rawInstanceId);
+    return opts;
+}
+
+static std::string
+appendInstanceSuffixToPath(const std::string &path, const std::string &instanceId) {
+    if(instanceId.empty())
+        return path;
+
+    size_t lastSlash = path.find_last_of("/\\");
+    size_t lastDot = path.find_last_of('.');
+    if(lastDot == std::string::npos ||
+       (lastSlash != std::string::npos && lastDot < lastSlash)) {
+        return path + "_" + instanceId;
+    }
+
+    return path.substr(0, lastDot) + "_" + instanceId + path.substr(lastDot);
+}
+
 void
 stopHandler(int signum) {
     log("Received signal " + std::to_string(signum) + ", shutting down...");
@@ -103,27 +178,44 @@ struct ClientContext {
     std::unique_ptr<UA_Client, UA_Client_Deleter> client;
     std::map<std::string, UA_CreateSubscriptionResponse> subscriptions;
     std::atomic<bool> running;
-    bool isConnected;
-    std::thread thread;
+    std::atomic<bool> isConnected;
+
+    // Thread 1: OPC UA network loop (run_iterate + OPC writes)
+    std::thread opcThread;
+    // Thread pool: general workers (non-OPC tasks: MQTT, DB, JSON parsing, etc.)
+    static constexpr int WORKER_COUNT = 32;
+    std::vector<std::thread> workers;
+
+    // Queue for non-OPC tasks — consumed by workerThread
     std::mutex taskMutex;
+    std::condition_variable taskCv;
     std::queue<std::function<void()>> taskQueue;
 
-    // new:
+    // Queue for OPC UA operations — consumed ONLY by opcThread (no UA_Client sharing)
+    std::mutex opcMutex;
+    std::queue<std::function<void()>> opcQueue;
+
     std::function<UA_StatusCode()> connectOnce;
     std::function<void()> onConnected;
+    static constexpr size_t MAX_OPC_TASKS_PER_TICK = 256;
 
     ClientContext() : running(true), isConnected(false) {}
 
     void
     startLoop() {
-        thread = std::thread([this]() {
-            log("Thread started for" + name, LogLevel::DEBUG);
+        // ── Thread 1: OPC UA network loop ────────────────────────────────────
+        // Exclusively owns UA_Client*. Calls run_iterate every ~10 ms and
+        // drains opcQueue (OPC UA writes posted from the worker thread).
+        opcThread = std::thread([this]() {
+            log("OPC thread started for " + name, LogLevel::DEBUG);
+
             while(running) {
-                if(!isConnected) {
+                // ── reconnect logic ──────────────────────────────────────────
+                if(!isConnected.load(std::memory_order_acquire)) {
                     if(connectOnce) {
                         UA_StatusCode rc = connectOnce();
                         if(rc == UA_STATUSCODE_GOOD) {
-                            isConnected = true;
+                            isConnected.store(true, std::memory_order_release);
                             if(onConnected) onConnected();
                             log("Connected to " + endpoint);
                         } else {
@@ -136,47 +228,137 @@ struct ClientContext {
                     }
                 }
 
+                // ── null-client guard ────────────────────────────────────────
+                if(!client) {
+                    log(name + ": Client is null, reconnecting...", LogLevel::ERRORS);
+                    isConnected.store(false, std::memory_order_release);
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    continue;
+                }
+
+                // ── opcQueue backlog diagnostic ──────────────────────────────
                 {
-                    std::lock_guard<std::mutex> lock(taskMutex);
-                    while(!taskQueue.empty()) {
-                        auto task = std::move(taskQueue.front());
-                        taskQueue.pop();
-                        task();
+                    std::lock_guard<std::mutex> lock(opcMutex);
+                    if(opcQueue.size() > 1000) {
+                        log(name + ": opcQueue backlog: " +
+                                std::to_string(opcQueue.size()),
+                            LogLevel::INFO);
                     }
                 }
-                
-                                // ADD NULL CHECK HERE
-                                if (!client) {
-                                    log(name + ": Client is null, reconnecting...", LogLevel::ERRORS);
-                                    isConnected = false;
-                                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                                    continue;
-                                }
 
-                UA_StatusCode code = UA_Client_run_iterate(client.get(), 100);
+                // ── drain ALL pending OPC tasks per iteration ────────────────
+                // MonitorItem setup tasks are fast (microsecond SDK calls) and
+                // must all complete quickly. Control writes are rare MQTT events.
+                // All UA_Client_* access is safe here: exclusively on opcThread.
+                for(size_t i = 0; i < MAX_OPC_TASKS_PER_TICK; ++i) {
+                    std::function<void()> opcTask;
+                    {
+                        std::lock_guard<std::mutex> lock(opcMutex);
+                        if(opcQueue.empty())
+                            break;
+                        opcTask = std::move(opcQueue.front());
+                        opcQueue.pop();
+                    }
+                    try {
+                        opcTask();
+                    } catch(...) {
+                        log(name + ": opcTask threw exception", LogLevel::ERRORS);
+                    }
+                }
+
+                // ── OPC UA network tick ──────────────────────────────────────
+                UA_StatusCode code = UA_Client_run_iterate(client.get(), 10);
                 if(code != UA_STATUSCODE_GOOD) {
-                    log(name + ": UA_Client_run_iterate failed with " +
-                            UA_StatusCode_name(code), LogLevel::ERRORS);
+                    log(name + ": UA_Client_run_iterate failed: " +
+                            std::string(UA_StatusCode_name(code)),
+                        LogLevel::ERRORS);
                     UA_Client_disconnect(client.get());
-
-                    client.reset(); 
-
-
-                    isConnected = false;
-                    // optional: clear subscriptions to avoid duplicates
+                    client.reset();
+                    isConnected.store(false, std::memory_order_release);
                     subscriptions.clear();
                     std::this_thread::sleep_for(std::chrono::seconds(5));
+                    continue;
                 }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
-            log("Thread exiting for " + name);
+            log("OPC thread exiting for " + name);
         });
+
+        // ── Thread pool: WORKER_COUNT general workers ─────────────────────────
+        // Drain taskQueue in parallel. Tasks must NOT call UA_Client_* functions.
+        // If a task needs an OPC UA operation, push a lambda via postOpcTask().
+        workers.reserve(WORKER_COUNT);
+        for(int i = 0; i < WORKER_COUNT; ++i) {
+            workers.emplace_back([this, i]() {
+                log("Worker[" + std::to_string(i) + "] started for " + name,
+                    LogLevel::DEBUG);
+
+                while(running) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(taskMutex);
+                        taskCv.wait(lock,
+                                    [this]{ return !taskQueue.empty() || !running; });
+
+                        if(!running && taskQueue.empty()) break;
+
+                        if(!taskQueue.empty()) {
+                            task = std::move(taskQueue.front());
+                            taskQueue.pop();
+                        }
+                    }
+
+                    if(task) {
+                        try {
+                            auto start = std::chrono::steady_clock::now();
+                            task();
+                            auto ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count();
+                            if(ms > 200) {
+                                log(name + ": Worker[" + std::to_string(i) +
+                                        "] SLOW TASK " + std::to_string(ms) + " ms",
+                                    LogLevel::INFO);
+                            }
+                        } catch(...) {
+                            log(name + ": Worker[" + std::to_string(i) +
+                                    "] task threw exception",
+                                LogLevel::ERRORS);
+                        }
+                    }
+                }
+                log("Worker[" + std::to_string(i) + "] exiting for " + name,
+                    LogLevel::DEBUG);
+            });
+        }
+    }
+
+    // Helper: push an OPC UA write/read operation — called from workerThread tasks.
+    // The lambda will execute on the OPC thread where UA_Client* is safe to use.
+    void postOpcTask(std::function<void()> fn) {
+        std::lock_guard<std::mutex> lock(opcMutex);
+        opcQueue.push(std::move(fn));
+    }
+
+    // Helper: push a general (non-OPC) task and wake the worker thread.
+    void postTask(std::function<void()> fn) {
+        {
+            std::lock_guard<std::mutex> lock(taskMutex);
+            taskQueue.push(std::move(fn));
+        }
+        taskCv.notify_one();
     }
 
     void stopLoop() {
         running = false;
-        if(thread.joinable()) {
-            thread.join();
-        }
+        taskCv.notify_all(); // wake all worker threads
+        if(opcThread.joinable())
+            opcThread.join();
+        for(auto &w : workers)
+            if(w.joinable()) w.join();
+        workers.clear();
     }
 };
 
@@ -350,6 +532,7 @@ static int
 runClient(bool isService, int argc, char *argv[]) {
 
     SetWorkingDirectoryToExe(); // ensure CWD is the exe folder
+    ClientCliOptions cliOptions = parseClientCliOptions(argc, argv);
 
     std::ifstream file("appsettings.json");
     if (!file.is_open()) {
@@ -406,6 +589,9 @@ runClient(bool isService, int argc, char *argv[]) {
         std::string dbPath = config["Payload"]["OfflineQueueOptions"]["DbPath"].get<std::string>();
         int retentionDays = config["Payload"]["OfflineQueueOptions"]["RetentionDays"].get<int>();
         int retryBatchSize = config["Payload"]["OfflineQueueOptions"]["RetryBatchSize"].get<int>();
+        if(!cliOptions.instanceId.empty()) {
+            dbPath = appendInstanceSuffixToPath(dbPath, cliOptions.instanceId);
+        }
 
         // Extract RedisConfig
         std::string redisHost = config["RedisConfig"]["Host"].get<std::string>();
@@ -427,7 +613,11 @@ runClient(bool isService, int argc, char *argv[]) {
 
 
         #ifdef _WIN32
-    HANDLE hMutex = CreateMutexA(NULL, TRUE, "Global\\AnexeeMutex");
+    std::string mutexName = "Global\\AnexeeMutex";
+    if(!cliOptions.instanceId.empty()) {
+        mutexName += "_" + cliOptions.instanceId;
+    }
+    HANDLE hMutex = CreateMutexA(NULL, TRUE, mutexName.c_str());
 
     if(hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
         if(!isService) {
@@ -437,7 +627,12 @@ runClient(bool isService, int argc, char *argv[]) {
         return 1;  // Exit immediately
     }
     #else
-    int lockFd = open("/tmp/anexee-opcua-client.lock", O_CREAT | O_RDWR, 0666);
+    std::string lockFilePath = "/tmp/anexee-opcua-client";
+    if(!cliOptions.instanceId.empty()) {
+        lockFilePath += "-" + cliOptions.instanceId;
+    }
+    lockFilePath += ".lock";
+    int lockFd = open(lockFilePath.c_str(), O_CREAT | O_RDWR, 0666);
     if(lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
         log("Another instance is already running (lock file)", LogLevel::ERRORS);
         if(lockFd >= 0) close(lockFd);
@@ -463,20 +658,25 @@ runClient(bool isService, int argc, char *argv[]) {
 
     // Global logging control - only enable file logging with --debug
     g_logging_enabled = false; // Default: no file logging
-    
-    if(argc > 1 && std::string(argv[1]) == "--debug") {
-        g_debug = true;
-        g_logging_enabled = true; // Enable file logging in debug mode
-    } else {
-        g_debug = false;
-    }
-    
+
+    g_debug = cliOptions.debug;
+    g_logging_enabled = cliOptions.debug; // Enable file logging in debug mode
+
     // Initialize logging with client-specific folder (only if logging is enabled)
-    init_logging("logs/client", "client", true);
+    std::string logFolder = "logs/client";
+    std::string logAppName = "client";
+    if(!cliOptions.instanceId.empty()) {
+        logFolder = "logs/client_" + cliOptions.instanceId;
+        logAppName = "client_" + cliOptions.instanceId;
+    }
+    init_logging(logFolder, logAppName, true);
     if (g_logging_enabled) {
         log("Client logging initialized with day-wise log files", LogLevel::INFO);
     } else {
         std::cout << "Client started - no file logging (use --debug to enable)" << std::endl;
+    }
+    if(!cliOptions.instanceId.empty()) {
+        log("Instance mode enabled: " + cliOptions.instanceId, LogLevel::INFO);
     }
     
     if(g_debug && !isService) {
@@ -503,6 +703,12 @@ runClient(bool isService, int argc, char *argv[]) {
 
     // Derive MQTT credentials from EdgeConfig now that bearer token is known
     SetEdgeConfigMqttPassword(edgeCfg, BearerToken);
+    if(!cliOptions.instanceId.empty()) {
+        if(edgeCfg.clientId.empty()) {
+            edgeCfg.clientId = "AnexeeClient";
+        }
+        edgeCfg.clientId += "_" + cliOptions.instanceId;
+    }
     mqttUsername = edgeCfg.mqttUsername;
     mqttPassword = edgeCfg.mqttPassword;
     log("MQTT credentials set from EdgeConfig (ClientId=" + edgeCfg.clientId + ")", LogLevel::INFO);
@@ -717,8 +923,16 @@ runClient(bool isService, int argc, char *argv[]) {
         log("MQTT handler initialized successfully", LogLevel::INFO);
         
         // Initialize Async Publisher
-        g_asyncPublisher = std::make_shared<AsyncPublisher>(g_mqttHandler);
-        log("AsyncPublisher initialized.", LogLevel::INFO);
+        g_asyncPublisher = std::make_shared<AsyncPublisher>(
+            g_mqttHandler,
+            [&dpToOrg](const std::string &topic, const std::string &wrapper) -> bool {
+                if(!g_sqliteService)
+                    return false;
+                return TryEnqueueTelemetryWrapper(topic, wrapper, g_sqliteService,
+                                                  dpToOrg);
+            });
+        log("AsyncPublisher initialized (MQTT-down spill to SQLite enabled).",
+            LogLevel::INFO);
         
         // Connect MQTTHandler with SqliteQueueService for proper state management
         if (g_sqliteService) {
@@ -737,13 +951,10 @@ runClient(bool isService, int argc, char *argv[]) {
                 log("CLIENT CALLBACK: About to call PublishLatestValuesToMqtt...", LogLevel::INFO);
                 g_sqliteService->PublishLatestValuesToMqtt(
                     [](const std::string& topic, const std::string& payload) {
-                        log("CLIENT CALLBACK LAMBDA: Publishing to topic: " + topic + " with payload size: " + std::to_string(payload.size()), LogLevel::INFO);
                         if (g_mqttHandler) {
-                            log("CLIENT CALLBACK LAMBDA: Calling g_mqttHandler->publish", LogLevel::INFO);
-                            bool result = g_mqttHandler->publish(topic, payload);
-                            log("CLIENT CALLBACK LAMBDA: Publish result: " + std::string(result ? "SUCCESS" : "FAILED"), LogLevel::INFO);
+                            (void)g_mqttHandler->publish(topic, payload);
                         } else {
-                            log("CLIENT CALLBACK LAMBDA: g_mqttHandler is null!", LogLevel::ERRORS);
+                            log("CLIENT CALLBACK: g_mqttHandler is null during replay publish.", LogLevel::ERRORS);
                         }
                     }
                 );
@@ -778,50 +989,27 @@ runClient(bool isService, int argc, char *argv[]) {
             int successCount = 0;
             int errorCount = 0;
             
-            for (const auto& msg : failedMessages) {
+            for(const auto &msg : failedMessages) {
                 try {
-                    if (msg.payload.empty()){
-                        log("Empty payload received on topic: " + msg.topic, LogLevel::INFO);
+                    if(msg.payload.empty()) {
+                        log("Empty payload received on topic: " + msg.topic,
+                            LogLevel::INFO);
                         continue;
                     }
-                    // Parse the JSON payload to extract the MqttPayload data
-                    nlohmann::json payload = nlohmann::json::parse(msg.payload);
-                    if (payload.contains("Data") && payload["Data"].is_array() && !payload["Data"].empty()) {
-                        auto data = payload["Data"][0];
-                        
-                        MqttPayload p;
-                        p.datapointId = data.value("DatapointId", 0);
-                        p.name = ""; // We don't have the name in the JSON
-                        p.tagId = data.value("TagId", 0);
-                        p.tagType = data.value("TagType", "INFO_DCR");
-                        p.source = data.value("Source", static_cast<int>(AlarmSource::AEEngine));
-                        p.infoId = data.value("InfoId", 1001);
-                        p.value = data["Value"];
-                        p.timeStamp = data.value("TimeStamp", "");
-                        p.quality = data.value("Quality", static_cast<int>(AlarmQuality::Good));
-                        p.UpdateType = data.value("UpdateType", static_cast<int>(UpdateType::Telemetry));
-                        
-                        // Improved orgId lookup with proper fallback
-                        long orgId = 1; // default fallback
-                        if (p.datapointId > 0) { 
-                            auto it = dpToOrg.find(p.datapointId);
-                            if (it != dpToOrg.end()) {
-                                orgId = it->second;
-                                log("Found orgId " + std::to_string(orgId) + " for datapointId " + std::to_string(p.datapointId), LogLevel::DEBUG);
-                            } else {
-                                log("No orgId mapping found for datapointId " + std::to_string(p.datapointId) + ", using fallback", LogLevel::INFO);
-                            }
-                        }
-                        
-                        g_sqliteService->EnqueueMessage(msg.topic, p, orgId);
+                    if(TryEnqueueTelemetryWrapper(msg.topic, msg.payload, g_sqliteService,
+                                                  dpToOrg)) {
                         successCount++;
-                        log("Queued failed message to database: " + msg.topic + " (orgId: " + std::to_string(orgId) + ")", LogLevel::DEBUG);
+                        log("Queued failed message to database: " + msg.topic,
+                            LogLevel::DEBUG);
                     } else {
-                        log("Failed message has invalid JSON structure: " + msg.payload, LogLevel::ERRORS);
+                        log("Failed message has invalid JSON structure: " + msg.payload,
+                            LogLevel::ERRORS);
                         errorCount++;
                     }
-                } catch (const std::exception& e) {
-                    log("Failed to parse failed message payload: " + std::string(e.what()) + " | Payload: " + msg.payload, LogLevel::ERRORS);
+                } catch(const std::exception &e) {
+                    log("Failed to parse failed message payload: " +
+                            std::string(e.what()) + " | Payload: " + msg.payload,
+                        LogLevel::ERRORS);
                     errorCount++;
                 }
             }
@@ -998,6 +1186,14 @@ runClient(bool isService, int argc, char *argv[]) {
         UA_String_clear(&config->clientDescription.applicationUri);
         config->clientDescription.applicationUri =
             UA_STRING_ALLOC("urn:Anexee.client.application");
+
+        // With many subscriptions, default 10 outstanding PublishRequests can starve
+        // keep-alives and trigger widespread "Inactivity for Subscription" events.
+        const size_t expectedSubCount = server.groups.size() + 1; // + event subscription
+        config->outStandingPublishRequests =
+            static_cast<UA_UInt16>(std::clamp<size_t>(expectedSubCount, 20, 256));
+        if(config->timeout < 30000)
+            config->timeout = 30000; // widen inactivity threshold under heavy load
     
         // --- Start of Corrected Security Logic ---
     
@@ -1226,8 +1422,7 @@ runClient(bool isService, int argc, char *argv[]) {
 
         std::string orgShortCode = profile.currentOrgCode;
 
-        std:
-        string NamespaceURI = "Anexee:" + orgShortCode;
+        std::string NamespaceURI = "Anexee:" + orgShortCode;
         //------------------------------------------------------------------------------------------
 
         context->onConnected = [ctx = context.get(), server = server_copy,
@@ -1243,12 +1438,16 @@ runClient(bool isService, int argc, char *argv[]) {
             // group subscriptions 
             for(const auto &group : server.groups) {
                 UA_CreateSubscriptionRequest greq = UA_CreateSubscriptionRequest_default();
-                //greq.requestedMaxKeepAliveCount = group.maxKeepAliveCount;
-                greq.requestedMaxKeepAliveCount = 40;
+                UA_UInt32 requestedKeepAlive =
+                    (group.maxKeepAliveCount > 0) ? (UA_UInt32)group.maxKeepAliveCount : 40;
                 greq.requestedPublishingInterval = group.publishingInterval;
-                //greq.requestedPublishingInterval = 50;
-                //greq.requestedLifetimeCount = group.lifetimeCount;
-                greq.requestedLifetimeCount = 120;
+                UA_UInt32 requestedLifetime =
+                    (group.lifetimeCount > 0) ? (UA_UInt32)group.lifetimeCount
+                                              : (requestedKeepAlive * 3);
+                if(requestedLifetime < (requestedKeepAlive * 3))
+                    requestedLifetime = requestedKeepAlive * 3;
+                greq.requestedMaxKeepAliveCount = requestedKeepAlive;
+                greq.requestedLifetimeCount = requestedLifetime;
                 greq.priority = group.priority;
                 greq.maxNotificationsPerPublish = group.maxNotificationsPerPublish;
                 //greq.maxNotificationsPerPublish = 0;
@@ -1261,30 +1460,183 @@ runClient(bool isService, int argc, char *argv[]) {
             }
 #endif
 
-            // queue monitored items creation
+            // ── Batch MonitoredItems registration: ONE call per group ──────────
+            // Uses UA_Client_MonitoredItems_createDataChanges (plural) which sends
+            // ALL items for a group in a single OPC UA service request.
             for(const auto &group : server.groups) {
                 std::string groupName = group.name;
+
+                // Pre-compile expressions and parse NodeIds BEFORE hopping to the OPC thread!
+                // This shifts heavy CPU parsing work to the current calling thread (pool worker).
+                std::vector<MappedInfospaceTag> batchInfoSpaces;
+                std::vector<UA_NodeId>          batchNodeIds;
+                std::vector<MyMonitorContext *> batchContexts;
+
+                // ── Resolve namespace index once per batch ───────────────
+                UA_UInt16 resolvedNs = 0;
+                bool      nsResolved = false;
+                if(!NamespaceURI.empty()) {
+                    UA_UInt16 tmp;
+                    if(UA_Client_getNamespaceIndex(
+                           ctx->client.get(),
+                           UA_STRING((char *)NamespaceURI.c_str()),
+                           &tmp) == UA_STATUSCODE_GOOD) {
+                        resolvedNs = tmp;
+                        nsResolved = true;
+                    }
+                }
+
                 for(const auto &tag : group.tags) {
                     if(!tag.mappedInfospaceTags) continue;
                     for(const auto &infoSpace : *tag.mappedInfospaceTags) {
-                        std::lock_guard<std::mutex> lock(ctx->taskMutex);
-                        ctx->taskQueue.push([ctx, infoSpace, groupName, NamespaceURI]() {
-                            MyMonitorContext *myContext = new MyMonitorContext{
-                                infoSpace, g_mqttHandler, g_sqliteService, nullptr, g_asyncPublisher};
+                        auto it = Mapping.find(infoSpace.tagId);
+                        if(it == Mapping.end()) continue;
 
-                            // Create a scheduler lambda using the current context
-                            TaskScheduler scheduler = [ctx](std::function<void()> task) {
-                                std::lock_guard<std::mutex> lock(ctx->taskMutex);
-                                ctx->taskQueue.push(task);
-                            };
+                        const std::string &nodeIdStr = it->second.first;
+                        
+                        // 1. Parse NodeId
+                        UA_NodeId nodeId = UA_NODEID_NULL;
+                        const char *nsStart = strstr(nodeIdStr.c_str(), "ns=");
+                        if(nsStart) {
+                            const char *nsEnd = strchr(nsStart + 3, ';');
+                            if(nsEnd) {
+                                UA_UInt16 nsIdx = nsResolved
+                                    ? resolvedNs
+                                    : (UA_UInt16)strtoul(nsStart + 3, nullptr, 10);
+                                const char *idStart = nsEnd + 1;
+                                if(strncmp(idStart, "i=", 2) == 0)
+                                    nodeId = UA_NODEID_NUMERIC(
+                                        nsIdx,
+                                        (UA_UInt32)strtoul(idStart + 2, nullptr, 10));
+                                else if(strncmp(idStart, "s=", 2) == 0)
+                                    nodeId = UA_NODEID_STRING_ALLOC(nsIdx, idStart + 2);
+                            }
+                        }
 
-                            MonitorItem(ctx->client.get(), ctx->subscriptions[groupName],
-                                        Mapping[infoSpace.tagId].first.c_str(),
-                                        infoSpace.tagId, myContext, NamespaceURI.c_str(), scheduler);
+                        // 2. Build MyMonitorContext and pre-compile ExprTk AST
+                        auto *myCtx = new MyMonitorContext{
+                            infoSpace, g_mqttHandler, g_sqliteService,
+                            nullptr, g_asyncPublisher,
+                            [ctx](std::function<void()> task) {
+                                ctx->postTask(std::move(task));
+                            }
+                        };
 
-                        });
+                        if(infoSpace.enableExpression && !infoSpace.expression.empty()) {
+                            myCtx->exprContext = std::make_shared<ExprTkContext>();
+                            myCtx->exprContext->symbol_table.add_variable(
+                                "value", myCtx->exprContext->value);
+                            myCtx->exprContext->symbol_table.add_constants();
+                            myCtx->exprContext->expression.register_symbol_table(
+                                myCtx->exprContext->symbol_table);
+                            exprtk::parser<double> parser;
+                            std::string exprStr = infoSpace.expression;
+                            std::transform(exprStr.begin(), exprStr.end(),
+                                           exprStr.begin(), ::tolower);
+                            if(!parser.compile(exprStr, myCtx->exprContext->expression))
+                                myCtx->exprContext.reset();
+                        }
+
+                        batchInfoSpaces.push_back(infoSpace);
+                        batchNodeIds.push_back(nodeId);
+                        batchContexts.push_back(myCtx);
                     }
                 }
+
+                if(batchInfoSpaces.empty()) continue;
+
+                // Move heavy pre-computed vectors into the OPC thread closure
+                ctx->postOpcTask([ctx, batchInfoSpaces, batchNodeIds, batchContexts,
+                                  groupName, NamespaceURI]() mutable {
+                    const UA_CreateSubscriptionResponse &sub =
+                        ctx->subscriptions[groupName];
+                    size_t count = batchInfoSpaces.size();
+
+                    // ── Build UA_CreateMonitoredItemsRequest ─────────────────
+                    UA_CreateMonitoredItemsRequest batchReq;
+                    UA_CreateMonitoredItemsRequest_init(&batchReq);
+                    batchReq.subscriptionId     = sub.subscriptionId;
+                    batchReq.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+                    batchReq.itemsToCreate =
+                        (UA_MonitoredItemCreateRequest *)UA_Array_new(
+                            count,
+                            &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
+                    batchReq.itemsToCreateSize = count;
+
+                    // ── Parallel arrays required by the API ──────────────────
+                    std::vector<UA_Client_DataChangeNotificationCallback> cbs(
+                        count, handler_NodeValueChanged);
+                    std::vector<UA_Client_DeleteMonitoredItemCallback>  delCbs(count, nullptr);
+
+                    for(size_t i = 0; i < count; ++i) {
+                        const MappedInfospaceTag &infoSpace  = batchInfoSpaces[i];
+
+                        // ── Fill request item ────────────────────────────────
+                        UA_MonitoredItemCreateRequest &req = batchReq.itemsToCreate[i];
+                        UA_MonitoredItemCreateRequest_init(&req);
+                        
+                        // IMPORTANT: We must deep copy the NodeId because UA_CreateMonitoredItemsRequest_clear
+                        // will attempt to free its members later. 
+                        UA_NodeId_copy(&batchNodeIds[i], &req.itemToMonitor.nodeId);
+                        UA_NodeId_clear(&batchNodeIds[i]);
+                        
+                        req.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
+                        req.monitoringMode            = UA_MONITORINGMODE_REPORTING;
+                        req.requestedParameters.samplingInterval = 0;
+                        req.requestedParameters.queueSize        = 10000;
+                        req.requestedParameters.discardOldest    = false;
+
+                        // Deadband filter (heap-allocated, owned by req)
+                        UA_DataChangeFilter *filter =
+                            (UA_DataChangeFilter *)UA_malloc(
+                                sizeof(UA_DataChangeFilter));
+                        UA_DataChangeFilter_init(filter);
+                        if(infoSpace.deadband > 0) {
+                            filter->deadbandType  = UA_DEADBANDTYPE_ABSOLUTE;
+                            filter->deadbandValue = infoSpace.deadband;
+                        }
+                        filter->trigger = UA_DATACHANGETRIGGER_STATUSVALUE;
+                        UA_ExtensionObject &fobj = req.requestedParameters.filter;
+                        memset(&fobj, 0, sizeof(fobj));
+                        fobj.encoding             = UA_EXTENSIONOBJECT_DECODED;
+                        fobj.content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER];
+                        fobj.content.decoded.data = filter;
+                    }
+
+                    // ── Single network service call for the whole group ───────
+                    UA_CreateMonitoredItemsResponse resp =
+                        UA_Client_MonitoredItems_createDataChanges(
+                            ctx->client.get(),
+                            batchReq,
+                            (void **)batchContexts.data(),
+                            cbs.data(),
+                            delCbs.data());
+
+                    // ── Deallocate the request (frees filter heap blocks too) ─
+                    UA_CreateMonitoredItemsRequest_clear(&batchReq);
+
+                    // ── Process results ──────────────────────────────────────
+                    size_t ok = 0;
+                    for(size_t i = 0; i < resp.resultsSize; ++i) {
+                        if(resp.results[i].statusCode != UA_STATUSCODE_GOOD) {
+                            log("MonitoredItem failed for TagId " +
+                                    std::to_string(batchInfoSpaces[i].tagId) +
+                                    ": " +
+                                    UA_StatusCode_name(resp.results[i].statusCode),
+                                LogLevel::ERRORS);
+                            delete batchContexts[i];
+                            batchContexts[i] = nullptr;
+                        } else {
+                            ++ok;
+                        }
+                    }
+                    UA_CreateMonitoredItemsResponse_clear(&resp);
+
+                    log("Group " + groupName + ": registered " +
+                            std::to_string(ok) + "/" + std::to_string(count) +
+                            " monitored items",
+                        LogLevel::INFO);
+                });
             }
         };
 
@@ -1344,7 +1696,8 @@ runClient(bool isService, int argc, char *argv[]) {
 
         std::string endpoint = Mapping[tagId].second;
         auto it = clientPool.find(endpoint);
-        if (it == clientPool.end() || !it->second->isConnected) {
+        if (it == clientPool.end() ||
+            !it->second->isConnected.load(std::memory_order_acquire)) {
             log("Client not connected for endpoint: " + endpoint, LogLevel::ERRORS);
             return;
         }
@@ -1365,9 +1718,8 @@ runClient(bool isService, int argc, char *argv[]) {
                     nodeIdStr = nodeIdStr.substr(lastSlash + 1); // Extract "ns=1;i=194"
                 }
 
-                // Queue write operation
-                std::lock_guard<std::mutex> lock(context->taskMutex);
-                context->taskQueue.push([context, tagId, data, nodeIdStr]() {
+                // UA_Client_writeValueAttribute runs on the OPC thread via postOpcTask
+                context->postOpcTask([context, tagId, data, nodeIdStr]() {
                     log("Executing COMMAND write for TagId: " + std::to_string(tagId), LogLevel::DEBUG);
                     
                     // Parse value from payload

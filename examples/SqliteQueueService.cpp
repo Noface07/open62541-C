@@ -104,19 +104,7 @@ SqliteQueueService::IsMqttConnected() {
 
 void
 SqliteQueueService::TriggerApiUpload() {
-    std::cout << "[SQLite] TriggerApiUpload called - checking worker status..."
-              << std::endl;
-
-    // Check if the API upload worker is running
-    if(!apiUploadWorkerRunning_.load()) {
-        std::cout << "[SQLite] API upload worker is not running - starting it now!"
-                  << std::endl;
-        StartApiUploadTimer();
-    } else {
-        std::cout << "[SQLite] API upload worker is already running - notifying it"
-                  << std::endl;
-        apiUploadCv_.notify_one();
-    }
+    StartApiUploadTimer();
 }
 
 // --- Database Initialization ---
@@ -213,6 +201,10 @@ SqliteQueueService::QueueWorkerLoop() {
 
         try {
             InsertMessageToDatabase(item);
+            // If connected and backlog exists, start a finite drain worker.
+            if(SqliteQueueService::mqttConnected_.load(std::memory_order_acquire)) {
+                StartApiUploadTimer();
+            }
         } catch(const std::exception &ex) {
             std::cerr << "SQLite insert failed for a message: " << ex.what() << std::endl;
         }
@@ -223,64 +215,135 @@ SqliteQueueService::QueueWorkerLoop() {
 
 void
 SqliteQueueService::StartApiUploadTimer() {
-    std::cout << "[SQLite] StartApiUploadTimer called - current worker status: "
-              << (apiUploadWorkerRunning_ ? "RUNNING" : "STOPPED") << std::endl;
+    std::unique_lock<std::mutex> lock(apiUploadMutex_);
 
-    if(apiUploadWorkerRunning_) {
-        std::cout
-            << "[SQLite] API upload worker already running - triggering notification"
-            << std::endl;
-        apiUploadCv_.notify_one();
-        return;
+    // Reap a previously finished worker thread before starting a new one.
+    if(apiUploadThread_.joinable() &&
+       !apiUploadWorkerRunning_.load(std::memory_order_acquire)) {
+        lock.unlock();
+        apiUploadThread_.join();
+        lock.lock();
     }
 
-    apiUploadWorkerRunning_ = true;
+    if(apiUploadWorkerRunning_.load(std::memory_order_acquire))
+        return;
+
+    if(!SqliteQueueService::mqttConnected_.load(std::memory_order_acquire))
+        return;
+
+    const long rows = GetRowCount();
+    if(rows <= 0)
+        return;
+
+    apiUploadWorkerRunning_.store(true, std::memory_order_release);
     apiUploadThread_ = std::thread(&SqliteQueueService::ApiUploadWorkerLoop, this);
-    std::cout << "[SQLite] API uploader started" << std::endl;
+    std::cout << "[SQLite] API uploader started with " << rows << " row(s)." << std::endl;
 }
 
 void
 SqliteQueueService::StopApiUploadTimer() {
-    std::cout << "[SQLite] StopApiUploadTimer called - current worker status: "
-              << (apiUploadWorkerRunning_ ? "RUNNING" : "STOPPED") << std::endl;
-
+    std::thread workerToJoin;
     {
         std::lock_guard<std::mutex> lock(apiUploadMutex_);
-        if(!apiUploadWorkerRunning_) {
-            std::cout << "[SQLite] API upload worker already stopped" << std::endl;
-            return;  // already stopped
+        apiUploadWorkerRunning_.store(false, std::memory_order_release);
+        if(apiUploadThread_.joinable()) {
+            workerToJoin = std::move(apiUploadThread_);
         }
-        apiUploadWorkerRunning_ = false;
     }
 
-    std::cout << "[SQLite] Stopping API upload worker..." << std::endl;
-    apiUploadCv_.notify_all();
-
-    if(apiUploadThread_.joinable()) {
-        apiUploadThread_.join();
+    if(workerToJoin.joinable()) {
+        workerToJoin.join();
         std::cout << "[SQLite] API upload worker stopped successfully" << std::endl;
     }
 }
 
 void
 SqliteQueueService::ApiUploadWorkerLoop() {
+    // Finite drain worker:
+    // Start only when rows exist, upload until queue is empty, then stop.
+    while(apiUploadWorkerRunning_.load(std::memory_order_acquire)) {
+        if(!SqliteQueueService::mqttConnected_.load(std::memory_order_acquire))
+            break;
+
+        auto messages = GetBatchQueuedMessages(options_.batchSize);
+        if(messages.empty())
+            break; // drained
+
+        try {
+            std::vector<ApiTagData> apiTagDataList;
+            for(const auto &msg : messages) {
+                if(msg.payload.empty())
+                    continue;
+
+                MqttPayload payload = nlohmann::json::parse(msg.payload);
+                long orgId = 0;
+                auto it = datapointToOrgIdMap_.find(payload.datapointId);
+                if(it != datapointToOrgIdMap_.end())
+                    orgId = it->second;
+
+                int quality = 1;
+                try {
+                    quality = payload.quality;
+                } catch(...) {
+                }
+
+                apiTagDataList.push_back({orgId, payload.tagId, payload.value,
+                                          payload.tagType, payload.timeStamp,
+                                          payload.source, payload.datapointId,
+                                          payload.infoId, quality, 2});
+            }
+
+            nlohmann::json finalPayload = apiMetadata_;
+            finalPayload["Data"] = apiTagDataList;
+            finalPayload["RequestDateTime"] = GetCurrentTimestamp();
+
+            std::cout << "[SQLite] Attempting to send " << apiTagDataList.size()
+                      << " records to API..." << std::endl;
+
+            if(SendToApi(finalPayload.dump())) {
+                std::vector<int> idsToDelete;
+                for(const auto &msg : messages)
+                    idsToDelete.push_back(msg.id);
+                DeleteMessages(idsToDelete);
+                std::cout << "[SQLite] Successfully uploaded " << idsToDelete.size()
+                          << " messages to API" << std::endl;
+            } else {
+                std::cerr << "[SQLite] API upload failed, will retry later" << std::endl;
+                for(int i = 0; i < 50; ++i) { // up to 5s backoff, interruptible
+                    if(!apiUploadWorkerRunning_.load(std::memory_order_acquire) ||
+                       !SqliteQueueService::mqttConnected_.load(std::memory_order_acquire)) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+        } catch(const std::exception &ex) {
+            std::cerr << "[SQLite] ApiUploadWorkerLoop exception: " << ex.what()
+                      << std::endl;
+        }
+    }
+
+    apiUploadWorkerRunning_.store(false, std::memory_order_release);
+    std::cout << "[SQLite] API uploader thread stopped." << std::endl;
+    return;
+
+#if 0
     while(apiUploadWorkerRunning_) {
         std::unique_lock<std::mutex> lock(apiUploadMutex_);
 
-        // Wait until: MQTT connected && DB has data OR stop requested
-        std::cout << "[SQLite] API upload worker waiting for conditions..." << std::endl;
-        apiUploadCv_.wait(lock, [this] {
+        // Wait until: MQTT connected && DB has data OR stop requested.
+        // Use wait_for so we can't sleep forever if a notify is missed.
+        bool ready = apiUploadCv_.wait_for(lock, std::chrono::seconds(1), [this] {
             bool isConnected = SqliteQueueService::mqttConnected_.load();
             long rowCount = GetRowCount();
             bool shouldProceed =
                 !apiUploadWorkerRunning_ || (isConnected && rowCount > 0);
-            std::cout << "[SQLite] API upload worker check - MQTT: "
-                      << (isConnected ? "CONNECTED" : "DISCONNECTED")
-                      << ", DB rows: " << rowCount
-                      << ", shouldProceed: " << (shouldProceed ? "YES" : "NO")
-                      << std::endl;
             return shouldProceed;
         });
+
+        if(!ready && apiUploadWorkerRunning_) {
+            continue;
+        }
 
         if(!apiUploadWorkerRunning_)
             break;
@@ -353,6 +416,7 @@ SqliteQueueService::ApiUploadWorkerLoop() {
     }
 
     std::cout << "[SQLite] API uploader thread stopped." << std::endl;
+#endif
 }
 
 // --- Core Database Methods ---
@@ -533,20 +597,13 @@ SqliteQueueService::PublishLatestValuesToMqtt(
         for(const auto &value : latestValues) {
             if (value.payload.empty()) continue;
             try {
-                std::cout << "[SQLite] Publishing latest value for topic: " << value.topic
-                          << std::endl;
                 // The C# version wraps the payload in a {"Data": [...]} structure.
                 // Replicating that.
                 nlohmann::json wrapper;
                 wrapper["Data"] =
                     nlohmann::json::array({nlohmann::json::parse(value.payload)});
                 std::string payloadToPublish = wrapper.dump();
-                std::cout << "[SQLite] Calling publishFunc for topic: " << value.topic
-                          << " with payload size: " << payloadToPublish.size()
-                          << std::endl;
                 publishFunc(value.topic, payloadToPublish);
-                std::cout << "[SQLite] Successfully published latest value for topic: "
-                          << value.topic << std::endl;
             } catch(const std::exception &ex) {
                 errorCount++;
                 std::cerr << "[SQLite] Error publishing latest value for topic "

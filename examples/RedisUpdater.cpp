@@ -123,10 +123,12 @@ void updateOrgData(int orgId, const std::string& token) {
         body["roleId"] = ""; 
         body["userId"] = 0;
         body["filterModel"]["customValue"] = "all";
-        body["data"]["isLogging"] = true;
+        body["data"] = json::object();
+        //body["data"]["isLogging"] = true;
         
         auto response = getResponse(API_HOST, API_PORT, token, body.dump(), "/api/GetTopicList");
-        
+        //std::cout << "   [API] Set " << response << " (Size: " << response.dump().size()
+        //          << ")\n";
         std::string key = "TOPIC_LIST_" + std::to_string(orgId);
         g_redisClient.setCompressed(key, response.dump(), 0);
         std::cout << "   [Redis] Set " << key << " (Size: " << response.dump().size() << ")\n";
@@ -147,8 +149,9 @@ void updateOrgData(int orgId, const std::string& token) {
     try {
         json body;
         body["orgId"] = orgId;
-        body["filterModel"]["currentPage"] = 1;
-        body["filterModel"]["pageSize"] = 100;
+        //body["filterModel"]["currentPage"] = 1;
+        //body["filterModel"]["pageSize"] = 100;
+        body["filterModel"]["customValue"] = "all";
 
         auto response = getResponse(API_HOST, API_PORT, token, body.dump(), "/api/GetAlarmsConfigDetailList");
         

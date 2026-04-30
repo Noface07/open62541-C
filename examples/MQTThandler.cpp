@@ -14,6 +14,10 @@
 namespace as = boost::asio;
 namespace am = async_mqtt;
 
+namespace {
+constexpr std::uint16_t kMqttKeepAliveSeconds = 60;
+}
+
 MQTTHandler::MQTTHandler(boost::asio::io_context &ioc, boost::asio::ssl::context &ssl_ctx)
     : m_ioc(ioc), m_ssl_ctx(ssl_ctx),
       m_client(std::make_unique<client_t>(ioc.get_executor(), ssl_ctx)),
@@ -128,7 +132,7 @@ MQTTHandler::try_reconnect() {
 
                     // 3. Start the MQTT layer handshake (MQTT v5)
                     auto connack_opt = co_await m_client->async_start(
-                        am::v5::connect_packet{true, 0x1234, m_clientId, std::nullopt, m_username,
+                        am::v5::connect_packet{true, kMqttKeepAliveSeconds, m_clientId, std::nullopt, m_username,
                                                m_password},
                         as::use_awaitable);
 
@@ -181,7 +185,7 @@ MQTTHandler::try_reconnect() {
 
                     // 3. Start the MQTT layer handshake (MQTT v5)
                     auto connack_opt = co_await wm_client->async_start(
-                        am::v5::connect_packet{true, 0x1234, m_clientId, std::nullopt, m_username,
+                        am::v5::connect_packet{true, kMqttKeepAliveSeconds, m_clientId, std::nullopt, m_username,
                                                m_password},
                         as::use_awaitable);
 
@@ -224,9 +228,14 @@ MQTTHandler::start_receive() {
                          }
                          pv_opt->visit(am::overload{
                             [&](am::v5::publish_packet &p) {
-                                std::lock_guard<std::mutex> lock(m_mutex);
-                                if(m_message_callback) {
-                                    m_message_callback(p.topic(), std::string(p.payload()));
+                                std::function<void(const std::string &, const std::string &)>
+                                    callbackCopy;
+                                {
+                                    std::lock_guard<std::mutex> lock(m_mutex);
+                                    callbackCopy = m_message_callback;
+                                }
+                                if(callbackCopy) {
+                                    callbackCopy(p.topic(), std::string(p.payload()));
                                 }
                             },
                             [](auto &) {}
@@ -240,9 +249,14 @@ MQTTHandler::start_receive() {
                          }
                          pv_opt->visit(am::overload{
                             [&](am::v5::publish_packet &p) {
-                                std::lock_guard<std::mutex> lock(m_mutex);
-                                if(m_message_callback) {
-                                    m_message_callback(p.topic(), std::string(p.payload()));
+                                std::function<void(const std::string &, const std::string &)>
+                                    callbackCopy;
+                                {
+                                    std::lock_guard<std::mutex> lock(m_mutex);
+                                    callbackCopy = m_message_callback;
+                                }
+                                if(callbackCopy) {
+                                    callbackCopy(p.topic(), std::string(p.payload()));
                                 }
                             },
                             [](auto &) {}
@@ -347,6 +361,46 @@ MQTTHandler::publish(const std::string &topic, const std::string &payload) {
 }
 
 bool
+MQTTHandler::publishBatch(std::vector<std::pair<std::string, std::string>> messages) {
+    if(!m_connected.load(std::memory_order_relaxed) || messages.empty()) return false;
+
+    // Use a single ASIO dispatch to pipeline all messages avoiding coroutine overhead
+    as::post(m_ioc, [this, msgs = std::move(messages)]() {
+        if(!m_connected.load(std::memory_order_relaxed)) return;
+
+        auto qos = am::qos::at_most_once;
+        auto completion_handler = [this](am::error_code ec, auto pubres) {
+            if(ec) {
+                log("MQTT batch publish error: " + ec.message(), LogLevel::ERRORS);
+                notifyDisconnected();
+            }
+        };
+
+        for(const auto& msg : msgs) {
+            if (m_protocol) {
+                m_client->async_publish(
+                    am::v5::publish_packet{
+                        msg.first,
+                        msg.second,
+                        qos
+                    },
+                    completion_handler);
+            } else {
+                wm_client->async_publish(
+                    am::v5::publish_packet{
+                        msg.first,
+                        msg.second,
+                        qos
+                    },
+                    completion_handler);
+            }
+        }
+    });
+
+    return true;
+}
+
+bool
 MQTTHandler::subscribe(const std::string &topic) {
     if(!isConnected()) {
         log("Cannot subscribe: Not connected to MQTT broker.", LogLevel::INFO);
@@ -439,8 +493,7 @@ MQTTHandler::subscribeBatch(const std::vector<std::string> &topics) {
 
 bool
 MQTTHandler::isConnected() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_connected;
+    return m_connected.load(std::memory_order_acquire);
 }
 
 void
@@ -521,11 +574,13 @@ MQTTHandler::notifyDisconnected() {
     std::function<void()> disconnect_cb;
     std::function<void(const std::vector<PendingMessage> &)> failed_cb;
     std::vector<PendingMessage> failed_messages;
+    bool transitioned = false;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if(m_connected) {
             m_connected = false;
+            transitioned = true;
 
             for(auto &[_, msg] : m_pending_messages) {
                 failed_messages.push_back(msg);
@@ -536,6 +591,10 @@ MQTTHandler::notifyDisconnected() {
             failed_cb = m_failed_message_callback;
         }
     }
+
+    // Another caller already handled the disconnected transition.
+    if(!transitioned)
+        return;
 
     // Update shared MQTT connection state
     if(sqliteService_) {
