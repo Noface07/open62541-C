@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <nlohmann/json.hpp>
 #include "InstrumentedMutex.cpp"
+#include <numbers>
 
 /**
  * @brief A custom comparator for using UA_NodeId as a key in std::map.
@@ -239,9 +240,13 @@ struct BranchState {
     UA_Boolean retain;
     UA_StatusCode quality;
     std::vector<UA_ByteString> eventIds;  // Track ALL EventIds for this state (multiple events may be generated)
+    bool shelved;
+    std::string shelvedTill;
+    int updateType;
     
     BranchState() : active(false), acked(false), confirmed(false), severity(0),
-                    time(0), receiveTime(0), retain(UA_FALSE), quality(UA_STATUSCODE_GOOD) {
+                    time(0), receiveTime(0), retain(UA_FALSE), quality(UA_STATUSCODE_GOOD),
+                    shelved(false), shelvedTill(""), updateType(0) {
     }
     
     ~BranchState() {
@@ -284,6 +289,9 @@ struct BranchState {
         receiveTime = other.receiveTime;
         retain = other.retain;
         quality = other.quality;
+        shelved = other.shelved;
+        shelvedTill = other.shelvedTill;
+        updateType = other.updateType;
         for(const auto &eventId : other.eventIds) {
             UA_ByteString copy;
             UA_ByteString_init(&copy);
@@ -304,6 +312,9 @@ struct BranchState {
             receiveTime = other.receiveTime;
             retain = other.retain;
             quality = other.quality;
+            shelved = other.shelved;
+            shelvedTill = other.shelvedTill;
+            updateType = other.updateType;
             clearEventIds();
             for(const auto &eventId : other.eventIds) {
                 UA_ByteString copy;
@@ -393,6 +404,30 @@ UA_StatusCode customDisableCallback(UA_Server *server, const UA_NodeId *sessionI
                                   const UA_NodeId *methodId, void *methodContext,
                                   const UA_NodeId *objectId, void *objectContext, size_t inputSize,
                                   const UA_Variant *input, size_t outputSize, UA_Variant *output);
+
+UA_StatusCode customOneShotShelveCallback(UA_Server *server, const UA_NodeId *sessionId,
+                                         void *sessionContext, const UA_NodeId *methodId,
+                                         void *methodContext, const UA_NodeId *objectId,
+                                         void *objectContext, size_t inputSize,
+                                         const UA_Variant *input, size_t outputSize,
+                                         UA_Variant *output);
+
+UA_StatusCode customTimedShelveCallback(UA_Server *server, const UA_NodeId *sessionId,
+                                       void *sessionContext, const UA_NodeId *methodId,
+                                       void *methodContext, const UA_NodeId *objectId,
+                                       void *objectContext, size_t inputSize,
+                                       const UA_Variant *input, size_t outputSize,
+                                       UA_Variant *output);
+
+UA_StatusCode customUnshelveCallback(UA_Server *server, const UA_NodeId *sessionId,
+                                     void *sessionContext, const UA_NodeId *methodId,
+                                     void *methodContext, const UA_NodeId *objectId,
+                                     void *objectContext, size_t inputSize,
+                                     const UA_Variant *input, size_t outputSize,
+                                     UA_Variant *output);
+
+void registerShelvingCallbacks(UA_Server *server, UA_NodeId alarmId);
+std::string getPreciseTimestampOffset(double offsetMs);
 
 // RAII Wrapper for UA_Variant to ensure cleanup
 struct ScopedVariant {

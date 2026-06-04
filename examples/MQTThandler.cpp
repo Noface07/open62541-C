@@ -407,33 +407,48 @@ MQTTHandler::subscribe(const std::string &topic) {
         return false;
     }
 
+    // Use fire-and-forget (completion handler) instead of co_await to avoid
+    // racing with start_receive()'s co_await async_recv() for SUBACK packets.
     as::post(m_ioc, [this, topic]() {
-        as::co_spawn(
-            m_ioc,
-            [this, topic]() -> as::awaitable<void> {
-                try {
-                    std::vector<am::topic_subopts> sub_entry = {
-                        {topic, am::qos::at_most_once}};
-                    
-                    if (m_protocol) {
-                        co_await m_client->async_subscribe(
-                            am::v5::subscribe_packet{*m_client->acquire_unique_packet_id(),
-                                                    am::force_move(sub_entry)},
-                            as::use_awaitable);
-                    } else {
-                        co_await wm_client->async_subscribe(
-                            am::v5::subscribe_packet{*wm_client->acquire_unique_packet_id(),
-                                                    am::force_move(sub_entry)},
-                            as::use_awaitable);
-                    }
-                    // log("Subscribed to topic: " + topic, LogLevel::INFO);
-                } catch(const std::exception &e) {
-                    log("MQTT subscribe error: " + std::string(e.what()),
+        try {
+            std::vector<am::topic_subopts> sub_entry = {
+                {topic, am::qos::at_most_once}};
+
+            auto completion_handler = [this, topic](am::error_code ec, auto) {
+                if(ec) {
+                    log("MQTT subscribe error for '" + topic + "': " +
+                            ec.message(),
                         LogLevel::ERRORS);
+                    notifyDisconnected();
                 }
-                co_return;
-            },
-            as::detached);
+            };
+
+            if(m_protocol) {
+                auto pid_opt = m_client->acquire_unique_packet_id();
+                if(!pid_opt) {
+                    log("MQTT subscribe: packet ID exhausted", LogLevel::ERRORS);
+                    return;
+                }
+                m_client->async_subscribe(
+                    am::v5::subscribe_packet{*pid_opt,
+                                            am::force_move(sub_entry)},
+                    completion_handler);
+            } else {
+                auto pid_opt = wm_client->acquire_unique_packet_id();
+                if(!pid_opt) {
+                    log("MQTT subscribe: packet ID exhausted", LogLevel::ERRORS);
+                    return;
+                }
+                wm_client->async_subscribe(
+                    am::v5::subscribe_packet{*pid_opt,
+                                            am::force_move(sub_entry)},
+                    completion_handler);
+            }
+        } catch(const std::exception &e) {
+            log("MQTT subscribe error: " + std::string(e.what()),
+                LogLevel::ERRORS);
+            notifyDisconnected();
+        }
     });
     return true;
 }
@@ -448,45 +463,62 @@ MQTTHandler::subscribeBatch(const std::vector<std::string> &topics) {
     if(topics.empty())
         return true;
 
-    // Capture topics by value to keep them alive in the async operation
+    // Use fire-and-forget (completion handler) instead of co_await to avoid
+    // racing with start_receive()'s co_await async_recv() for SUBACK packets.
+    // This matches the pattern used by publish/publishBatch.
     as::post(m_ioc, [this, topics]() {
-        as::co_spawn(
-            m_ioc,
-            [this, topics]() -> as::awaitable<void> {
-                try {
-                    std::vector<am::topic_subopts> sub_entries;
-                    sub_entries.reserve(topics.size());
+        try {
+            std::vector<am::topic_subopts> sub_entries;
+            sub_entries.reserve(topics.size());
 
-                    for(const auto &t : topics) {
-                        sub_entries.push_back({t, am::qos::at_most_once});
-                    }
+            for(const auto &t : topics) {
+                sub_entries.push_back({t, am::qos::at_most_once});
+            }
 
-                    log("Subscribing to batch of " + std::to_string(topics.size()) +
-                            " topics...",
-                        LogLevel::INFO);
+            log("Subscribing to batch of " + std::to_string(topics.size()) +
+                    " topics...",
+                LogLevel::INFO);
 
-                    if (m_protocol) {
-                        co_await m_client->async_subscribe(
-                            am::v5::subscribe_packet{*m_client->acquire_unique_packet_id(),
-                                                    am::force_move(sub_entries)},
-                            as::use_awaitable);
-                    } else {
-                        co_await wm_client->async_subscribe(
-                            am::v5::subscribe_packet{*wm_client->acquire_unique_packet_id(),
-                                                    am::force_move(sub_entries)},
-                            as::use_awaitable);
-                    }
-
-                    log("Successfully subscribed to batch of " +
-                            std::to_string(topics.size()) + " topics",
-                        LogLevel::INFO);
-                } catch(const std::exception &e) {
-                    log("MQTT batch subscribe error: " + std::string(e.what()),
+            auto completion_handler = [this, count = topics.size()](am::error_code ec, auto) {
+                if(ec) {
+                    log("MQTT batch subscribe error: " + ec.message(),
                         LogLevel::ERRORS);
+                    notifyDisconnected();
+                } else {
+                    log("Successfully subscribed to batch of " +
+                            std::to_string(count) + " topics",
+                        LogLevel::INFO);
                 }
-                co_return;
-            },
-            as::detached);
+            };
+
+            if(m_protocol) {
+                auto pid_opt = m_client->acquire_unique_packet_id();
+                if(!pid_opt) {
+                    log("MQTT subscribeBatch: packet ID exhausted",
+                        LogLevel::ERRORS);
+                    return;
+                }
+                m_client->async_subscribe(
+                    am::v5::subscribe_packet{*pid_opt,
+                                            am::force_move(sub_entries)},
+                    completion_handler);
+            } else {
+                auto pid_opt = wm_client->acquire_unique_packet_id();
+                if(!pid_opt) {
+                    log("MQTT subscribeBatch: packet ID exhausted",
+                        LogLevel::ERRORS);
+                    return;
+                }
+                wm_client->async_subscribe(
+                    am::v5::subscribe_packet{*pid_opt,
+                                            am::force_move(sub_entries)},
+                    completion_handler);
+            }
+        } catch(const std::exception &e) {
+            log("MQTT batch subscribe error: " + std::string(e.what()),
+                LogLevel::ERRORS);
+            notifyDisconnected();
+        }
     });
     return true;
 }
@@ -592,28 +624,28 @@ MQTTHandler::notifyDisconnected() {
         }
     }
 
-    // Another caller already handled the disconnected transition.
-    if(!transitioned)
-        return;
+    if(transitioned) {
+        // Update shared MQTT connection state
+        if(sqliteService_) {
+            SqliteQueueService::SetMqttConnected(false);
+            log("MQTT disconnected! Notified SqliteQueueService to stop API uploads.",
+                LogLevel::INFO);
+        }
 
-    // Update shared MQTT connection state
-    if(sqliteService_) {
-        SqliteQueueService::SetMqttConnected(false);
-        log("MQTT disconnected! Notified SqliteQueueService to stop API uploads.",
-            LogLevel::INFO);
+        if(disconnect_cb)
+            as::post(m_ioc, disconnect_cb);
+        if(failed_cb && !failed_messages.empty()) {
+            as::post(m_ioc, [failed_cb, failed_messages]() { failed_cb(failed_messages); });
+        }
     }
 
-    if(disconnect_cb)
-        as::post(m_ioc, disconnect_cb);
-    if(failed_cb && !failed_messages.empty()) {
-        as::post(m_ioc, [failed_cb, failed_messages]() { failed_cb(failed_messages); });
+    if(m_running) {
+        m_reconnect_timer.expires_after(m_reconnect_interval);
+        m_reconnect_timer.async_wait([this](auto ec) {
+            if(!ec)
+                try_reconnect();
+        });
     }
-
-    m_reconnect_timer.expires_after(m_reconnect_interval);
-    m_reconnect_timer.async_wait([this](auto ec) {
-        if(!ec)
-            try_reconnect();
-    });
 }
 
 void

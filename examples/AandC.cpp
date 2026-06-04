@@ -5,8 +5,15 @@
 #include <shared_mutex>
 #include "alarm_enums.h"
 #include "Logger.h"
+#include "fetchAPI.h"
+#include <thread>
+#include <unordered_set>
 
 using json = nlohmann::ordered_json;
+
+extern std::string g_bearerToken;
+extern std::string g_apiHost;
+extern std::string g_apiPort;
 
 
 //Global Maps
@@ -100,6 +107,10 @@ UA_StatusCode setStealthValueByPath(UA_Server *server, UA_NodeId baseNode,
                 isEqual = (*(UA_UInt16*)val.get()->data == *(UA_UInt16*)currentVal.get()->data);
             } else if(type == &UA_TYPES[UA_TYPES_INT32]) {
                 isEqual = (*(UA_Int32*)val.get()->data == *(UA_Int32*)currentVal.get()->data);
+            } else if(type == &UA_TYPES[UA_TYPES_STRING]) {
+                UA_String *s1 = (UA_String*)val.get()->data;
+                UA_String *s2 = (UA_String*)currentVal.get()->data;
+                isEqual = UA_String_equal(s1, s2);
             }
              // Add other types as needed, but Alarms mostly use Bool/UInt16
             
@@ -611,6 +622,7 @@ customAcknowledgeCallback(UA_Server *server, const UA_NodeId *sessionId,
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
+            {"Quality", AlarmQuality::Good},
             {"Command", "Ack"}
         };
         
@@ -720,6 +732,7 @@ customConfirmCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
+            {"Quality", AlarmQuality::Good},
             {"Command", "Confirm"}
         };
         
@@ -799,16 +812,37 @@ customEnableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessio
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
+            {"Quality", AlarmQuality::Good},
             {"Command", "Enable"}
         };
         
         // Publish request
-        std::string subTopic = triggerTopics[0] + "/Event";
+        std::string subTopic = triggerTopics[0] + "/event";
         publish_to_mqtt(subTopic, out.dump());
         
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                    "✓ Enable request sent for alarm '%s' (AETypeID=%d). Awaiting AE Engine response...",
                    alarmKey.c_str(), AETypeID);
+
+        // Call EnableDisabledAlarmConfig API
+        if(AETypeID > 0) {
+            std::thread([host = g_apiHost, port = g_apiPort, token = g_bearerToken, AETypeID]() {
+                try {
+                    json payload;
+                    payload["filterModel"] = json::object();
+                    payload["data"] = {
+                        {"id", AETypeID},
+                        {"enable", true}
+                    };
+                    getResponse(host, port, token, payload.dump(), "/api/EnableDisabledAlarmConfig");
+                    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
+                                "✓ EnableDisabledAlarmConfig API called successfully for ID %d (enable=true)", AETypeID);
+                } catch(const std::exception &e) {
+                    UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
+                                 "Failed to call EnableDisabledAlarmConfig API for ID %d (enable=true): %s", AETypeID, e.what());
+                }
+            }).detach();
+        }
     } else {
         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                       "No trigger topics found for alarm, cannot send control request");
@@ -874,16 +908,37 @@ customDisableCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessi
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
+            {"Quality", AlarmQuality::Good},
             {"Command", "Disable"}
         };
         
         // Publish request
-        std::string subTopic = triggerTopics[0] + "/Event";
+        std::string subTopic = triggerTopics[0] + "/event";
         publish_to_mqtt(subTopic, out.dump());
         
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                    "✓ Disable request sent for alarm '%s' (AETypeID=%d). Awaiting AE Engine response...",
                    alarmKey.c_str(), AETypeID);
+
+        // Call EnableDisabledAlarmConfig API
+        if(AETypeID > 0) {
+            std::thread([host = g_apiHost, port = g_apiPort, token = g_bearerToken, AETypeID]() {
+                try {
+                    json payload;
+                    payload["filterModel"] = json::object();
+                    payload["data"] = {
+                        {"id", AETypeID},
+                        {"enable", false}
+                    };
+                    getResponse(host, port, token, payload.dump(), "/api/EnableDisabledAlarmConfig");
+                    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
+                                "✓ EnableDisabledAlarmConfig API called successfully for ID %d (enable=false)", AETypeID);
+                } catch(const std::exception &e) {
+                    UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, 
+                                 "Failed to call EnableDisabledAlarmConfig API for ID %d (enable=false): %s", AETypeID, e.what());
+                }
+            }).detach();
+        }
     } else {
         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                       "No trigger topics found for alarm, cannot send control request");
@@ -993,6 +1048,7 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
             {"Timestamp", timestamp},
             {"Source", static_cast<int>(AlarmSource::OPC)},
             {"UpdateType", static_cast<int>(UpdateType::Control)},
+            {"Quality", AlarmQuality::Good},
             {"Command", "AddComment"},
             {"Comment", commentText}
         };
@@ -1013,6 +1069,250 @@ customAddCommentCallback(UA_Server *server, const UA_NodeId *sessionId,
     return UA_STATUSCODE_GOOD;
 }
 
+
+// Helper for precise timestamp generation with offset (ISO 8601 with 100ns precision +05:30)
+std::string getPreciseTimestampOffset(double offsetMs) {
+    auto now = std::chrono::system_clock::now() + std::chrono::milliseconds(static_cast<long long>(offsetMs));
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf;
+    #if defined(_WIN32)
+        localtime_s(&tm_buf, &t);
+    #else
+        localtime_r(&tm_buf, &t);
+    #endif
+    
+    // Calculate fractional seconds
+    auto duration = now.time_since_epoch();
+    auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
+    auto fractional = duration - seconds;
+    long long fractional_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(fractional).count();
+
+    char tsBuf[64];
+    std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+    
+    char finalBuf[128];
+    snprintf(finalBuf, sizeof(finalBuf), "%s.%07lld+05:30", tsBuf, fractional_ns / 100);
+    return std::string(finalBuf);
+}
+
+
+/* Custom OneShotShelve method callback */
+UA_StatusCode
+customOneShotShelveCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
+                            const UA_NodeId *methodId, void *methodContext,
+                            const UA_NodeId *objectId, void *objectContext, size_t inputSize,
+                            const UA_Variant *input, size_t outputSize, UA_Variant *output) {
+    InstrumentedGuard lock(g_alarmMutex);
+    std::string alarmKey = findAlarmKeyForCondition(objectId);
+    std::string guid = "";
+
+    auto branchStateMapIt = g_branchStates.find(alarmKey);
+    if(branchStateMapIt != g_branchStates.end()) {
+        UA_DateTime mostRecentTime = 0;
+        for(const auto &branchPair : branchStateMapIt->second) {
+            if(branchPair.second.receiveTime > mostRecentTime) {
+                mostRecentTime = branchPair.second.receiveTime;
+                guid = branchPair.first;
+            }
+        }
+    }
+
+    std::vector<std::string> triggerTopics = findTriggerTopicsForAlarm(objectId);
+    if(!triggerTopics.empty()) {
+        std::string timestamp = getPreciseTimestamp();
+        
+        int AETypeID = 0;
+        auto triggerIt = g_triggerToAlarmMap.find(triggerTopics[0]);
+        if(triggerIt != g_triggerToAlarmMap.end()) {
+            for(const auto &mapping : triggerIt->second) {
+                if(mapping.alarmKey == alarmKey) {
+                    AETypeID = mapping.alarmId;
+                    break;
+                }
+            }
+        }
+        
+        // Build control request payload
+        json out;
+        out["Event"] = {
+            {"AETypeID", AETypeID},
+            {"AEInstanceID", guid},
+            {"Timestamp", timestamp},
+            {"Source", static_cast<int>(AlarmSource::OPC)},
+            {"UpdateType", static_cast<int>(UpdateType::Control)},
+            {"Quality", AlarmQuality::Good},
+            {"Command", "Shelve"},
+            {"ShelvedTill", "NA"}
+        };
+        
+        // Publish request
+        std::string subTopic = triggerTopics[0] + "/Event";
+        publish_to_mqtt(subTopic, out.dump());
+        
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                   "✓ One-shot Shelve request sent for GUID '%s' (AETypeID=%d). Awaiting AE Engine approval...",
+                   guid.c_str(), AETypeID);
+    } else {
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                      "No trigger topics found for alarm, cannot send control request");
+    }
+
+    return UA_STATUSCODE_GOOD;
+}
+
+/* Custom TimedShelve method callback */
+UA_StatusCode
+customTimedShelveCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
+                          const UA_NodeId *methodId, void *methodContext,
+                          const UA_NodeId *objectId, void *objectContext, size_t inputSize,
+                          const UA_Variant *input, size_t outputSize, UA_Variant *output) {
+    if(inputSize < 1 || !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_DOUBLE])) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "TimedShelve requires ShelvingTime (Double)");
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    }
+    
+    double shelvingTimeMs = *(UA_Double *)input[0].data;
+
+    InstrumentedGuard lock(g_alarmMutex);
+    std::string alarmKey = findAlarmKeyForCondition(objectId);
+    std::string guid = "";
+
+    auto branchStateMapIt = g_branchStates.find(alarmKey);
+    if(branchStateMapIt != g_branchStates.end()) {
+        UA_DateTime mostRecentTime = 0;
+        for(const auto &branchPair : branchStateMapIt->second) {
+            if(branchPair.second.receiveTime > mostRecentTime) {
+                mostRecentTime = branchPair.second.receiveTime;
+                guid = branchPair.first;
+            }
+        }
+    }
+
+    std::vector<std::string> triggerTopics = findTriggerTopicsForAlarm(objectId);
+    if(!triggerTopics.empty()) {
+        std::string timestamp = getPreciseTimestamp();
+        std::string shelvedTill = getPreciseTimestampOffset(shelvingTimeMs);
+        
+        int AETypeID = 0;
+        auto triggerIt = g_triggerToAlarmMap.find(triggerTopics[0]);
+        if(triggerIt != g_triggerToAlarmMap.end()) {
+            for(const auto &mapping : triggerIt->second) {
+                if(mapping.alarmKey == alarmKey) {
+                    AETypeID = mapping.alarmId;
+                    break;
+                }
+            }
+        }
+        
+        // Build control request payload
+        json out;
+        out["Event"] = {
+            {"AETypeID", AETypeID},
+            {"AEInstanceID", guid},
+            {"Timestamp", timestamp},
+            {"Source", static_cast<int>(AlarmSource::OPC)},
+            {"UpdateType", static_cast<int>(UpdateType::Control)},
+            {"Quality", AlarmQuality::Good},
+            {"Command", "Shelve"},
+            {"ShelvedTill", shelvedTill}
+        };
+        
+        // Publish request
+        std::string subTopic = triggerTopics[0] + "/Event";
+        publish_to_mqtt(subTopic, out.dump());
+        
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                   "✓ Timed Shelve request sent for GUID '%s' (AETypeID=%d, duration=%f ms). Awaiting AE Engine approval...",
+                   guid.c_str(), AETypeID, shelvingTimeMs);
+    } else {
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                      "No trigger topics found for alarm, cannot send control request");
+    }
+
+    return UA_STATUSCODE_GOOD;
+}
+
+/* Custom Unshelve method callback */
+UA_StatusCode
+customUnshelveCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
+                        const UA_NodeId *methodId, void *methodContext,
+                        const UA_NodeId *objectId, void *objectContext, size_t inputSize,
+                        const UA_Variant *input, size_t outputSize, UA_Variant *output) {
+    InstrumentedGuard lock(g_alarmMutex);
+    std::string alarmKey = findAlarmKeyForCondition(objectId);
+    std::string guid = "";
+
+    auto branchStateMapIt = g_branchStates.find(alarmKey);
+    if(branchStateMapIt != g_branchStates.end()) {
+        UA_DateTime mostRecentTime = 0;
+        for(const auto &branchPair : branchStateMapIt->second) {
+            if(branchPair.second.receiveTime > mostRecentTime) {
+                mostRecentTime = branchPair.second.receiveTime;
+                guid = branchPair.first;
+            }
+        }
+    }
+
+    std::vector<std::string> triggerTopics = findTriggerTopicsForAlarm(objectId);
+    if(!triggerTopics.empty()) {
+        std::string timestamp = getPreciseTimestamp();
+        
+        int AETypeID = 0;
+        auto triggerIt = g_triggerToAlarmMap.find(triggerTopics[0]);
+        if(triggerIt != g_triggerToAlarmMap.end()) {
+            for(const auto &mapping : triggerIt->second) {
+                if(mapping.alarmKey == alarmKey) {
+                    AETypeID = mapping.alarmId;
+                    break;
+                }
+            }
+        }
+        
+        // Build control request payload
+        json out;
+        out["Event"] = {
+            {"AETypeID", AETypeID},
+            {"AEInstanceID", guid},
+            {"Timestamp", timestamp},
+            {"Source", static_cast<int>(AlarmSource::OPC)},
+            {"UpdateType", static_cast<int>(UpdateType::Control)},
+            {"Quality", AlarmQuality::Good},
+            {"Command", "Unshelve"}
+        };
+        
+        // Publish request
+        std::string subTopic = triggerTopics[0] + "/Event";
+        publish_to_mqtt(subTopic, out.dump());
+        
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                   "✓ Unshelve request sent for GUID '%s' (AETypeID=%d). Awaiting AE Engine approval...",
+                   guid.c_str(), AETypeID);
+    } else {
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                      "No trigger topics found for alarm, cannot send control request");
+    }
+
+    return UA_STATUSCODE_GOOD;
+}
+
+/* Helper to find ShelvedStateMachine and register shelving callbacks */
+void registerShelvingCallbacks(UA_Server *server, UA_NodeId alarmId) {
+    UA_NodeId shelvedStateMachineId = findChildNodeIdAnyNS(server, alarmId, "ShelvedStateMachine");
+    if(!UA_NodeId_isNull(&shelvedStateMachineId)) {
+        UA_NodeId oneShotShelveId = findChildNodeIdAnyNS(server, shelvedStateMachineId, "OneShotShelve");
+        if(!UA_NodeId_isNull(&oneShotShelveId)) {
+            UA_Server_setMethodNodeCallback(server, oneShotShelveId, customOneShotShelveCallback);
+        }
+        UA_NodeId timedShelveId = findChildNodeIdAnyNS(server, shelvedStateMachineId, "TimedShelve");
+        if(!UA_NodeId_isNull(&timedShelveId)) {
+            UA_Server_setMethodNodeCallback(server, timedShelveId, customTimedShelveCallback);
+        }
+        UA_NodeId unshelveId = findChildNodeIdAnyNS(server, shelvedStateMachineId, "Unshelve");
+        if(!UA_NodeId_isNull(&unshelveId)) {
+            UA_Server_setMethodNodeCallback(server, unshelveId, customUnshelveCallback);
+        }
+    }
+}
 
 
 struct RefreshEventData {
@@ -1080,11 +1380,15 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
         {
             UA_ByteString eventId = UA_BYTESTRING_NULL;
             UA_LocalizedText msg = UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Refresh Start");
+            UA_KeyValueMap map = UA_KEYVALUEMAP_NULL;
+            UA_String sourceName = UA_STRING((char *)"Server");
+            UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"SourceName"), &sourceName, &UA_TYPES[UA_TYPES_STRING]);
 
             UA_Server_createEvent(server, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
                                   UA_NODEID_NUMERIC(0, UA_NS0ID_REFRESHSTARTEVENTTYPE), 
-                                  100, msg, NULL, NULL, &eventId);
+                                  100, msg, &map, NULL, &eventId);
             UA_ByteString_clear(&eventId);
+            UA_KeyValueMap_clear(&map);
         }
 
     // STEP 2: Iterate through all alarms to COLLECT data
@@ -1161,120 +1465,50 @@ ConditionRefreshMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
     } // UNLOCK Mutex (End of Phase 1)
     
 
-    // STEP 3: Fire Events from Snapshot (Optimization #3: Template Map)
+    // STEP 3: Fire Events from Snapshot
     log("ConditionRefresh: Firing " + std::to_string(eventsToFire.size()) + " events...", LogLevel::INFO);
     
-    // 1. Create a "Template" map OUTSIDE the loop
-    UA_KeyValueMap map = UA_KEYVALUEMAP_NULL;
-    UA_NodeId eventTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE);
-    UA_Boolean enabledVal = UA_TRUE;
-    UA_LocalizedText enabledLT = UA_LOCALIZEDTEXT((char*)"en", (char*)"Enabled");
-    UA_Boolean retainVal = UA_TRUE; // Always true for Refresh
-
-    // Pre-set fields that are the same for all events
-    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EventType"), &eventTypeId, &UA_TYPES[UA_TYPES_NODEID]);
-    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EnabledState/Id"), &enabledVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
-    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"EnabledState"), &enabledLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Retain"), &retainVal, &UA_TYPES[UA_TYPES_BOOLEAN]);
-    
-    // Placeholders for dynamic fields (Optimization: Initialize once)
-    UA_NodeId nullNodeId = UA_NODEID_NULL;
-    UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionClassId"), &nullNodeId, &UA_TYPES[UA_TYPES_NODEID]);
+    std::unordered_set<std::string> triggeredConditions;
 
     for(auto &evt : eventsToFire) {
-        
-        // 2. Only update the DYNAMIC fields (Time, ActiveState, Severity, etc.)
-        
-        // ActiveState/Id
-        UA_Boolean activeId = evt.state.active;
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ActiveState/Id"), &activeId, &UA_TYPES[UA_TYPES_BOOLEAN]);
-        
-        // ActiveState
-        UA_LocalizedText activeLT = evt.state.active ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Active") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Inactive");
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ActiveState"), &activeLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+        // Trigger the condition node once per alarm
+        if (triggeredConditions.find(evt.alarmName) != triggeredConditions.end()) {
+            continue;
+        }
+        triggeredConditions.insert(evt.alarmName);
 
-        // AckedState/Id
-        UA_Boolean ackedId = evt.state.acked;
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"AckedState/Id"), &ackedId, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_ByteString eventId = UA_BYTESTRING_NULL;
+        UA_StatusCode rc = UA_Server_triggerConditionEvent(server, evt.conditionId, evt.sourceNodeId, &eventId);
 
-        // AckedState
-        UA_LocalizedText ackedLT = evt.state.acked ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Acknowledged") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unacknowledged");
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"AckedState"), &ackedLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-        // ConfirmedState/Id
-        UA_Boolean confirmedId = evt.state.confirmed;
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState/Id"), &confirmedId, &UA_TYPES[UA_TYPES_BOOLEAN]);
-
-        // ConfirmedState
-        UA_LocalizedText confirmedLT = evt.state.confirmed ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Confirmed") : UA_LOCALIZEDTEXT((char*)"en", (char*)"Unconfirmed");
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConfirmedState"), &confirmedLT, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
-
-        // Time
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Time"), &evt.state.time, &UA_TYPES[UA_TYPES_DATETIME]);
-
-        // ReceiveTime
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ReceiveTime"), &evt.state.receiveTime, &UA_TYPES[UA_TYPES_DATETIME]);
-
-        // Quality
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"Quality"), &evt.state.quality, &UA_TYPES[UA_TYPES_STATUSCODE]);
-
-        // BranchId
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"BranchId"), &evt.branchId, &UA_TYPES[UA_TYPES_NODEID]);
-
-        // SourceNode
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"SourceNode"), &evt.sourceNodeId, &UA_TYPES[UA_TYPES_NODEID]);
-
-        // ConditionName
-        UA_String condName = UA_STRING((char *)evt.alarmName.c_str());
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionName"), &condName, &UA_TYPES[UA_TYPES_STRING]);
-
-        // ConditionId
-        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"ConditionId"), &evt.conditionId, &UA_TYPES[UA_TYPES_NODEID]);
-
-        // Message & Severity (Arguments)
-        UA_LocalizedText msgText = UA_LOCALIZEDTEXT((char*)"en-US", (char*)evt.state.message.c_str()); 
-        
-        // Fire Event
-        UA_ByteString newEventId = UA_BYTESTRING_NULL;
-        
-        UA_StatusCode rc = UA_Server_createEvent(
-            server, evt.sourceNodeId,
-            UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE),
-            evt.state.severity, msgText, &map, NULL, &newEventId);
-
-        if(rc == UA_STATUSCODE_GOOD && newEventId.length > 0) {
-            // Note: We cannot update the 'state' eventIds here safely because it might have changed
-            // in the global map since we unlocked. However, refresh events are usually transient.
-            // If we need to track this EventId for Acknowledge, we need to re-lock and update g_branchStates.
-            
-            // Optimization: Only lock if we need to add the ID
+        if(rc == UA_STATUSCODE_GOOD && eventId.length > 0) {
             InstrumentedGuard lock(g_alarmMutex);
             auto &states = g_branchStates[evt.alarmName];
             auto it = states.find(evt.guid);
             if(it != states.end()) {
-                it->second.addEventId(&newEventId);
+                it->second.addEventId(&eventId);
             }
         } else {
             UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                          "Failed to create temp event for GUID '%s': %s",
-                          evt.guid.c_str(), UA_StatusCode_name(rc));
+                          "Failed to trigger condition event for '%s': %s",
+                          evt.alarmName.c_str(), UA_StatusCode_name(rc));
         }
         
-        UA_ByteString_clear(&newEventId);
-        // DO NOT Clear map here! We reuse it.
+        UA_ByteString_clear(&eventId);
     }
-    
-    UA_KeyValueMap_clear(&map); // Clean up once at the very end
 
-    // STEP 8: Fire RefreshEndEvent
+    // STEP 4: Fire RefreshEndEvent
     {
         UA_ByteString eventId = UA_BYTESTRING_NULL;
         UA_LocalizedText msg = UA_LOCALIZEDTEXT((char *)"en-US", (char *)"Refresh Complete");
-        // Source: Server, Type: RefreshEndEventType, Severity: 100
+        UA_KeyValueMap map = UA_KEYVALUEMAP_NULL;
+        UA_String sourceName = UA_STRING((char *)"Server");
+        UA_KeyValueMap_setScalar(&map, UA_QUALIFIEDNAME(0, (char*)"SourceName"), &sourceName, &UA_TYPES[UA_TYPES_STRING]);
+
         UA_Server_createEvent(server, UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER),
                               UA_NODEID_NUMERIC(0, UA_NS0ID_REFRESHENDEVENTTYPE),
-                              100, msg, NULL, NULL, &eventId);
+                              100, msg, &map, NULL, &eventId);
         UA_ByteString_clear(&eventId);
+        UA_KeyValueMap_clear(&map);
     }
 
     return UA_STATUSCODE_GOOD;

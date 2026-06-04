@@ -123,6 +123,8 @@ struct AlarmJobData {
     UA_DateTime now;
     std::string quality;
     UA_StatusCode qualityCode;
+    int updateType;
+    std::string shelvedTill;
     std::vector<TriggerToAlarmMapping> mappings;
 };
 
@@ -156,9 +158,9 @@ void enqueueServerJob(const std::function<void(UA_Server*)>& fn, ServerJobType t
 // ============================================================================
 
 // Store API credentials and org list globally for worker threads and auth
-static std::string g_bearerToken;
-static std::string g_apiHost;
-static std::string g_apiPort;
+std::string g_bearerToken;
+std::string g_apiHost;
+std::string g_apiPort;
 static std::string g_authUsername;  // From appsettings.json Authorization section
 static std::string g_authPassword;  // From appsettings.json Authorization section
 static std::vector<OrgConfig> g_organizations;  // List of all organizations
@@ -1305,7 +1307,7 @@ as::awaitable<void> perform_subscriptions() {
                 unsub_batch.emplace_back(topic);
             }
 
-            const std::string event_topic = topic + "/Event";
+            const std::string event_topic = topic + "/event/#";
             if(g_subscribed_topics.erase(event_topic)) {
                 unsub_batch.emplace_back(event_topic);
             }
@@ -1382,48 +1384,646 @@ as::awaitable<void> perform_subscriptions() {
         for(const auto &topic : sub_batch) {
             sub_entries.emplace_back(topic, am::qos::at_most_once);
 
-            // Subscribe to /Event ONLY if this topic is an alarm trigger
+            // Subscribe to /event/# ONLY if this topic is an alarm trigger
             if(g_triggerToAlarmMap.contains(topic)) {
-                sub_entries.emplace_back(topic + "/Event", am::qos::at_most_once);
+                sub_entries.emplace_back(topic + "/event/#", am::qos::at_most_once);
             }
         }
     }
 
-    try {
-        if(g_use_tls) {
-            co_await amcl_s.async_subscribe(
-                am::v5::subscribe_packet{*amcl_s.acquire_unique_packet_id(),
-                                         am::force_move(sub_entries)},
-                as::use_awaitable);
-        } else {
-            co_await amcl_w.async_subscribe(
-                am::v5::subscribe_packet{*amcl_w.acquire_unique_packet_id(),
-                                         am::force_move(sub_entries)},
-                as::use_awaitable);
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(g_sub_mutex);
-            for(const auto &topic : sub_batch) {
-                g_subscribed_topics.insert(topic);
-                // log("DEBUG: Subscribing to: " + topic, LogLevel::INFO);
-                if(g_triggerToAlarmMap.contains(topic)) {
-                    g_subscribed_topics.insert(topic + "/Event");
-                    log("DEBUG: Subscribing to/Event: " + topic + "/Event", LogLevel::INFO);
+    if(!sub_entries.empty()) {
+        try {
+                if(g_use_tls) {
+                    co_await amcl_s.async_subscribe(
+                        am::v5::subscribe_packet{*amcl_s.acquire_unique_packet_id(),
+                                                 am::force_move(sub_entries)},
+                        as::use_awaitable);
+                } else {
+                    co_await amcl_w.async_subscribe(
+                        am::v5::subscribe_packet{*amcl_w.acquire_unique_packet_id(),
+                                                 am::force_move(sub_entries)},
+                        as::use_awaitable);
                 }
+        
+                {
+                    std::lock_guard<std::mutex> lock(g_sub_mutex);
+                    for(const auto &topic : sub_batch) {
+                        g_subscribed_topics.insert(topic);
+                        // log("DEBUG: Subscribing to: " + topic, LogLevel::INFO);
+                        if(g_triggerToAlarmMap.contains(topic)) {
+                            g_subscribed_topics.insert(topic + "/event/#");
+                            log("DEBUG: Subscribing to/event/#: " + topic + "/event/#", LogLevel::INFO);
+                        }
+                    }
+        
+                    log("✓ Subscribed to " + std::to_string(sub_batch.size()) + " topics",
+                        LogLevel::INFO);
+                }
+        
+            } catch(const std::exception &e) {
+                log("ERROR: Subscription batch failed: " + std::string(e.what()),
+                    LogLevel::ERRORS);
             }
-
-            log("✓ Subscribed to " + std::to_string(sub_batch.size()) + " topics",
-                LogLevel::INFO);
-        }
-
-    } catch(const std::exception &e) {
-        log("ERROR: Subscription batch failed: " + std::string(e.what()),
-            LogLevel::ERRORS);
     }
 }
 
+
+// Forward declarations
+void handleAlarmHotReload(UA_Server *server, const std::string &payload);
+static void applyAlarmAdd(UA_Server *server, const AlarmConfig &alarm, UA_UInt16 nsIdx, const UA_NodeId *sourceNodeOverride = nullptr);
+static void applyAlarmUpdate(UA_Server *server, const AlarmConfig &alarm);
+static void applyAlarmDelete(UA_Server *server, const AlarmConfig &alarm);
+
+// Add: create alarm node and register it in global maps.
+static void applyAlarmAdd(UA_Server *server, const AlarmConfig &alarm, UA_UInt16 nsIdx, const UA_NodeId *sourceNodeOverride) {
+    if(!alarm.alarmEmitters.has_value()) return;
+    for(const auto &emitter : alarm.alarmEmitters.value()) {
+        std::string searchKey = emitter.emitterNodeName;
+        if(!searchKey.empty() && searchKey.back() == '/') searchKey.pop_back();
+
+        UA_NodeId sourceNode = UA_NODEID_NULL;
+
+        // If caller provided an explicit source node (e.g. from the old alarm location), use it directly
+        if(sourceNodeOverride && !UA_NodeId_isNull(sourceNodeOverride)) {
+            UA_NodeId_copy(sourceNodeOverride, &sourceNode);
+            log("applyAlarmAdd: using provided sourceNodeOverride for '" + searchKey + "'", LogLevel::INFO);
+        } else {
+            std::lock_guard<std::mutex> lk(g_nodeMap_mutex);
+            auto it = nodeMap.find(searchKey);
+            if(it != nodeMap.end()) sourceNode = it->second;
+        }
+
+        if(UA_NodeId_isNull(&sourceNode)) {
+            // Source node not in nodeMap — resolve or create the folder hierarchy
+            log("applyAlarmAdd: source node '" + searchKey + "' not in nodeMap. Resolving/creating...", LogLevel::INFO);
+            std::vector<std::string> parts = split(searchKey, '/');
+            if(!parts.empty()) {
+                // Resolve correct namespace index from org shortCode (first path segment)
+                UA_UInt16 resolvedNsIdx = nsIdx;
+                {
+                    std::string nsUri = "Anexee:" + parts[0];
+                    UA_String uaUri = UA_String_fromChars(nsUri.c_str());
+                    size_t idx = 0;
+                    if(UA_Server_getNamespaceByName(server, uaUri, &idx) == UA_STATUSCODE_GOOD) {
+                        resolvedNsIdx = (UA_UInt16)idx;
+                        log("applyAlarmAdd: resolved namespace '" + nsUri + "' -> ns=" + std::to_string(resolvedNsIdx), LogLevel::INFO);
+                    }
+                    UA_String_clear(&uaUri);
+                }
+                
+                // Start from OrgRoot (e.g., OrgRoot_TDSPL)
+                UA_NodeId parent = UA_NODEID_STRING_ALLOC(resolvedNsIdx, ("OrgRoot_" + parts[0]).c_str());
+                
+                std::string currentPath;
+                for(size_t i = 0; i < parts.size(); i++) {
+                    if(currentPath.empty()) currentPath = parts[i];
+                    else currentPath += "/" + parts[i];
+                    
+                    // Construct the expected NodeId for this folder
+                    UA_NodeId candidateId = UA_NODEID_STRING_ALLOC(resolvedNsIdx, currentPath.c_str());
+                    
+                    // Check if this node already exists in the OPC UA server
+                    UA_NodeClass nc = UA_NODECLASS_UNSPECIFIED;
+                    UA_StatusCode readSc = UA_Server_readNodeClass(server, candidateId, &nc);
+                    
+                    if(readSc == UA_STATUSCODE_GOOD && nc != UA_NODECLASS_UNSPECIFIED) {
+                        // Node exists — use it
+                        parent = candidateId;
+                        log("applyAlarmAdd: found existing node '" + currentPath + "' (ns=" + std::to_string(resolvedNsIdx) + ")", LogLevel::INFO);
+                    } else {
+                        // Node doesn't exist — create folder
+                        UA_ObjectAttributes oAttr = UA_ObjectAttributes_default;
+                        oAttr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", parts[i].c_str());
+                        UA_QualifiedName qName = UA_QUALIFIEDNAME_ALLOC(resolvedNsIdx, parts[i].c_str());
+                        
+                        UA_StatusCode addSc = UA_Server_addObjectNode(
+                            server, candidateId, parent,
+                            UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), qName,
+                            UA_NODEID_NUMERIC(0, UA_NS0ID_FOLDERTYPE), oAttr, NULL, NULL);
+                        
+                        UA_QualifiedName_clear(&qName);
+                        UA_ObjectAttributes_clear(&oAttr);
+                        
+                        if(addSc == UA_STATUSCODE_GOOD || addSc == UA_STATUSCODE_BADNODEIDEXISTS) {
+                            parent = candidateId;
+                            log("applyAlarmAdd: created/found folder '" + currentPath + "'", LogLevel::INFO);
+                        } else {
+                            log("applyAlarmAdd: failed to create folder '" + currentPath + "': " + 
+                                std::string(UA_StatusCode_name(addSc)), LogLevel::ERRORS);
+                        }
+                    }
+                    
+                    // Also register in global nodeMap so future lookups succeed
+                    {
+                        std::lock_guard<std::mutex> lk(g_nodeMap_mutex);
+                        if(!nodeMap.count(currentPath)) {
+                            nodeMap[currentPath] = parent;
+                        }
+                    }
+                }
+                sourceNode = parent;
+                // Update nsIdx to match the resolved namespace for alarm creation below
+                nsIdx = resolvedNsIdx;
+            }
+        }
+
+        if(UA_NodeId_isNull(&sourceNode)) {
+            log("applyAlarmAdd: could not resolve or create source node for '" + searchKey + "'. Skipping.", LogLevel::ERRORS);
+            continue;
+        }
+
+        std::string alarmKey = emitter.emitterNodeName + "-" + alarm.name;
+
+        // Idempotency: if alarm already exists skip creation
+        {
+            InstrumentedGuard lk(g_alarmMutex);
+            if(g_alarmByKey.count(alarmKey)) {
+                log("applyAlarmAdd: alarm '" + alarmKey + "' already exists — skipping add", LogLevel::INFO);
+                continue;
+            }
+        }
+
+        UA_NodeId requestedNodeId = UA_NODEID_STRING_ALLOC(nsIdx, alarmKey.c_str());
+
+        // Set EventNotifier on source node
+        UA_Byte evNotifier = 0x01;
+        UA_Server_writeEventNotifier(server, sourceNode, evNotifier);
+
+        UA_NodeId alarmId = UA_NODEID_NULL;
+        UA_StatusCode sc = UA_Server_createCondition(
+            server, requestedNodeId,
+            UA_NODEID_NUMERIC(0, UA_NS0ID_EXCLUSIVELIMITALARMTYPE),
+            UA_QUALIFIEDNAME_ALLOC(nsIdx, alarm.name.c_str()),
+            sourceNode,
+            UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+            &alarmId);
+        UA_NodeId_clear(&requestedNodeId);
+
+        if(sc == UA_STATUSCODE_BADNODEIDEXISTS) {
+            alarmId = UA_NODEID_STRING_ALLOC(nsIdx, alarmKey.c_str());
+            log("applyAlarmAdd: alarm '" + alarmKey + "' node already existed — re-using", LogLevel::INFO);
+        } else if(sc != UA_STATUSCODE_GOOD) {
+            log("applyAlarmAdd: UA_Server_createCondition failed for '" + alarmKey +
+                "': " + std::string(UA_StatusCode_name(sc)), LogLevel::ERRORS);
+            continue;
+        } else {
+            // Initialize alarm state
+            UA_Boolean enabled = alarm.enable ? UA_TRUE : UA_FALSE;
+            setStealthValueByPath(server, alarmId, {"EnabledState", "Id"}, &enabled, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            UA_Boolean inactive = UA_FALSE;
+            setStealthValueByPath(server, alarmId, {"ActiveState", "Id"}, &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            setStealthValueByPath(server, alarmId, {"AckedState", "Id"}, &inactive, &UA_TYPES[UA_TYPES_BOOLEAN]);
+            // Register method callbacks
+            UA_NodeId mId = findChildNodeIdAnyNS(server, alarmId, "Acknowledge");
+            if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customAcknowledgeCallback);
+            mId = findChildNodeIdAnyNS(server, alarmId, "Confirm");
+            if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customConfirmCallback);
+            mId = findChildNodeIdAnyNS(server, alarmId, "AddComment");
+            if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customAddCommentCallback);
+            mId = findChildNodeIdAnyNS(server, alarmId, "Enable");
+            if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customEnableCallback);
+            mId = findChildNodeIdAnyNS(server, alarmId, "Disable");
+            if(!UA_NodeId_isNull(&mId)) UA_Server_setMethodNodeCallback(server, mId, customDisableCallback);
+
+            // Register custom properties UpdateType and ShelvedTill
+            UA_VariableAttributes utAttr = UA_VariableAttributes_default;
+            utAttr.displayName = UA_LOCALIZEDTEXT((char*)"en-US", (char*)"UpdateType");
+            utAttr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
+            UA_Int32 defaultUpdateType = 0;
+            UA_Variant_setScalar(&utAttr.value, &defaultUpdateType, &UA_TYPES[UA_TYPES_INT32]);
+            UA_NodeId utPropId = UA_NODEID_NULL;
+            UA_Server_addVariableNode(server, utPropId, alarmId, 
+                UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                UA_QUALIFIEDNAME(nsIdx, (char*)"UpdateType"),
+                UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
+                utAttr, NULL, NULL);
+
+            UA_VariableAttributes stAttr = UA_VariableAttributes_default;
+            stAttr.displayName = UA_LOCALIZEDTEXT((char*)"en-US", (char*)"ShelvedTill");
+            stAttr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
+            UA_String defaultShelvedTill = UA_STRING((char*)"NA");
+            UA_Variant_setScalar(&stAttr.value, &defaultShelvedTill, &UA_TYPES[UA_TYPES_STRING]);
+            UA_NodeId stPropId = UA_NODEID_NULL;
+            UA_Server_addVariableNode(server, stPropId, alarmId,
+                UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                UA_QUALIFIEDNAME(nsIdx, (char*)"ShelvedTill"),
+                UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE),
+                stAttr, NULL, NULL);
+
+            registerShelvingCallbacks(server, alarmId);
+            log("applyAlarmAdd: created alarm '" + alarmKey + "'", LogLevel::INFO);
+        }
+
+        if(!UA_NodeId_isNull(&alarmId)) {
+            // Register in global maps
+            {
+                InstrumentedGuard lk(g_alarmMutex);
+
+                UA_NodeId globalId;
+                UA_NodeId_copy(&alarmId, &globalId);
+                if(g_alarmByKey.count(alarmKey)) UA_NodeId_clear(&g_alarmByKey[alarmKey]);
+                g_alarmByKey[alarmKey] = globalId;
+
+                // Emitter trigger mapping
+                if(!searchKey.empty()) {
+                    TriggerToAlarmMapping mapping;
+                    mapping.triggerTopic = searchKey;
+                    mapping.alarmKey = alarmKey;
+                    mapping.alarmId = alarm.id;
+                    mapping.alarmInstanceId = 0;
+                    mapping.triggerId = (alarm.alarmTriggers.has_value() && !alarm.alarmTriggers.value().empty())
+                                            ? alarm.alarmTriggers.value()[0].id : 0;
+                    bool exists = false;
+                    for(const auto &m : g_triggerToAlarmMap[mapping.triggerTopic]) {
+                        if(m.alarmKey == mapping.alarmKey && m.alarmId == mapping.alarmId) { exists = true; break; }
+                    }
+                    if(!exists) {
+                        g_triggerToAlarmMap[mapping.triggerTopic].push_back(mapping);
+                        log("applyAlarmAdd: mapped emitter '" + searchKey + "' -> alarm " + std::to_string(alarm.id), LogLevel::INFO);
+                    }
+                }
+
+                // Explicit trigger topic mappings
+                if(alarm.alarmTriggers.has_value()) {
+                    for(const auto &trigger : alarm.alarmTriggers.value()) {
+                        if(trigger.topic.empty() || trigger.topic == searchKey) continue;
+                        TriggerToAlarmMapping mapping;
+                        mapping.triggerTopic = trigger.topic;
+                        mapping.alarmKey = alarmKey;
+                        mapping.alarmId = alarm.id;
+                        mapping.alarmInstanceId = 0;
+                        mapping.triggerId = trigger.id;
+                        bool exists = false;
+                        for(const auto &m : g_triggerToAlarmMap[mapping.triggerTopic]) {
+                            if(m.alarmKey == mapping.alarmKey && m.alarmId == mapping.alarmId) { exists = true; break; }
+                        }
+                        if(!exists) g_triggerToAlarmMap[mapping.triggerTopic].push_back(mapping);
+                    }
+                }
+            }
+
+            // Subscribe to /event/# wildcard topics to capture messages like topic/event/408/guid
+            std::vector<std::string> pendingEventSubs;
+            if(!searchKey.empty()) pendingEventSubs.push_back(searchKey + "/event/#");
+            if(alarm.alarmTriggers.has_value()) {
+                for(const auto &trigger : alarm.alarmTriggers.value()) {
+                    if(!trigger.topic.empty()) pendingEventSubs.push_back(trigger.topic + "/event/#");
+                }
+            }
+            if(!pendingEventSubs.empty()) GlobalMQTT_SubscribeBatch(pendingEventSubs);
+
+            UA_NodeId_clear(&alarmId);
+        }
+    }
+}
+
+// Update: refresh alarm properties (enable/disable) without recreating the node.
+static void applyAlarmUpdate(UA_Server *server, const AlarmConfig &alarm) {
+    if(!alarm.alarmEmitters.has_value()) return;
+    for(const auto &emitter : alarm.alarmEmitters.value()) {
+        std::string searchKey = emitter.emitterNodeName;
+        if(!searchKey.empty() && searchKey.back() == '/') searchKey.pop_back();
+        std::string alarmKey = emitter.emitterNodeName + "-" + alarm.name;
+
+        // Detect if the alarm name or emitter changed by searching for the same alarm.id
+        std::vector<std::string> oldAlarmKeys;
+        {
+            InstrumentedGuard lk(g_alarmMutex);
+            for(const auto& [topic, mappings] : g_triggerToAlarmMap) {
+                for(const auto& m : mappings) {
+                    if(m.alarmId == alarm.id && m.alarmKey != alarmKey) {
+                        if(std::find(oldAlarmKeys.begin(), oldAlarmKeys.end(), m.alarmKey) == oldAlarmKeys.end()) {
+                            oldAlarmKeys.push_back(m.alarmKey);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Before deleting old alarms, capture the namespace index from the old alarm node
+        UA_UInt16 savedNsIdx = 0;
+        if(!oldAlarmKeys.empty()) {
+            const std::string& firstOldKey = oldAlarmKeys[0];
+            InstrumentedGuard lk(g_alarmMutex);
+            auto it = g_alarmByKey.find(firstOldKey);
+            if(it != g_alarmByKey.end()) {
+                savedNsIdx = it->second.namespaceIndex;
+            }
+        }
+
+        // Clean up any old alarm keys found
+        for(const std::string& oldKey : oldAlarmKeys) {
+            log("applyAlarmUpdate: cleaning up old alarm '" + oldKey + "' due to name/emitter change", LogLevel::INFO);
+            UA_NodeId oldNodeId = UA_NODEID_NULL;
+            {
+                InstrumentedGuard lk(g_alarmMutex);
+                auto it = g_alarmByKey.find(oldKey);
+                if(it != g_alarmByKey.end()) {
+                    UA_NodeId_copy(&it->second, &oldNodeId);
+                    for(auto &[topic, mappings] : g_triggerToAlarmMap) {
+                        mappings.erase(
+                            std::remove_if(mappings.begin(), mappings.end(),
+                                [&](const TriggerToAlarmMapping &m){ return m.alarmKey == oldKey; }),
+                            mappings.end());
+                    }
+                    UA_NodeId_clear(&it->second);
+                    g_alarmByKey.erase(it);
+                }
+            }
+            if(!UA_NodeId_isNull(&oldNodeId)) {
+                UA_Server_deleteNode(server, oldNodeId, UA_TRUE);
+                UA_NodeId_clear(&oldNodeId);
+            }
+            
+            // Clean up empty topics
+            std::vector<std::string> topicsToUnsub;
+            {
+                InstrumentedGuard lk(g_alarmMutex);
+                for(auto it = g_triggerToAlarmMap.begin(); it != g_triggerToAlarmMap.end(); ) {
+                    if(it->second.empty()) {
+                        topicsToUnsub.push_back(it->first + "/event");
+                        it = g_triggerToAlarmMap.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            if(!topicsToUnsub.empty()) GlobalMQTT_UnsubscribeBatch(topicsToUnsub);
+        }
+
+        UA_NodeId alarmId = UA_NODEID_NULL;
+        {
+            InstrumentedGuard lk(g_alarmMutex);
+            if(g_alarmByKey.count(alarmKey)) alarmId = g_alarmByKey[alarmKey];
+        }
+
+        if(UA_NodeId_isNull(&alarmId)) {
+            // Alarm doesn't exist yet (or was just deleted above) — treat as add
+            UA_NodeId sourceNode = UA_NODEID_NULL;
+            {
+                std::lock_guard<std::mutex> lk(g_nodeMap_mutex);
+                auto it = nodeMap.find(searchKey);
+                if(it != nodeMap.end()) sourceNode = it->second;
+            }
+            // Use saved namespace index, or derive from sourceNode, or resolve by org shortCode
+            UA_UInt16 nsIdx = savedNsIdx;
+            if(nsIdx == 0 && !UA_NodeId_isNull(&sourceNode)) nsIdx = sourceNode.namespaceIndex;
+            if(nsIdx == 0) {
+                // Resolve from org namespace URI: "Anexee:<shortCode>"
+                auto emitterParts = split(searchKey, '/');
+                if(!emitterParts.empty()) {
+                    std::string nsUri = "Anexee:" + emitterParts[0];
+                    UA_String uaUri = UA_String_fromChars(nsUri.c_str());
+                    size_t resolvedIdx = 0;
+                    if(UA_Server_getNamespaceByName(server, uaUri, &resolvedIdx) == UA_STATUSCODE_GOOD) {
+                        nsIdx = (UA_UInt16)resolvedIdx;
+                    }
+                    UA_String_clear(&uaUri);
+                }
+                if(nsIdx == 0) nsIdx = 1; // Last resort fallback
+            }
+            applyAlarmAdd(server, alarm, nsIdx, nullptr);
+            UA_NodeId_clear(&sourceNode);
+            continue;
+        }
+
+        // Update EnabledState
+        UA_Boolean enabled = alarm.enable ? UA_TRUE : UA_FALSE;
+        UA_LocalizedText tEnabled = enabled
+            ? UA_LOCALIZEDTEXT((char*)"en", (char*)"Enabled")
+            : UA_LOCALIZEDTEXT((char*)"en", (char*)"Disabled");
+        setStealthValueByPath(server, alarmId, {"EnabledState", "Id"}, &enabled, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        setStealthValueByPath(server, alarmId, {"EnabledState"}, &tEnabled, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
+
+        log("applyAlarmUpdate: updated alarm '" + alarmKey + "' enable=" + std::to_string(alarm.enable), LogLevel::INFO);
+    }
+}
+
+// Delete: remove alarm nodes and clean up global maps.
+static void applyAlarmDelete(UA_Server *server, const AlarmConfig &alarm) {
+    if(!alarm.alarmEmitters.has_value()) return;
+    for(const auto &emitter : alarm.alarmEmitters.value()) {
+        std::string searchKey = emitter.emitterNodeName;
+        if(!searchKey.empty() && searchKey.back() == '/') searchKey.pop_back();
+        std::string alarmKey = emitter.emitterNodeName + "-" + alarm.name;
+
+        UA_NodeId alarmId = UA_NODEID_NULL;
+        {
+            InstrumentedGuard lk(g_alarmMutex);
+            auto it = g_alarmByKey.find(alarmKey);
+            if(it == g_alarmByKey.end()) {
+                log("applyAlarmDelete: alarm '" + alarmKey + "' not found — nothing to delete", LogLevel::INFO);
+                continue;
+            }
+            UA_NodeId_copy(&it->second, &alarmId);
+            // Remove from trigger map
+            for(auto &[topic, mappings] : g_triggerToAlarmMap) {
+                mappings.erase(
+                    std::remove_if(mappings.begin(), mappings.end(),
+                        [&](const TriggerToAlarmMapping &m){ return m.alarmKey == alarmKey; }),
+                    mappings.end());
+            }
+            // Remove from alarmByKey
+            UA_NodeId_clear(&it->second);
+            g_alarmByKey.erase(it);
+        }
+
+        // Remove the condition node from the server
+        if(!UA_NodeId_isNull(&alarmId)) {
+            UA_StatusCode sc = UA_Server_deleteNode(server, alarmId, UA_TRUE);
+            if(sc == UA_STATUSCODE_GOOD) {
+                log("applyAlarmDelete: deleted alarm node '" + alarmKey + "'", LogLevel::INFO);
+            } else {
+                log("applyAlarmDelete: failed to delete alarm node '" + alarmKey +
+                    "': " + std::string(UA_StatusCode_name(sc)), LogLevel::ERRORS);
+            }
+            UA_NodeId_clear(&alarmId);
+        }
+
+        // Unsubscribe /event topics if no other alarms use them
+        std::vector<std::string> topicsToUnsub;
+        {
+            InstrumentedGuard lk(g_alarmMutex);
+            if(g_triggerToAlarmMap.count(searchKey) && g_triggerToAlarmMap[searchKey].empty()) {
+                topicsToUnsub.push_back(searchKey + "/event");
+                g_triggerToAlarmMap.erase(searchKey);
+            }
+            if(alarm.alarmTriggers.has_value()) {
+                for(const auto &trigger : alarm.alarmTriggers.value()) {
+                    if(!trigger.topic.empty() &&
+                       g_triggerToAlarmMap.count(trigger.topic) &&
+                       g_triggerToAlarmMap[trigger.topic].empty()) {
+                        topicsToUnsub.push_back(trigger.topic + "/event");
+                        g_triggerToAlarmMap.erase(trigger.topic);
+                    }
+                }
+            }
+        }
+        if(!topicsToUnsub.empty()) GlobalMQTT_UnsubscribeBatch(topicsToUnsub);
+    }
+}
+
+void handleAlarmHotReload(UA_Server *server, const std::string &payload) {
+    log("HTRLD/Events: received alarm hot reload payload. Offloading to detached thread.", LogLevel::INFO);
+
+    // Offload everything to a background thread so the MQTT I/O thread is never blocked!
+    std::thread([server, payload]() {
+        std::string sanitizedPayload = payload;
+        size_t pos = 0;
+        while((pos = sanitizedPayload.find(",,", pos)) != std::string::npos) {
+            sanitizedPayload.replace(pos, 2, ",");
+        }
+
+        json cmd;
+        try {
+            cmd = json::parse(sanitizedPayload);
+        } catch(const std::exception &e) {
+            log("HTRLD/Events: failed to parse payload JSON: " + std::string(e.what()), LogLevel::ERRORS);
+            return;
+        }
+
+        std::string commandName;
+        if(cmd.contains("commandName") && cmd["commandName"].is_string()) commandName = cmd["commandName"].get<std::string>();
+        else if(cmd.contains("CommandName") && cmd["CommandName"].is_string()) commandName = cmd["CommandName"].get<std::string>();
+        else if(cmd.contains("Action") && cmd["Action"].is_string()) commandName = cmd["Action"].get<std::string>();
+        else if(cmd.contains("action") && cmd["action"].is_string()) commandName = cmd["action"].get<std::string>();
+
+        log("HTRLD/Events: command='" + commandName + "'", LogLevel::INFO);
+
+        if(commandName == "Delete") {
+            std::vector<int> idsToDelete;
+            if(cmd.contains("ItemCollection") && cmd["ItemCollection"].is_array()) {
+                for(auto& idItem : cmd["ItemCollection"]) {
+                    if(idItem.is_number_integer()) idsToDelete.push_back(idItem.get<int>());
+                }
+            }
+            if(idsToDelete.empty()) {
+                log("HTRLD/Events: 'Delete' command received but ItemCollection is empty/invalid", LogLevel::WARNING);
+                return;
+            }
+            
+            enqueueServerJob([idsToDelete, server](UA_Server *srv) {
+                for(int idToDelete : idsToDelete) {
+                    std::vector<std::string> keysToDelete;
+                    {
+                        InstrumentedGuard lk(g_alarmMutex);
+                        for(const auto& [topic, mappings] : g_triggerToAlarmMap) {
+                            for(const auto& m : mappings) {
+                                if(m.alarmId == idToDelete) {
+                                    if(std::find(keysToDelete.begin(), keysToDelete.end(), m.alarmKey) == keysToDelete.end()) {
+                                        keysToDelete.push_back(m.alarmKey);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    for(const std::string& key : keysToDelete) {
+                        UA_NodeId oldNodeId = UA_NODEID_NULL;
+                        {
+                            InstrumentedGuard lk(g_alarmMutex);
+                            auto it = g_alarmByKey.find(key);
+                            if(it != g_alarmByKey.end()) {
+                                UA_NodeId_copy(&it->second, &oldNodeId);
+                                for(auto &[topic, mappings] : g_triggerToAlarmMap) {
+                                    mappings.erase(
+                                        std::remove_if(mappings.begin(), mappings.end(),
+                                            [&](const TriggerToAlarmMapping &m){ return m.alarmKey == key; }),
+                                        mappings.end());
+                                }
+                                UA_NodeId_clear(&it->second);
+                                g_alarmByKey.erase(it);
+                            }
+                        }
+                        if(!UA_NodeId_isNull(&oldNodeId)) {
+                            UA_Server_deleteNode(srv, oldNodeId, UA_TRUE);
+                            UA_NodeId_clear(&oldNodeId);
+                            log("HTRLD/Events: deleted alarm node '" + key + "' (ID: " + std::to_string(idToDelete) + ")", LogLevel::INFO);
+                        }
+                    }
+                }
+                
+                // Clean up empty topics
+                std::vector<std::string> topicsToUnsub;
+                {
+                    InstrumentedGuard lk(g_alarmMutex);
+                    for(auto it = g_triggerToAlarmMap.begin(); it != g_triggerToAlarmMap.end(); ) {
+                        if(it->second.empty()) {
+                            topicsToUnsub.push_back(it->first + "/event");
+                            it = g_triggerToAlarmMap.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+                if(!topicsToUnsub.empty()) GlobalMQTT_UnsubscribeBatch(topicsToUnsub);
+            });
+            return;
+        }
+
+        unsigned httpStatus = 0;
+        json apiResponse = callEventsHotReloadAPI(g_apiHost, g_apiPort, g_bearerToken, cmd, &httpStatus);
+        log("HTRLD/Events: callEventsHotReloadAPI returned HTTP " + std::to_string(httpStatus), LogLevel::INFO);
+
+        if(apiResponse.is_null() || apiResponse.empty()) {
+            log("HTRLD/Events: API returned empty/null — skipping hot reload", LogLevel::ERRORS);
+            return;
+        }
+
+        // Log a snippet of the raw response to help diagnose parse failures
+        {
+            std::string snippet = apiResponse.dump();
+            if(snippet.size() > 500) snippet = snippet.substr(0, 500) + "...[truncated]";
+            log("HTRLD/Events: API response preview: " + snippet, LogLevel::INFO);
+        }
+
+        std::vector<AlarmConfig> alarms = ParseAlarmConfigFromJson(apiResponse);
+        if(alarms.empty()) {
+            log("HTRLD/Events: ParseAlarmConfigFromJson returned 0 alarms — "
+                "check that the API response contains a 'data' array. "
+                "Full response logged above.", LogLevel::ERRORS);
+            return;
+        }
+
+        log("HTRLD/Events: applying " + std::to_string(alarms.size()) + " alarm(s) with command='" + commandName + "'", LogLevel::INFO);
+
+        if(commandName == "Add") {
+            for(const auto &alarm : alarms) {
+                AlarmConfig alarmCopy = alarm;
+                enqueueServerJob([alarmCopy, server](UA_Server *srv) {
+                    UA_UInt16 nsIdx = 1;
+                    if(alarmCopy.alarmEmitters.has_value() && !alarmCopy.alarmEmitters.value().empty()) {
+                        std::string searchKey = alarmCopy.alarmEmitters.value()[0].emitterNodeName;
+                        if(!searchKey.empty() && searchKey.back() == '/') searchKey.pop_back();
+                        std::lock_guard<std::mutex> lk(g_nodeMap_mutex);
+                        auto it = nodeMap.find(searchKey);
+                        if(it != nodeMap.end()) nsIdx = it->second.namespaceIndex;
+                    }
+                    applyAlarmAdd(srv, alarmCopy, nsIdx);
+                }, ServerJobType::AddAlarms);
+            }
+        } else if(commandName == "Update") {
+            for(const auto &alarm : alarms) {
+                AlarmConfig alarmCopy = alarm;
+                enqueueServerJob([alarmCopy, server](UA_Server *srv) {
+                    applyAlarmUpdate(srv, alarmCopy);
+                }, ServerJobType::Custom);
+            }
+        } else if(commandName == "Delete") {
+            for(const auto &alarm : alarms) {
+                AlarmConfig alarmCopy = alarm;
+                enqueueServerJob([alarmCopy, server](UA_Server *srv) {
+                    applyAlarmDelete(srv, alarmCopy);
+                }, ServerJobType::Custom);
+            }
+        } else {
+            log("HTRLD/Events: unknown command '" + commandName + "' — ignoring", LogLevel::WARNING);
+        }
+    }).detach();
+}
+
 // Forward declaration for MQTT packet processing
+
 // This function handles both alarm and telemetry messages
 void process_mqtt_packet(UA_Server* server, const std::string& topic, const std::string& payload);
 
@@ -1487,27 +2087,23 @@ void start_mqtt_client(UA_Server *server) {
                     {
                         InstrumentedGuard alarmLock(g_alarmMutex);
                         std::lock_guard<std::mutex> lock(g_sub_mutex);
-                        g_subscribed_topics.clear(); 
-                        g_pending_subscriptions.clear(); // Ensure clean state
-                        
-                        // Re-queue Alarms
-                        if(!g_triggerToAlarmMap.empty()) {
-                            log("DEBUG: Re-queueing " + std::to_string(g_triggerToAlarmMap.size()) + " alarm topics", LogLevel::INFO);
-                            for(const auto &pair : g_triggerToAlarmMap) {
-                                g_subscription_queue.push_back(pair.first);
-                                g_pending_subscriptions.insert(pair.first); // REQUIRED
-                            }
+                        // Re-queue previously active subscriptions
+                        log("DEBUG: Re-queueing " + std::to_string(g_subscribed_topics.size()) + " previously active subscriptions", LogLevel::INFO);
+                        for(const auto& topic : g_subscribed_topics) {
+                            g_subscription_queue.push_back(topic);
+                            g_pending_subscriptions.insert(topic);
                         }
                         
-                        // Re-queue Generic Telemetry
+                        g_subscribed_topics.clear(); // Clear AFTER moving to pending queue so they get re-subscribed
+
+                        // Always subscribe to the Alarm Hot Reload command topic
                         {
-                            std::lock_guard<std::mutex> nodeLock(g_nodeMap_mutex);
-                            if(!nodeMap.empty()) {
-                                log("DEBUG: Re-queueing " + std::to_string(nodeMap.size()) + " generic topics", LogLevel::INFO);
-                                for(const auto &pair : nodeMap) {
-                                    g_subscription_queue.push_back(pair.first);
-                                    g_pending_subscriptions.insert(pair.first); // REQUIRED
-                                }
+                            const std::string alarmHotReloadTopic = "HTRLD/Events";
+                            if(!g_pending_subscriptions.contains(alarmHotReloadTopic) &&
+                               !g_subscribed_topics.contains(alarmHotReloadTopic)) {
+                                g_subscription_queue.push_front(alarmHotReloadTopic);
+                                g_pending_subscriptions.insert(alarmHotReloadTopic);
+                                log("DEBUG: Priority Queued subscription for HTRLD/Events", LogLevel::INFO);
                             }
                         }
                     }
@@ -1537,18 +2133,30 @@ void start_mqtt_client(UA_Server *server) {
                                         return;
                                     }
 
+
+                                     if(topic == "HTRLD/Events") {
+                                         handleAlarmHotReload(server, payload);
+                                         return; // handled
+                                     }
+
+                                    /* OFFLOAD EVERYTHING TO SERVER THREAD TO UNBLOCK ASIO */
+                                    enqueueServerJob([topic, payload](UA_Server* server) {
                                     /* Check if this is a trigger topic for alarm conditions (.alarm.pub suffix) */
                                     std::string baseTopic = topic;
                                     
                                     // DEBUG LOGGING FOR ALARMS
-                                    if(topic.find("Event") != std::string::npos || topic.find("Alarm") != std::string::npos) {
+                                    if(topic.find("Event") != std::string::npos || topic.find("event") != std::string::npos || topic.find("Alarm") != std::string::npos || topic.find("alarm") != std::string::npos) {
                                          log("DEBUG: MQTT Recv: '" + topic + "' Payload: " + (payload.size() > 50 ? payload.substr(0,50) + "..." : payload), LogLevel::INFO);
                                     }
 
-                                    // Check if topic ends with /Event and extract base topic
-                                    if(topic.size() > 6 && topic.rfind("/Event") == topic.size() - 6) {
-                                        baseTopic = topic.substr(0, topic.size() - 6);
-                                        // log("DEBUG: Detected /Event topic, base='" + baseTopic + "'", LogLevel::INFO);
+                                    // Check if topic contains /Event or /event and extract base topic
+                                    // Handles both 'base/Event' and 'base/Event/408/guid' patterns
+                                    auto eventPos = topic.find("/Event");
+                                    if(eventPos == std::string::npos) {
+                                        eventPos = topic.find("/event");
+                                    }
+                                    if(eventPos != std::string::npos) {
+                                        baseTopic = topic.substr(0, eventPos);
                                     }
 
                                     // Thread-Safe Lookup: Copy mappings to local vector under lock
@@ -1579,41 +2187,57 @@ void start_mqtt_client(UA_Server *server) {
                                             if(alarmPayload.contains("Event")) {
                                                 log("DEBUG: 'Event' field found. Extracting data...", LogLevel::INFO);
                                                 auto &alarm = alarmPayload["Event"];
-                                                
-                                                // Extract AeInstanceID GUID
+
+                                                // Filter: only process events from AEEngine (Source=24)
+                                                // Ignore our own OPC-sourced control messages (Ack/Confirm/Enable/Disable)
+                                                if(alarm.contains("Source") && alarm["Source"].is_number()) {
+                                                    int src = alarm["Source"].get<int>();
+                                                    if(src != static_cast<int>(AlarmSource::AEEngine)) {
+                                                        log("DEBUG: Ignoring Event with Source=" + std::to_string(src) + " (not AEEngine=24)", LogLevel::INFO);
+                                                        return;
+                                                    }
+                                                }
+
+                                                // Extract AEInstanceID GUID
                                                 std::string aeInstanceId = "";
-                                                if(alarm.contains("AeInstanceID")) {
-                                                    if(alarm["AeInstanceID"].is_string()) {
-                                                        aeInstanceId = alarm["AeInstanceID"].get<std::string>();
-                                                    } else if(alarm["AeInstanceID"].is_number()) {
-                                                        aeInstanceId = std::to_string(alarm["AeInstanceID"].get<int>());
-                                                    } else if(!alarm["AeInstanceID"].is_null()) {
-                                                        aeInstanceId = alarm["AeInstanceID"].dump();
+                                                std::string aeInstKey = alarm.contains("AEInstanceID") ? "AEInstanceID" :
+                                                                        alarm.contains("AeInstanceID") ? "AeInstanceID" : "";
+                                                if(!aeInstKey.empty()) {
+                                                    if(alarm[aeInstKey].is_string()) {
+                                                        aeInstanceId = alarm[aeInstKey].get<std::string>();
+                                                    } else if(alarm[aeInstKey].is_number()) {
+                                                        aeInstanceId = std::to_string(alarm[aeInstKey].get<int>());
+                                                    } else if(!alarm[aeInstKey].is_null()) {
+                                                        aeInstanceId = alarm[aeInstKey].dump();
                                                     }
                                                 }
                                                 
-                                                // Extract AeTypeID
-                                                int AETypeID = 0;
-                                                if(alarm.contains("AeTypeID")) {
-                                                    if(alarm["AeTypeID"].is_string()) {
-                                                        try {
-                                                            AETypeID = std::stoi(alarm["AeTypeID"].get<std::string>());
-                                                        } catch(...) { log("DEBUG: Failed to convert AeTypeID string to int", LogLevel::INFO); }
-                                                    } else {
-                                                        AETypeID = alarm["AeTypeID"].get<int>();
-                                                    }
-                                                }
-                                                
-                                                bool active = alarm.value("Active", false);
-                                                bool enabled = alarm.value("Enabled", true);
-                                                bool shelved = alarm.value("Shelved", false);
-                                                bool acked = alarm.value("Acked", false);
-                                                bool confirmed = alarm.value("Confirmed", false);
-                                                
-                                                UA_UInt16 severity = static_cast<UA_UInt16>(alarm.value("Severity", 500));
-                                                std::string alarmMessage = alarm.value("AlarmMessage", "Alarm triggered");
-                                                std::string alarmName = alarm.value("Name", "");
-                                                std::string comment = alarm.value("Comment", "");
+                                                 // Extract AeTypeID — handle both 'AeTypeID' (mixed) and 'AETypeID' (all-caps)
+                                                 int AETypeID = 0;
+                                                 std::string aeTypeKey = alarm.contains("AeTypeID") ? "AeTypeID" :
+                                                                         alarm.contains("AETypeID") ? "AETypeID" : "";
+                                                 if(!aeTypeKey.empty()) {
+                                                     if(alarm[aeTypeKey].is_string()) {
+                                                         try {
+                                                             AETypeID = std::stoi(alarm[aeTypeKey].get<std::string>());
+                                                         } catch(...) { log("DEBUG: Failed to convert AeTypeID string to int", LogLevel::INFO); }
+                                                     } else if(alarm[aeTypeKey].is_number_integer()) {
+                                                         AETypeID = alarm[aeTypeKey].get<int>();
+                                                     }
+                                                 }
+                                                 
+                                                 bool active = alarm.value("Active", false);
+                                                 bool enabled = alarm.value("Enabled", true);
+                                                 bool shelved = alarm.value("Shelved", false);
+                                                 bool acked = alarm.value("Acked", false);
+                                                 bool confirmed = alarm.value("Confirmed", false);
+                                                 
+                                                 UA_UInt16 severity = static_cast<UA_UInt16>(alarm.value("Severity", 500));
+                                                 std::string alarmMessage = alarm.value("AlarmMessage", "Alarm triggered");
+                                                 std::string alarmName = alarm.value("Name", "");
+                                                 std::string comment = alarm.value("Comment", "");
+                                                int updateType = alarm.value("UpdateType", 1);
+                                                std::string shelvedTill = alarm.value("ShelvedTill", "");
                                                 
                                                 // Source/Quality/UpdateType enums
                                                 int qualityEnumValue = alarm.value("Quality", 1); // 1=Good
@@ -1622,7 +2246,7 @@ void start_mqtt_client(UA_Server *server) {
                                                 std::string quality = alarmQualityToString(qualityEnum);
                                                 
                                                 bool retain = alarm.value("Retain", false);
-
+ 
                                                 // Populate Job Data
                                                 AlarmJobData jobData;
                                                 jobData.AETypeID = AETypeID;
@@ -1640,6 +2264,8 @@ void start_mqtt_client(UA_Server *server) {
                                                 jobData.now = UA_DateTime_now(); 
                                                 jobData.quality = quality;
                                                 jobData.qualityCode = (quality == "Good") ? UA_STATUSCODE_GOOD : UA_STATUSCODE_BAD;
+                                                jobData.updateType = updateType;
+                                                jobData.shelvedTill = shelvedTill;
                                                 jobData.mappings = mappings;
 
                                                 
@@ -1777,6 +2403,28 @@ void start_mqtt_client(UA_Server *server) {
                                                             UA_LocalizedText comment = UA_LOCALIZEDTEXT((char*)"en", (char*)jobData.comment.c_str());
                                                             setStealthValueByPath(server, alarmId, {"Comment"}, &comment, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
                                                         }
+
+                                                        // Update custom properties UpdateType & ShelvedTill
+                                                        UA_Int32 utVal = jobData.updateType;
+                                                        setStealthValueByPath(server, alarmId, {"UpdateType"}, &utVal, &UA_TYPES[UA_TYPES_INT32]);
+                                                        
+                                                        if(!jobData.shelvedTill.empty()) {
+                                                            UA_String stVal = UA_STRING((char*)jobData.shelvedTill.c_str());
+                                                            setStealthValueByPath(server, alarmId, {"ShelvedTill"}, &stVal, &UA_TYPES[UA_TYPES_STRING]);
+                                                        }
+
+                                                        // ShelvedState
+                                                        UA_LocalizedText tShelvedState;
+                                                        if(jobData.shelved) {
+                                                            if(jobData.shelvedTill == "NA" || jobData.shelvedTill.empty()) {
+                                                                tShelvedState = UA_LOCALIZEDTEXT((char*)"en", (char*)"OneShotShelved");
+                                                            } else {
+                                                                tShelvedState = UA_LOCALIZEDTEXT((char*)"en", (char*)"TimedShelved");
+                                                            }
+                                                        } else {
+                                                            tShelvedState = UA_LOCALIZEDTEXT((char*)"en", (char*)"Unshelved");
+                                                        }
+                                                        setStealthValueByPath(server, alarmId, {"ShelvedStateMachine", "CurrentState"}, &tShelvedState, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
                                                         
                                                         // =========================================================
                                                         // STEP 3: Trigger Event
@@ -1792,9 +2440,25 @@ void start_mqtt_client(UA_Server *server) {
                                                         UA_ByteString eventId = UA_BYTESTRING_NULL;
                                                         UA_Server_triggerConditionEvent(server, alarmId, sourceNode, &eventId);
                                                         
-                                                        // Store EventId
-                                                        if(eventId.length > 0 && !jobData.aeInstanceId.empty()) {
-                                                            g_branchStates[mapping.alarmKey][jobData.aeInstanceId].addEventId(&eventId);
+                                                        // Store EventId and state in g_branchStates
+                                                        if(!jobData.aeInstanceId.empty()) {
+                                                            InstrumentedGuard lock(g_alarmMutex);
+                                                            auto &bs = g_branchStates[mapping.alarmKey][jobData.aeInstanceId];
+                                                            bs.active = jobData.active;
+                                                            bs.acked = jobData.acked;
+                                                            bs.confirmed = jobData.confirmed;
+                                                            bs.severity = jobData.severity;
+                                                            bs.message = jobData.alarmMessage;
+                                                            bs.time = jobData.now;
+                                                            bs.receiveTime = jobData.now;
+                                                            bs.retain = jobData.retain;
+                                                            bs.quality = jobData.qualityCode;
+                                                            bs.shelved = jobData.shelved;
+                                                            bs.shelvedTill = jobData.shelvedTill;
+                                                            bs.updateType = jobData.updateType;
+                                                            if(eventId.length > 0) {
+                                                                bs.addEventId(&eventId);
+                                                            }
                                                         }
                                                         UA_ByteString_clear(&eventId);
                                                         
@@ -1922,6 +2586,7 @@ void start_mqtt_client(UA_Server *server) {
                                             log("Generic Telemetry Parser Error: " + std::string(e.what()), LogLevel::ERRORS);
                                         }
                                     }
+                                    }, ServerJobType::Custom); // End of offloaded block!
                                 },
                                 [](auto const&) {}
                              });
@@ -1942,17 +2607,30 @@ void start_mqtt_client(UA_Server *server) {
                                             return;
                                         }
 
+
+                                        if(topic == "HTRLD/Events") {
+                                            handleAlarmHotReload(server, payload);
+                                            return;
+                                        }
+
+                                        /* OFFLOAD EVERYTHING TO SERVER THREAD TO UNBLOCK ASIO */
+                                        enqueueServerJob([topic, payload](UA_Server* server) {
                                         /* Check if this is a trigger topic for alarm conditions (.alarm.pub suffix) */
                                         std::string baseTopic = topic;
                                         
                                         // DEBUG LOGGING FOR ALARMS
-                                        if(topic.find("Event") != std::string::npos || topic.find("Alarm") != std::string::npos) {
+                                        if(topic.find("Event") != std::string::npos || topic.find("event") != std::string::npos || topic.find("Alarm") != std::string::npos || topic.find("alarm") != std::string::npos) {
                                              log("DEBUG: MQTT Recv: '" + topic + "' Payload: " + (payload.size() > 50 ? payload.substr(0,50) + "..." : payload), LogLevel::INFO);
                                         }
 
-                                        // Check if topic ends with /Event and extract base topic
-                                        if(topic.size() > 6 && topic.rfind("/Event") == topic.size() - 6) {
-                                            baseTopic = topic.substr(0, topic.size() - 6);
+                                        // Check if topic contains /Event or /event and extract base topic
+                                        // Handles both 'base/Event' and 'base/Event/408/guid' patterns
+                                        auto eventPos = topic.find("/Event");
+                                        if(eventPos == std::string::npos) {
+                                            eventPos = topic.find("/event");
+                                        }
+                                        if(eventPos != std::string::npos) {
+                                            baseTopic = topic.substr(0, eventPos);
                                         }
 
                                         // Thread-Safe Lookup: Copy mappings to local vector under lock
@@ -1981,28 +2659,41 @@ void start_mqtt_client(UA_Server *server) {
                                                 if(alarmPayload.contains("Event")) {
                                                     log("DEBUG: 'Event' field found. Extracting data...", LogLevel::INFO);
                                                     auto &alarm = alarmPayload["Event"];
-                                                    
-                                                    // Extract AeInstanceID GUID
-                                                    std::string aeInstanceId = "";
-                                                    if(alarm.contains("AeInstanceID")) {
-                                                        if(alarm["AeInstanceID"].is_string()) {
-                                                            aeInstanceId = alarm["AeInstanceID"].get<std::string>();
-                                                        } else if(alarm["AeInstanceID"].is_number()) {
-                                                            aeInstanceId = std::to_string(alarm["AeInstanceID"].get<int>());
-                                                        } else if(!alarm["AeInstanceID"].is_null()) {
-                                                            aeInstanceId = alarm["AeInstanceID"].dump();
+
+                                                    // Filter: only process events from AEEngine (Source=24)
+                                                    // Ignore our own OPC-sourced control messages (Ack/Confirm/Enable/Disable)
+                                                    if(alarm.contains("Source") && alarm["Source"].is_number()) {
+                                                        int src = alarm["Source"].get<int>();
+                                                        if(src != static_cast<int>(AlarmSource::AEEngine)) {
+                                                            log("DEBUG: Ignoring Event with Source=" + std::to_string(src) + " (not AEEngine=24)", LogLevel::INFO);
+                                                            return;
                                                         }
                                                     }
-                                                    
-                                                    // Extract AeTypeID
+
+                                                    // Extract AEInstanceID GUID
+                                                    std::string aeInstanceId = "";
+                                                    std::string aeInstKey = alarm.contains("AEInstanceID") ? "AEInstanceID" :
+                                                                            alarm.contains("AeInstanceID") ? "AeInstanceID" : "";
+                                                    if(!aeInstKey.empty()) {
+                                                        if(alarm[aeInstKey].is_string()) {
+                                                            aeInstanceId = alarm[aeInstKey].get<std::string>();
+                                                        } else if(alarm[aeInstKey].is_number()) {
+                                                            aeInstanceId = std::to_string(alarm[aeInstKey].get<int>());
+                                                        } else if(!alarm[aeInstKey].is_null()) {
+                                                            aeInstanceId = alarm[aeInstKey].dump();
+                                                        }
+                                                    }
+                                                     // Extract AeTypeID — handle both 'AeTypeID' (mixed) and 'AETypeID' (all-caps)
                                                     int AETypeID = 0;
-                                                    if(alarm.contains("AeTypeID")) {
-                                                        if(alarm["AeTypeID"].is_string()) {
+                                                    std::string aeTypeKey = alarm.contains("AeTypeID") ? "AeTypeID" :
+                                                                            alarm.contains("AETypeID") ? "AETypeID" : "";
+                                                    if(!aeTypeKey.empty()) {
+                                                        if(alarm[aeTypeKey].is_string()) {
                                                             try {
-                                                                AETypeID = std::stoi(alarm["AeTypeID"].get<std::string>());
+                                                                AETypeID = std::stoi(alarm[aeTypeKey].get<std::string>());
                                                             } catch(...) { log("DEBUG: Failed to convert AeTypeID string to int", LogLevel::INFO); }
-                                                        } else {
-                                                            AETypeID = alarm["AeTypeID"].get<int>();
+                                                        } else if(alarm[aeTypeKey].is_number_integer()) {
+                                                            AETypeID = alarm[aeTypeKey].get<int>();
                                                         }
                                                     }
                                                     
@@ -2016,6 +2707,8 @@ void start_mqtt_client(UA_Server *server) {
                                                     std::string alarmMessage = alarm.value("AlarmMessage", "Alarm triggered");
                                                     std::string alarmName = alarm.value("Name", "");
                                                     std::string comment = alarm.value("Comment", "");
+                                                    int updateType = alarm.value("UpdateType", 1);
+                                                    std::string shelvedTill = alarm.value("ShelvedTill", "");
                                                     
                                                     // Source/Quality/UpdateType enums
                                                     int qualityEnumValue = alarm.value("Quality", 1); // 1=Good
@@ -2024,7 +2717,7 @@ void start_mqtt_client(UA_Server *server) {
                                                     std::string quality = alarmQualityToString(qualityEnum);
                                                     
                                                     bool retain = alarm.value("Retain", false);
-
+ 
                                                     // Populate Job Data
                                                     AlarmJobData jobData;
                                                     jobData.AETypeID = AETypeID;
@@ -2042,6 +2735,8 @@ void start_mqtt_client(UA_Server *server) {
                                                     jobData.now = UA_DateTime_now(); 
                                                     jobData.quality = quality;
                                                     jobData.qualityCode = (quality == "Good") ? UA_STATUSCODE_GOOD : UA_STATUSCODE_BAD;
+                                                    jobData.updateType = updateType;
+                                                    jobData.shelvedTill = shelvedTill;
                                                     jobData.mappings = mappings;
 
                                                     
@@ -2135,6 +2830,28 @@ void start_mqtt_client(UA_Server *server) {
                                                                 UA_LocalizedText comment = UA_LOCALIZEDTEXT((char*)"en", (char*)jobData.comment.c_str());
                                                                 setStealthValueByPath(server, alarmId, {"Comment"}, &comment, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
                                                             }
+
+                                                            // Update custom properties UpdateType & ShelvedTill
+                                                            UA_Int32 utVal = jobData.updateType;
+                                                            setStealthValueByPath(server, alarmId, {"UpdateType"}, &utVal, &UA_TYPES[UA_TYPES_INT32]);
+                                                            
+                                                            if(!jobData.shelvedTill.empty()) {
+                                                                UA_String stVal = UA_STRING((char*)jobData.shelvedTill.c_str());
+                                                                setStealthValueByPath(server, alarmId, {"ShelvedTill"}, &stVal, &UA_TYPES[UA_TYPES_STRING]);
+                                                            }
+
+                                                            // ShelvedState
+                                                            UA_LocalizedText tShelvedState;
+                                                            if(jobData.shelved) {
+                                                                if(jobData.shelvedTill == "NA" || jobData.shelvedTill.empty()) {
+                                                                    tShelvedState = UA_LOCALIZEDTEXT((char*)"en", (char*)"OneShotShelved");
+                                                                } else {
+                                                                    tShelvedState = UA_LOCALIZEDTEXT((char*)"en", (char*)"TimedShelved");
+                                                                }
+                                                            } else {
+                                                                tShelvedState = UA_LOCALIZEDTEXT((char*)"en", (char*)"Unshelved");
+                                                            }
+                                                            setStealthValueByPath(server, alarmId, {"ShelvedStateMachine", "CurrentState"}, &tShelvedState, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
                                                             
                                                             // STEP 3: Trigger Event
                                                             std::string emitterName = mapping.alarmKey.substr(0, mapping.alarmKey.find("-"));
@@ -2147,8 +2864,25 @@ void start_mqtt_client(UA_Server *server) {
                                                             UA_ByteString eventId = UA_BYTESTRING_NULL;
                                                             UA_Server_triggerConditionEvent(server, alarmId, sourceNode, &eventId);
                                                             
-                                                            if(eventId.length > 0 && !jobData.aeInstanceId.empty()) {
-                                                                g_branchStates[mapping.alarmKey][jobData.aeInstanceId].addEventId(&eventId);
+                                                            // Store EventId and state in g_branchStates
+                                                            if(!jobData.aeInstanceId.empty()) {
+                                                                InstrumentedGuard lock(g_alarmMutex);
+                                                                auto &bs = g_branchStates[mapping.alarmKey][jobData.aeInstanceId];
+                                                                bs.active = jobData.active;
+                                                                bs.acked = jobData.acked;
+                                                                bs.confirmed = jobData.confirmed;
+                                                                bs.severity = jobData.severity;
+                                                                bs.message = jobData.alarmMessage;
+                                                                bs.time = jobData.now;
+                                                                bs.receiveTime = jobData.now;
+                                                                bs.retain = jobData.retain;
+                                                                bs.quality = jobData.qualityCode;
+                                                                bs.shelved = jobData.shelved;
+                                                                bs.shelvedTill = jobData.shelvedTill;
+                                                                bs.updateType = jobData.updateType;
+                                                                if(eventId.length > 0) {
+                                                                    bs.addEventId(&eventId);
+                                                                }
                                                             }
                                                             UA_ByteString_clear(&eventId);
                                                             
@@ -2256,6 +2990,7 @@ void start_mqtt_client(UA_Server *server) {
                                                 log("Generic Telemetry Parser Error: " + std::string(e.what()), LogLevel::ERRORS);
                                             }
                                         }
+                                        }, ServerJobType::Custom); // End of offloaded block!
                                     },
                                     [](auto const&) {}
                                  });
@@ -2270,11 +3005,25 @@ void start_mqtt_client(UA_Server *server) {
                             bool has_pending = false;
                             {
                                 std::lock_guard<std::mutex> lock(g_sub_mutex);
-                                has_pending = !g_subscription_queue.empty();
+                                has_pending = !g_subscription_queue.empty() || !g_unsubscription_queue.empty();
                             }
                             
                             if(has_pending) {
                                 co_await perform_subscriptions();
+                                
+                                as::steady_timer t(ioc); 
+                                t.expires_after(std::chrono::milliseconds(50));
+                                try {
+                                    co_await t.async_wait(as::use_awaitable);
+                                } catch(const boost::system::system_error& err) {
+                                    if(err.code() == boost::asio::error::operation_aborted) {
+                                        // Local timer t can ONLY be cancelled by coroutine cancellation
+                                        co_return;
+                                    } else {
+                                        throw;
+                                    }
+                                }
+                                
                                 continue;
                             }
                             
@@ -2284,14 +3033,11 @@ void start_mqtt_client(UA_Server *server) {
                                     co_await g_sub_timer->async_wait(as::use_awaitable);
                                 } catch (const boost::system::system_error& e) {
                                     if (e.code() == boost::asio::error::operation_aborted) {
-                                        // log("DEBUG: Signal received (Timer cancelled)", LogLevel::DEBUG);
-                                        // Only continue if this was an explicit queue signal
                                         if(g_signal_pending.exchange(false)) {
-                                            continue;
+                                            continue; // It was an explicit queue signal!
                                         }
-                                        // Otherwise, it's a shutdown signal (from sibling task failure) -> Exit loop
-                                        log("DEBUG: Subscription Loop Cancelled (Sibling failure or Shutdown)", LogLevel::INFO);
-                                        co_return;
+                                        log("DEBUG: Subscription Loop Cancelled (Shutdown)", LogLevel::INFO);
+                                        co_return; // Otherwise, the coroutine was cancelled by awaitable_operators!
                                     }
                                     throw;
                                 }
@@ -2968,18 +3714,6 @@ int RunServer(int argc, char **argv) {
 
 
 
-    // ========================================================================
-    // ALARMS & CONDITIONS: Register Refresh Callback
-    // ========================================================================
-    // Register the ConditionRefresh method callback on the standard ConditionType node
-    UA_NodeId refreshId = UA_NODEID_NUMERIC(0, UA_NS0ID_CONDITIONTYPE_CONDITIONREFRESH);
-    UA_StatusCode refreshRc = UA_Server_setMethodNodeCallback(server, refreshId, ConditionRefreshMethodCallback);
-    if(refreshRc == UA_STATUSCODE_GOOD) {
-        log("✓ Registered ConditionRefresh callback", LogLevel::INFO);
-    } else {
-        log("WARNING: Failed to register ConditionRefresh callback: " + std::string(UA_StatusCode_name(refreshRc)), LogLevel::ERRORS);
-    }
-
     // Start MQTT Client (Async)
     start_mqtt_client(server);
 
@@ -2995,6 +3729,20 @@ int RunServer(int argc, char **argv) {
          return EXIT_FAILURE;
     }
     log("Server startup completed successfully", LogLevel::INFO);
+
+    // ========================================================================
+    // ALARMS & CONDITIONS: Register Refresh Callback
+    // ========================================================================
+    // Register the ConditionRefresh method callback on the standard ConditionType node
+    // MUST BE DONE AFTER UA_Server_run_startup because open62541's internal A&C 
+    // initialization overwrites method callbacks.
+    UA_NodeId refreshId = UA_NODEID_NUMERIC(0, UA_NS0ID_CONDITIONTYPE_CONDITIONREFRESH);
+    UA_StatusCode refreshRc = UA_Server_setMethodNodeCallback(server, refreshId, ConditionRefreshMethodCallback);
+    if(refreshRc == UA_STATUSCODE_GOOD) {
+        log("✓ Registered ConditionRefresh callback (Override successful)", LogLevel::INFO);
+    } else {
+        log("WARNING: Failed to register ConditionRefresh callback: " + std::string(UA_StatusCode_name(refreshRc)), LogLevel::ERRORS);
+    }
     
     // ========================================================================
     // CRITICAL: Register access control callbacks AFTER server startup

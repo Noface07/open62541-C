@@ -87,4 +87,102 @@ std::pair<int, std::string> extractNsAndValue(const std::string& input);
 
 ServerConfig ServerConfigFromJSON(const json& item);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Hot reload (MQTT topic HTRLD/Edgents → /api/EdgentHotReloading)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One mapped tag option (mappedTagOptions[i]) inside a HotReloadItem. Each
+// option corresponds to one MQTT topic ↔ tagId pair that should drive a
+// monitored item on the OPC UA server side.
+struct HotReloadMappedTagOption {
+    int id = 0;
+    int tagId = 0;          // key used in Mapping / TopicMapping
+    int orgId = 0;
+    std::string name;
+    std::string namespaces; // MQTT topic (e.g. "TDSPL/UAv1/UAv21/UA_15001")
+};
+
+// One tag/datapoint entry from the EdgentHotReloading API response payload.
+// The API may return either a short identifier in `nodeId` (e.g. "ND011") or
+// a full OPC UA path in `namespacePath` (e.g. "ns=2;i=32081"); callers
+// prefer `namespacePath` and fall back to constructing one from
+// `nodeId` + the connected context's resolved namespace index.
+struct HotReloadItem {
+    int id = 0;            // hierarchy id of the item
+    int dataPointId = 0;   // hint for tagId fallback
+    std::string name;
+    std::string typeId;
+    std::string nodeId;        // raw identifier (e.g. "ND011")
+    std::string namespacePath; // full OPC UA node path (e.g. "ns=2;i=32081")
+    std::string parentId;
+    std::string rdWtOpt;       // from dataPointsModel.rdWtOpt (e.g. "RD_WRT_RW")
+    int orgId = 0;
+    double deadbandPercent = 0.0;
+    int sampling = 0;
+    int queueSize = 0;
+
+    // Group-level fields. Only populated when the API row describes an
+    // OPC_HI_GROUP and consumed by applyGroupUpdate to call
+    // UA_Client_Subscriptions_modify. -1 indicates "not present" so the
+    // dispatcher can preserve existing values it cannot override.
+    int publishingInterval = -1;
+    int maxKeepAliveCount = -1;
+    int lifetimeCount = -1;
+    int priority = -1;
+    int maxNotificationsPerPublish = -1;
+
+    std::vector<HotReloadMappedTagOption> mappedTagOptions;
+};
+
+/**
+ * @brief Issue a POST to /api/EdgentHotReloading with the original MQTT
+ *        command body and return the raw JSON response.
+ *
+ * @param outHttpStatus If non-null, receives the HTTP status code (e.g. 401)
+ *        on a completed response; 0 on transport / pre-response failure.
+ */
+json callHotReloadAPI(const std::string &host, const std::string &port,
+                      const std::string &bearerToken,
+                      const json &commandBody,
+                      unsigned *outHttpStatus = nullptr);
+
+/**
+ * @brief Issue a POST to /api/EventsHotReloading with the original MQTT
+ *        command body and return the raw JSON response.
+ *
+ * Used by the UA Server when a HTRLD/Events MQTT message is received.
+ * Mirrors callHotReloadAPI but targets the alarm/events endpoint.
+ *
+ * @param outHttpStatus If non-null, receives the HTTP status code on a
+ *        completed response; 0 on transport / pre-response failure.
+ */
+json callEventsHotReloadAPI(const std::string &host, const std::string &port,
+                            const std::string &bearerToken,
+                            const json &commandBody,
+                            unsigned *outHttpStatus = nullptr);
+
+/**
+ * @brief Extract the doubly-nested data array from the EdgentHotReloading
+ *        response envelope into a flat list of HotReloadItem.
+ *
+ * Returns an empty vector on any field-missing / bad-type condition rather
+ * than throwing.
+ */
+std::vector<HotReloadItem> parseHotReloadResponse(const json &response);
+
+/**
+ * @brief Walk the EdgentHotReloading response envelope and pull out any
+ *        OPC UA server descriptors (typeId == "OPC_HI_SERVER" or items that
+ *        carry an endpointUrl). Each entry is parsed into a fully populated
+ *        ServerInfoO including its groups/tags/mappedInfospaceTags so the
+ *        caller can spin up a brand-new ClientContext at runtime.
+ *
+ * Side effect: populates the global Mapping / TopicMapping for every newly
+ * discovered tag, mirroring the startup parser.
+ *
+ * Returns an empty vector on any field-missing / bad-type condition rather
+ * than throwing.
+ */
+std::vector<ServerInfoO> parseHotReloadServerEntries(const json &response);
+
 #endif // API_HANDLER_H

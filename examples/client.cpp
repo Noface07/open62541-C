@@ -66,6 +66,52 @@ std::atomic<bool> g_running(true);
 std::string APIusername = "bhupesh.paliwal@techondater.com";
 std::string APIpassword = "Admin@123";
 
+// ─── Hot reload routing ──────────────────────────────────────────────────────
+// Maps HotReloadCommand::purpose (= ServerInfoO::typeId) to the list of
+// endpoint URLs that share that typeId, so a single MQTT command can fan out
+// to every connected ClientContext serving the same purpose.
+static std::mutex                                            g_purposeMutex;
+static std::unordered_map<std::string, std::vector<std::string>> g_purposeToEndpoints;
+
+// ─── Hot reload coordinator ──────────────────────────────────────────────────
+// Single-worker queue that serializes API calls + dispatch off the MQTT thread
+// and outside any OPC UA thread. Workers may post UA mutations via
+// ClientContext::postOpcTask.
+static std::mutex                          g_hrMutex;
+static std::queue<std::function<void()>>   g_hrQueue;
+static std::condition_variable             g_hrCv;
+static std::thread                         g_hrWorker;
+static std::atomic<bool>                   g_hrRunning{false};
+
+// Protects clientPool (and the parallel clientContexts vector) against
+// concurrent reads from the MQTT callback (control writes look up the target
+// context by endpoint) and writes from the hot reload worker (Add/Delete on
+// purpose=OPC_HI_SERVER mutate the pool at runtime).
+static std::mutex                          g_clientPoolMutex;
+
+// Serializes reads/writes of runClient's `BearerToken` between the hot reload
+// worker, MQTT password refresh, and any path that re-authenticates after HTTP
+// 401.
+static std::mutex                          g_bearerTokenMutex;
+
+// Forward declaration: a configurable factory that produces a fully-
+// configured-and-started ClientContext for a given ServerInfoO. Initialized
+// in runClient() once all per-process state (BearerToken, EdgeConfig,
+// applicationEndURL, etc.) is loaded so that applyAddServer can reuse the
+// exact same setup pipeline used at startup.
+struct ClientContext; // defined below
+static std::function<std::unique_ptr<ClientContext>(const ServerInfoO &)>
+    g_buildContext;
+
+static void
+postHotReloadTask(std::function<void()> fn) {
+    {
+        std::lock_guard<std::mutex> lk(g_hrMutex);
+        g_hrQueue.push(std::move(fn));
+    }
+    g_hrCv.notify_one();
+}
+
 
 #ifdef _WIN32
 // Windows Service globals
@@ -175,10 +221,22 @@ struct UA_Client_Deleter {
 struct ClientContext {
     std::string name;
     std::string endpoint;
+    std::string typeId;       // ServerInfoO::typeId (e.g. "OPC_HI_SERVER")
+    std::string namespaceURI; // OPC UA Namespace URI for hot reload node lookup
+    // Hierarchy id of this server (= ServerInfoO::dataPointId at startup, or
+    // the id field on a hot reload OPC_HI_SERVER add). Used by the hot reload
+    // dispatcher to route Update/Delete commands to one specific server when
+    // the client owns multiple connections.
+    int serverHierarchyId = 0;
     std::unique_ptr<UA_Client, UA_Client_Deleter> client;
     std::map<std::string, UA_CreateSubscriptionResponse> subscriptions;
     std::atomic<bool> running;
     std::atomic<bool> isConnected;
+
+    // Resolved namespace index for `namespaceURI` (set by onConnected).
+    // Hot reload's applyAdd uses this to construct full OPC UA node paths
+    // like "ns=<resolvedNs>;s=<nodeId>" from the API's short nodeId field.
+    std::atomic<std::uint16_t> resolvedNs{0};
 
     // Thread 1: OPC UA network loop (run_iterate + OPC writes)
     std::thread opcThread;
@@ -194,6 +252,17 @@ struct ClientContext {
     // Queue for OPC UA operations — consumed ONLY by opcThread (no UA_Client sharing)
     std::mutex opcMutex;
     std::queue<std::function<void()>> opcQueue;
+
+    // Live monitored item registry indexed by hierarchyId. Populated when
+    // monitored items are created at startup or by applyAdd; consumed by
+    // applyDelete / applyUpdate / applyReload to undo previously created items.
+    std::mutex registryMutex;
+    std::unordered_map<int, std::vector<LiveMonitorEntry>> liveRegistry;
+
+    // Maps a group's hierarchy id to its `subscriptions` key (group.name) so
+    // hot reload's applyGroupUpdate can look up the OPC UA subscriptionId
+    // from the MQTT command's `id`.
+    std::unordered_map<int, std::string> groupIdToName;
 
     std::function<UA_StatusCode()> connectOnce;
     std::function<void()> onConnected;
@@ -265,6 +334,13 @@ struct ClientContext {
                         log(name + ": opcTask threw exception", LogLevel::ERRORS);
                     }
                 }
+
+                // A queued task may have flipped isConnected to false (e.g.
+                // applyReload's teardown). Re-check before run_iterate so we
+                // jump straight to the reconnect path instead of failing on
+                // a torn-down channel and burning the 5-second sleep below.
+                if(!isConnected.load(std::memory_order_acquire))
+                    continue;
 
                 // ── OPC UA network tick ──────────────────────────────────────
                 UA_StatusCode code = UA_Client_run_iterate(client.get(), 10);
@@ -524,6 +600,1211 @@ std::future<std::string> getBearerTokenNow(std::string applicationEndURLHost, st
     }
 
     return fut; // async: caller decides when to wait
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hot reload dispatchers
+//
+// Each function applies one MQTT-triggered action to a single ClientContext.
+// All actual UA_Client_* mutations are dispatched through ctx->postOpcTask so
+// they run on the OPC thread that owns the underlying UA_Client.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Build "ns=<idx>;s=<id>" for a string node id, "ns=<idx>;i=<id>" for a
+// purely numeric id. The hot reload API only ships the short identifier.
+static std::string
+buildNodePath(std::uint16_t nsIdx, const std::string &nodeId) {
+    if(nodeId.empty()) return {};
+
+    bool numeric = !nodeId.empty();
+    for(char c : nodeId) {
+        if(!std::isdigit(static_cast<unsigned char>(c))) {
+            numeric = false;
+            break;
+        }
+    }
+    return "ns=" + std::to_string(nsIdx) + (numeric ? ";i=" : ";s=") + nodeId;
+}
+
+static void
+applyAdd(ClientContext *ctx, const HotReloadCommand &cmd,
+         const std::vector<HotReloadItem> &items) {
+    if(!ctx) return;
+    if(items.empty()) {
+        log("HotReload Add: no items to add for hierarchy id " +
+                std::to_string(cmd.firstId()),
+            LogLevel::WARNING);
+        return;
+    }
+
+    const std::uint16_t nsIdx =
+        ctx->resolvedNs.load(std::memory_order_acquire);
+
+    // Pick a target subscription. The hot reload payload doesn't carry a
+    // group, so use the first available group subscription.
+    UA_UInt32 targetSubId = 0;
+    std::string targetGroupName;
+    {
+        // subscriptions is read on multiple threads. The OPC thread mutates
+        // it inside onConnected; we only read here, but the values are POD
+        // so a snapshot is safe enough for routing decisions.
+        for(const auto &kv : ctx->subscriptions) {
+            if(kv.first == ctx->name)
+                continue; // skip the events subscription
+            targetSubId = kv.second.subscriptionId;
+            targetGroupName = kv.first;
+            break;
+        }
+    }
+    if(targetSubId == 0) {
+        log("HotReload Add: no group subscription available on " +
+                ctx->endpoint,
+            LogLevel::ERRORS);
+        return;
+    }
+
+    // Pre-build everything that does NOT need the UA_Client.
+    // Each (item × mappedTagOption) pair becomes one monitor; if an item has
+    // no mappedTagOptions, we register a single placeholder monitor keyed on
+    // dataPointId/id.
+    std::vector<MappedInfospaceTag> infoSpaces;
+    std::vector<std::string>        nodePaths;
+    std::vector<std::string>        newTopics; // MQTT topics to subscribe
+    infoSpaces.reserve(items.size());
+    nodePaths.reserve(items.size());
+
+    auto resolvePath = [&](const HotReloadItem &it) -> std::string {
+        if(!it.namespacePath.empty())
+            return it.namespacePath;
+        if(nsIdx == 0) {
+            log("HotReload Add: item " + std::to_string(it.id) +
+                    " has no namespace and ctx->resolvedNs not set on " +
+                    ctx->endpoint,
+                LogLevel::ERRORS);
+            return std::string{};
+        }
+        return buildNodePath(nsIdx, it.nodeId);
+    };
+
+    // A valid OPC UA node path must start with "ns=" and contain a ";<i|s>=…"
+    // identifier. Anything else (e.g. the hierarchy label "Node 7" returned
+    // for OPC_HI_GROUP rows) cannot be monitored.
+    auto isValidUaPath = [](const std::string &p) {
+        if(p.compare(0, 3, "ns=") != 0) return false;
+        const auto semi = p.find(';');
+        if(semi == std::string::npos) return false;
+        const auto eq = p.find('=', semi);
+        return eq != std::string::npos;
+    };
+
+    for(const auto &it : items) {
+        // Hot reload payloads can describe non-leaf hierarchy nodes
+        // (OPC_HI_GROUP / OPC_HI_SERVER) — those aren't monitorable.
+        if(!it.typeId.empty() && it.typeId != "OPC_HI_DATAPOINT") {
+            log("HotReload Add: skipping non-datapoint item " +
+                    std::to_string(it.id) + " (typeId=" + it.typeId + ")",
+                LogLevel::DEBUG);
+            continue;
+        }
+
+        std::string path = resolvePath(it);
+        if(path.empty() || !isValidUaPath(path)) {
+            log("HotReload Add: item " + std::to_string(it.id) +
+                    " has no valid OPC UA path (got '" + path +
+                    "') — skipping",
+                LogLevel::WARNING);
+            continue;
+        }
+
+        // Per-item base info (shared across mappedTagOptions).
+        // `mappedId` is the mapped infospace's own id (e.g. 55444) and
+        // populates MappedInfospaceTag::id; it is distinct from `tagId`
+        // (the value used as the Mapping/TopicMapping key, e.g. 55701)
+        // and from `it.id` (the parent tag's hierarchy id, e.g. 1651).
+        auto buildInfo = [&](int mappedId, int tagId,
+                             const std::string &mqttTopic, int orgId) {
+            MappedInfospaceTag info{};
+            info.id = mappedId;
+            info.tagId = tagId;
+            info.name = it.name;
+            info.namespaces = mqttTopic;
+            info.samplingInterval = it.sampling;
+            info.deadband = 0;
+            info.queuesize = it.queueSize > 0 ? it.queueSize : 10000;
+            info.orgId = (orgId != 0) ? orgId
+                                      : (it.orgId != 0 ? it.orgId : cmd.orgId);
+            info.tagType = it.typeId;
+            info.hierarchyId = it.id;
+            return info;
+        };
+
+        if(!it.mappedTagOptions.empty()) {
+            for(const auto &opt : it.mappedTagOptions) {
+                const int tagId = opt.tagId;
+                if(tagId == 0) continue;
+                Mapping[tagId] = {path, ctx->endpoint};
+                if(!opt.namespaces.empty()) {
+                    TopicMapping[tagId] = opt.namespaces;
+                    newTopics.push_back(opt.namespaces);
+                }
+                infoSpaces.push_back(
+                    buildInfo(opt.id, tagId, opt.namespaces, opt.orgId));
+                nodePaths.push_back(path);
+            }
+        } else {
+            // Fallback: no mappedTagOptions in payload → use dataPointId / id.
+            const int tagId = (it.dataPointId != 0) ? it.dataPointId : it.id;
+            Mapping[tagId] = {path, ctx->endpoint};
+            infoSpaces.push_back(buildInfo(0, tagId, std::string{}, 0));
+            nodePaths.push_back(path);
+        }
+    }
+
+    if(infoSpaces.empty()) {
+        log("HotReload Add: nothing to register after filtering",
+            LogLevel::WARNING);
+        return;
+    }
+
+    // Make sure new control topics are subscribed at the broker so writes
+    // are delivered to this client. subscribeBatch is idempotent.
+    if(!newTopics.empty() && g_mqttHandler && g_mqttHandler->isConnected()) {
+        try {
+            g_mqttHandler->subscribeBatch(newTopics);
+            log("HotReload Add: subscribed " +
+                    std::to_string(newTopics.size()) +
+                    " MQTT topic(s) for control writes",
+                LogLevel::DEBUG);
+        } catch(const std::exception &e) {
+            log(std::string("HotReload Add: subscribeBatch failed: ") +
+                    e.what(),
+                LogLevel::WARNING);
+        }
+    }
+
+    ctx->postOpcTask([ctx, targetSubId, targetGroupName,
+                      infoSpaces = std::move(infoSpaces),
+                      nodePaths  = std::move(nodePaths),
+                      hierarchyId = cmd.firstId()]() mutable {
+        if(!ctx->client || !ctx->isConnected.load(std::memory_order_acquire)) {
+            log("HotReload Add: client not connected for " + ctx->endpoint,
+                LogLevel::ERRORS);
+            return;
+        }
+
+        const size_t count = infoSpaces.size();
+
+        UA_CreateMonitoredItemsRequest batchReq;
+        UA_CreateMonitoredItemsRequest_init(&batchReq);
+        batchReq.subscriptionId     = targetSubId;
+        batchReq.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+        batchReq.itemsToCreate =
+            (UA_MonitoredItemCreateRequest *)UA_Array_new(
+                count, &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
+        batchReq.itemsToCreateSize = count;
+
+        std::vector<MyMonitorContext *> ctxs(count, nullptr);
+        std::vector<UA_Client_DataChangeNotificationCallback> cbs(
+            count, handler_NodeValueChanged);
+        std::vector<UA_Client_DeleteMonitoredItemCallback> delCbs(count, nullptr);
+
+        for(size_t i = 0; i < count; ++i) {
+            UA_NodeId nodeId = UA_NODEID_NULL;
+            const std::string &p = nodePaths[i];
+            const char *nsStart = strstr(p.c_str(), "ns=");
+            if(nsStart) {
+                const char *nsEnd = strchr(nsStart + 3, ';');
+                if(nsEnd) {
+                    UA_UInt16 nsI = (UA_UInt16)strtoul(nsStart + 3, nullptr, 10);
+                    const char *idStart = nsEnd + 1;
+                    if(strncmp(idStart, "i=", 2) == 0)
+                        nodeId = UA_NODEID_NUMERIC(
+                            nsI, (UA_UInt32)strtoul(idStart + 2, nullptr, 10));
+                    else if(strncmp(idStart, "s=", 2) == 0)
+                        nodeId = UA_NODEID_STRING_ALLOC(nsI, idStart + 2);
+                }
+            }
+
+            UA_MonitoredItemCreateRequest &req = batchReq.itemsToCreate[i];
+            UA_MonitoredItemCreateRequest_init(&req);
+            UA_NodeId_copy(&nodeId, &req.itemToMonitor.nodeId);
+            UA_NodeId_clear(&nodeId);
+            req.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
+            req.monitoringMode = UA_MONITORINGMODE_REPORTING;
+            req.requestedParameters.samplingInterval = 0;
+            req.requestedParameters.queueSize =
+                (UA_UInt32)(infoSpaces[i].queuesize > 0 ? infoSpaces[i].queuesize
+                                                       : 10000);
+            req.requestedParameters.discardOldest = false;
+
+            UA_DataChangeFilter *filter =
+                (UA_DataChangeFilter *)UA_malloc(sizeof(UA_DataChangeFilter));
+            UA_DataChangeFilter_init(filter);
+            if(infoSpaces[i].deadband > 0) {
+                filter->deadbandType = UA_DEADBANDTYPE_ABSOLUTE;
+                filter->deadbandValue = infoSpaces[i].deadband;
+            }
+            filter->trigger = UA_DATACHANGETRIGGER_STATUSVALUE;
+            UA_ExtensionObject &fobj = req.requestedParameters.filter;
+            memset(&fobj, 0, sizeof(fobj));
+            fobj.encoding = UA_EXTENSIONOBJECT_DECODED;
+            fobj.content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER];
+            fobj.content.decoded.data = filter;
+
+            ctxs[i] = new MyMonitorContext{
+                infoSpaces[i], g_mqttHandler, g_sqliteService, nullptr,
+                g_asyncPublisher,
+                [ctx](std::function<void()> task) {
+                    ctx->postTask(std::move(task));
+                }};
+        }
+
+        UA_CreateMonitoredItemsResponse resp =
+            UA_Client_MonitoredItems_createDataChanges(
+                ctx->client.get(), batchReq, (void **)ctxs.data(), cbs.data(),
+                delCbs.data());
+
+        UA_CreateMonitoredItemsRequest_clear(&batchReq);
+
+        size_t ok = 0;
+        {
+            std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+            for(size_t i = 0; i < resp.resultsSize; ++i) {
+                if(resp.results[i].statusCode != UA_STATUSCODE_GOOD) {
+                    log("HotReload Add: monitor failed for tagId " +
+                            std::to_string(infoSpaces[i].tagId) + ": " +
+                            UA_StatusCode_name(resp.results[i].statusCode),
+                        LogLevel::ERRORS);
+                    delete ctxs[i];
+                    ctxs[i] = nullptr;
+                } else {
+                    ++ok;
+                    LiveMonitorEntry entry;
+                    entry.hierarchyId = hierarchyId;
+                    entry.tagId = infoSpaces[i].tagId;
+                    entry.monitoredItemId = resp.results[i].monitoredItemId;
+                    entry.subscriptionId = targetSubId;
+                    entry.groupName = targetGroupName;
+                    entry.endpointUrl = ctx->endpoint;
+                    entry.infoSpace = infoSpaces[i];
+                    ctx->liveRegistry[hierarchyId].push_back(std::move(entry));
+                }
+            }
+        }
+        UA_CreateMonitoredItemsResponse_clear(&resp);
+
+        log("HotReload Add: hierarchy " + std::to_string(hierarchyId) +
+                " on " + ctx->endpoint + ": " + std::to_string(ok) + "/" +
+                std::to_string(count) + " monitors created",
+            LogLevel::INFO);
+    });
+}
+
+// purpose=OPC_HI_GROUP, action=Add: create a new OPC UA subscription with the
+// group's parameters (publishingInterval, keepAlive, lifetime, priority, etc.)
+// and register it so future datapoint adds / group updates can route to it.
+//
+// The API returns only the group metadata row (children array is empty), so
+// we only create the subscription here — no monitored items are registered.
+static void
+applyAddGroup(ClientContext *ctx, const HotReloadCommand &cmd,
+              const std::vector<HotReloadItem> &items) {
+    if(!ctx) return;
+
+    // Find the OPC_HI_GROUP row in the response.
+    const HotReloadItem *groupItem = nullptr;
+    for(const auto &it : items) {
+        if(it.typeId == "OPC_HI_GROUP") {
+            groupItem = &it;
+            break;
+        }
+    }
+    if(!groupItem) {
+        log("HotReload AddGroup: no OPC_HI_GROUP row in API response for "
+            "id=" + std::to_string(cmd.firstId()),
+            LogLevel::WARNING);
+        return;
+    }
+
+    const int hierarchyId = groupItem->id;
+    const std::string groupName =
+        !groupItem->name.empty() ? groupItem->name
+                                 : ("group_" + std::to_string(hierarchyId));
+
+    // Check if this group already exists.
+    if(ctx->subscriptions.find(groupName) != ctx->subscriptions.end()) {
+        log("HotReload AddGroup: subscription '" + groupName +
+                "' already exists on " + ctx->endpoint + " — skipping",
+            LogLevel::WARNING);
+        return;
+    }
+
+    // Extract subscription parameters (mirroring the startup pattern at
+    // onConnected). Use defaults that match UA_CreateSubscriptionRequest_default
+    // when the API doesn't ship a value.
+    const int pubInterval =
+        (groupItem->publishingInterval > 0) ? groupItem->publishingInterval : 1000;
+    const UA_UInt32 requestedKeepAlive =
+        (groupItem->maxKeepAliveCount > 0) ? (UA_UInt32)groupItem->maxKeepAliveCount : 40;
+    UA_UInt32 requestedLifetime =
+        (groupItem->lifetimeCount > 0) ? (UA_UInt32)groupItem->lifetimeCount
+                                       : (requestedKeepAlive * 3);
+    if(requestedLifetime < (requestedKeepAlive * 3))
+        requestedLifetime = requestedKeepAlive * 3; // OPC UA constraint
+    const int priority =
+        (groupItem->priority >= 0) ? groupItem->priority : 0;
+    const int maxNotif =
+        (groupItem->maxNotificationsPerPublish >= 0)
+            ? groupItem->maxNotificationsPerPublish
+            : 0;
+
+    // Create the subscription on the OPC thread (UA_Client* is only safe there).
+    ctx->postOpcTask([ctx, groupName, hierarchyId, pubInterval,
+                      requestedKeepAlive, requestedLifetime, priority,
+                      maxNotif]() {
+        if(!ctx->client || !ctx->isConnected.load(std::memory_order_acquire)) {
+            log("HotReload AddGroup: client not connected for " + ctx->endpoint,
+                LogLevel::ERRORS);
+            return;
+        }
+
+        UA_CreateSubscriptionRequest greq = UA_CreateSubscriptionRequest_default();
+        greq.requestedPublishingInterval = (UA_Double)pubInterval;
+        greq.requestedMaxKeepAliveCount = requestedKeepAlive;
+        greq.requestedLifetimeCount = requestedLifetime;
+        greq.priority = (UA_Byte)std::min(255, priority);
+        greq.maxNotificationsPerPublish = (UA_UInt32)maxNotif;
+
+        UA_CreateSubscriptionResponse gsub =
+            UA_Client_Subscriptions_create(ctx->client.get(), greq,
+                                           nullptr, nullptr, nullptr);
+        if(gsub.responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
+            log("HotReload AddGroup: subscription creation failed for '" +
+                    groupName + "' on " + ctx->endpoint + ": " +
+                    UA_StatusCode_name(gsub.responseHeader.serviceResult),
+                LogLevel::ERRORS);
+            return;
+        }
+
+        ctx->subscriptions[groupName] = gsub;
+        if(hierarchyId != 0) {
+            ctx->groupIdToName[hierarchyId] = groupName;
+        }
+
+        log("HotReload AddGroup: subscription '" + groupName +
+                "' created on " + ctx->endpoint +
+                " (hierarchyId=" + std::to_string(hierarchyId) +
+                ", subId=" + std::to_string(gsub.subscriptionId) +
+                ", interval=" + std::to_string(gsub.revisedPublishingInterval) +
+                "ms)",
+            LogLevel::INFO);
+    });
+}
+
+// Delete every live monitored item on `ctx` that matches `deleteId`.
+// The MQTT `id` may be either the tag's hierarchy id (dataPointId / hot reload
+// `id`) or a mapped telemetry tagId (key in Mapping). We try registry lookup
+// by hierarchy key first, then collect any entries whose LiveMonitorEntry::tagId
+// matches.
+static bool
+applyDeleteSingle(ClientContext *ctx, int deleteId) {
+    if(!ctx) return false;
+
+    std::vector<LiveMonitorEntry> snapshot;
+    {
+        std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+        auto it = ctx->liveRegistry.find(deleteId);
+        if(it != ctx->liveRegistry.end() && !it->second.empty()) {
+            snapshot = std::move(it->second);
+            ctx->liveRegistry.erase(it);
+        } else {
+            for(auto rit = ctx->liveRegistry.begin();
+                rit != ctx->liveRegistry.end();) {
+                auto &vec = rit->second;
+                auto split = std::partition(
+                    vec.begin(), vec.end(), [&](const LiveMonitorEntry &e) {
+                        return e.tagId != deleteId;
+                    });
+                for(auto j = split; j != vec.end(); ++j)
+                    snapshot.push_back(std::move(*j));
+                vec.erase(split, vec.end());
+                if(vec.empty())
+                    rit = ctx->liveRegistry.erase(rit);
+                else
+                    ++rit;
+            }
+            if(snapshot.empty()) {
+                log("HotReload Delete: no live monitors for id " +
+                        std::to_string(deleteId) +
+                        " on " + ctx->endpoint +
+                        " (not found as hierarchyId or tagId in registry)",
+                    LogLevel::DEBUG);
+                return true;
+            }
+        }
+    }
+
+    // Clear global Mapping / TopicMapping for these tag ids up front so MQTT
+    // control writes targeting these tags fail fast while the OPC delete is
+    // queued.
+    for(const auto &e : snapshot) {
+        Mapping.erase(e.tagId);
+        TopicMapping.erase(e.tagId);
+    }
+
+    ctx->postOpcTask([ctx, snapshot = std::move(snapshot), deleteId]() {
+        if(!ctx->client) {
+            log("HotReload Delete: client null for " + ctx->endpoint,
+                LogLevel::ERRORS);
+            return;
+        }
+        size_t ok = 0;
+        for(const auto &e : snapshot) {
+            UA_StatusCode rc = UA_Client_MonitoredItems_deleteSingle(
+                ctx->client.get(), e.subscriptionId, e.monitoredItemId);
+            if(rc == UA_STATUSCODE_GOOD)
+                ++ok;
+            else
+                log("HotReload Delete: failed for tagId " +
+                        std::to_string(e.tagId) + ": " +
+                        UA_StatusCode_name(rc),
+                    LogLevel::ERRORS);
+        }
+        log("HotReload Delete: id " + std::to_string(deleteId) + " on " +
+                ctx->endpoint + ": " + std::to_string(ok) + "/" +
+                std::to_string(snapshot.size()) + " monitors removed",
+            LogLevel::INFO);
+    });
+    return true;
+}
+
+// Delete an entire OPC UA group: tear down every monitored item under the
+// group's subscription and delete the subscription itself. The MQTT command
+// id is the group's hierarchy id (= GroupInfo::dataPointId at startup).
+//
+// We never call the API for Delete — `groupHierarchyId` is the only input.
+static void
+applyDeleteGroup(ClientContext *ctx, int groupHierarchyId) {
+    if(!ctx) return;
+
+    // Resolve the subscription via groupIdToName (populated in onConnected).
+    std::string groupName;
+    {
+        auto it = ctx->groupIdToName.find(groupHierarchyId);
+        if(it == ctx->groupIdToName.end()) {
+            log("HotReload DeleteGroup: id " +
+                    std::to_string(groupHierarchyId) + " unknown on " +
+                    ctx->endpoint,
+                LogLevel::DEBUG);
+            return;
+        }
+        groupName = it->second;
+    }
+
+    auto subIt = ctx->subscriptions.find(groupName);
+    if(subIt == ctx->subscriptions.end()) {
+        log("HotReload DeleteGroup: subscription '" + groupName +
+                "' not active on " + ctx->endpoint,
+            LogLevel::WARNING);
+        return;
+    }
+    const UA_UInt32 subscriptionId = subIt->second.subscriptionId;
+
+    // Snapshot every live entry under this subscription so we can scrub
+    // Mapping/TopicMapping eagerly (MQTT writes that arrive after this point
+    // for the affected tag ids fail fast instead of routing into a soon-to-
+    // be-deleted subscription).
+    std::vector<LiveMonitorEntry> doomed;
+    {
+        std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+        for(auto rit = ctx->liveRegistry.begin();
+            rit != ctx->liveRegistry.end();) {
+            auto &vec = rit->second;
+            // Partition entries: keep ones not under this subscription.
+            auto split = std::partition(
+                vec.begin(), vec.end(), [&](const LiveMonitorEntry &e) {
+                    return e.subscriptionId != subscriptionId;
+                });
+            for(auto it = split; it != vec.end(); ++it)
+                doomed.push_back(std::move(*it));
+            vec.erase(split, vec.end());
+            if(vec.empty())
+                rit = ctx->liveRegistry.erase(rit);
+            else
+                ++rit;
+        }
+    }
+    for(const auto &e : doomed) {
+        Mapping.erase(e.tagId);
+        TopicMapping.erase(e.tagId);
+    }
+
+    ctx->postOpcTask([ctx, subscriptionId, groupName,
+                      groupHierarchyId, removed = doomed.size()]() {
+        if(!ctx->client) {
+            log("HotReload DeleteGroup: client null for " + ctx->endpoint,
+                LogLevel::ERRORS);
+            return;
+        }
+        // Deleting the subscription removes every monitored item it owns,
+        // so we don't need a separate per-item delete call here.
+        UA_StatusCode rc = UA_Client_Subscriptions_deleteSingle(
+            ctx->client.get(), subscriptionId);
+        if(rc != UA_STATUSCODE_GOOD) {
+            log("HotReload DeleteGroup: subscription delete failed for '" +
+                    groupName + "' (id=" + std::to_string(subscriptionId) +
+                    "): " + UA_StatusCode_name(rc),
+                LogLevel::ERRORS);
+        }
+        // Drop client-side bookkeeping regardless of UA status — the
+        // subscription is gone (or unreachable) either way.
+        ctx->subscriptions.erase(groupName);
+        ctx->groupIdToName.erase(groupHierarchyId);
+
+        log("HotReload DeleteGroup: '" + groupName + "' (id=" +
+                std::to_string(groupHierarchyId) + ") on " + ctx->endpoint +
+                " removed (" + std::to_string(removed) +
+                " monitored items dropped)",
+            LogLevel::INFO);
+    });
+}
+
+// Update = delete existing live monitors for this hierarchy id, then add
+// back using the freshly fetched items. Datapoint-level only; group / server
+// updates take separate paths (applyGroupUpdate, applyReload-on-one-server).
+static void
+applyUpdate(ClientContext *ctx, const HotReloadCommand &cmd,
+            const std::vector<HotReloadItem> &items) {
+    applyDeleteSingle(ctx, cmd.firstId());
+    applyAdd(ctx, cmd, items);
+}
+
+static void
+applyReload(ClientContext *ctx, const HotReloadCommand &cmd,
+            const std::vector<HotReloadItem> & /*items*/) {
+    // Reload restarts the OPC UA client connection. The teardown MUST run on
+    // the OPC thread so it doesn't race the reconnect logic at the top of
+    // ClientContext::startLoop. Critically, `isConnected` is flipped to false
+    // ONLY at the very end of the task — otherwise the OPC loop would see
+    // !isConnected on its next iteration and reconnect *before* this task
+    // ever ran, then we'd tear down the freshly-rebuilt session.
+    if(!ctx) return;
+
+    log("HotReload Reload: queuing restart for " + ctx->endpoint +
+            " (triggered by id=" + std::to_string(cmd.firstId()) +
+            " purpose=" + cmd.purpose + ")",
+        LogLevel::INFO);
+
+    ctx->postOpcTask([ctx]() {
+        // 1. Cleanly disconnect the live session. We do NOT reset the
+        //    UA_Client here: connectOnce() in the reconnect path replaces
+        //    ctx->client with a freshly-constructed instance via
+        //    `ctx->client.reset(UA_Client_new())`, and we want the existing
+        //    iteration to be able to call UA_Client_run_iterate (even on a
+        //    disconnected channel) without dereferencing a null pointer.
+        if(ctx->client) {
+            UA_Client_disconnect(ctx->client.get());
+        }
+
+        // 2. Wipe all derived state that onConnected will rebuild.
+        ctx->subscriptions.clear();
+        ctx->groupIdToName.clear();
+        ctx->resolvedNs.store(0, std::memory_order_release);
+
+        // 3. Drain liveRegistry and scrub the corresponding entries from
+        //    global Mapping / TopicMapping so MQTT control writes referencing
+        //    the reconnect repopulates them. (Removed because onConnected uses cached startup data)
+        std::vector<int> ownedTagIds;
+        {
+            std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+            for(const auto &kv : ctx->liveRegistry) {
+                for(const auto &e : kv.second)
+                    ownedTagIds.push_back(e.tagId);
+            }
+            ctx->liveRegistry.clear();
+        }
+
+        // 4. LAST step: signal the OPC loop to reconnect on its next
+        //    iteration. Order matters: any earlier flip would let the loop
+        //    reconnect before the cleanup above completes.
+        ctx->isConnected.store(false, std::memory_order_release);
+
+        log("HotReload Reload: " + ctx->endpoint +
+                " teardown complete; reconnect pending (cleared " +
+                std::to_string(ownedTagIds.size()) + " tag mappings)",
+            LogLevel::INFO);
+    });
+}
+
+// Apply an `Update` command whose purpose is `OPC_HI_GROUP`: re-apply the
+// group's subscription-level parameters via UA_Client_Subscriptions_modify.
+// This neither creates nor destroys monitored items — it only mutates the
+// subscription that already drives them.
+static void
+applyGroupUpdate(ClientContext *ctx, const HotReloadCommand &cmd,
+                 const std::vector<HotReloadItem> &items) {
+    if(!ctx) return;
+
+    // Find the group-typed item that matches the command id. Hot reload
+    // responses for groups always contain a single row, but be defensive.
+    const int targetId = cmd.firstId();
+    const HotReloadItem *match = nullptr;
+    for(const auto &it : items) {
+        if(it.typeId == "OPC_HI_GROUP" && it.id == targetId) {
+            match = &it;
+            break;
+        }
+    }
+    if(!match) {
+        // Fall back to the first OPC_HI_GROUP entry if id matching fails.
+        for(const auto &it : items) {
+            if(it.typeId == "OPC_HI_GROUP") {
+                match = &it;
+                break;
+            }
+        }
+    }
+    if(!match) {
+        log("HotReload GroupUpdate: no OPC_HI_GROUP row in API response for "
+            "id=" + std::to_string(targetId),
+            LogLevel::WARNING);
+        return;
+    }
+
+    // Look up the live subscription for this group on this context.
+    // Primary: match by hierarchy id captured at startup. Fallback: match by
+    // the API response's `name` field directly against `ctx->subscriptions`,
+    // since startup uses `group.name` as the subscription key. The fallback
+    // is essential when the startup hierarchy API doesn't expose a top-level
+    // `id` for groups but the hot reload API does.
+    std::string groupName;
+    auto nameIt = ctx->groupIdToName.find(targetId);
+    if(nameIt != ctx->groupIdToName.end()) {
+        groupName = nameIt->second;
+    } else if(!match->name.empty() &&
+              ctx->subscriptions.find(match->name) != ctx->subscriptions.end()) {
+        groupName = match->name;
+        log("HotReload GroupUpdate: id " + std::to_string(targetId) +
+                " not in groupIdToName; resolved by name '" + match->name +
+                "' on " + ctx->endpoint,
+            LogLevel::DEBUG);
+        ctx->groupIdToName[targetId] = match->name;
+    } else {
+        log("HotReload GroupUpdate: no group with id " +
+                std::to_string(targetId) + " or name '" + match->name +
+                "' known on " + ctx->endpoint,
+            LogLevel::DEBUG);
+        return;
+    }
+
+    auto subIt = ctx->subscriptions.find(groupName);
+    if(subIt == ctx->subscriptions.end()) {
+        log("HotReload GroupUpdate: subscription '" + groupName +
+                "' not active on " + ctx->endpoint,
+            LogLevel::WARNING);
+        return;
+    }
+    const UA_CreateSubscriptionResponse current = subIt->second;
+
+    // Build the Modify request. Where the API didn't ship a value, keep the
+    // current revised value so we don't downgrade settings the server has
+    // already committed to.
+    const HotReloadItem &m = *match;
+    UA_ModifySubscriptionRequest mreq;
+    UA_ModifySubscriptionRequest_init(&mreq);
+    mreq.subscriptionId = current.subscriptionId;
+    mreq.requestedPublishingInterval =
+        (m.publishingInterval > 0) ? (UA_Double)m.publishingInterval
+                                   : current.revisedPublishingInterval;
+
+    const UA_UInt32 newKeepAlive =
+        (m.maxKeepAliveCount > 0) ? (UA_UInt32)m.maxKeepAliveCount
+                                  : current.revisedMaxKeepAliveCount;
+    mreq.requestedMaxKeepAliveCount = newKeepAlive;
+
+    UA_UInt32 newLifetime =
+        (m.lifetimeCount > 0)
+            ? (UA_UInt32)m.lifetimeCount
+            : current.revisedLifetimeCount;
+    if(newLifetime < newKeepAlive * 3)
+        newLifetime = newKeepAlive * 3; // OPC UA constraint
+    mreq.requestedLifetimeCount = newLifetime;
+
+    mreq.maxNotificationsPerPublish =
+        (m.maxNotificationsPerPublish >= 0)
+            ? (UA_UInt32)m.maxNotificationsPerPublish
+            : 0;
+    mreq.priority =
+        (m.priority >= 0) ? (UA_Byte)std::min(255, m.priority)
+                          : (UA_Byte)0;
+
+    log("HotReload GroupUpdate: queuing modify for '" + groupName +
+            "' on " + ctx->endpoint +
+            " | interval=" + std::to_string(m.publishingInterval) +
+            " keepAlive=" + std::to_string(m.maxKeepAliveCount) +
+            " priority=" + std::to_string(m.priority),
+        LogLevel::INFO);
+
+    ctx->postOpcTask([ctx, mreq, groupName]() {
+        if(!ctx->client ||
+           !ctx->isConnected.load(std::memory_order_acquire)) {
+            log("HotReload GroupUpdate: client not connected for " +
+                    ctx->endpoint,
+                LogLevel::ERRORS);
+            return;
+        }
+
+        UA_ModifySubscriptionResponse mresp =
+            UA_Client_Subscriptions_modify(ctx->client.get(), mreq);
+
+        if(mresp.responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
+            log("HotReload GroupUpdate: modify failed for '" + groupName +
+                    "': " +
+                    UA_StatusCode_name(mresp.responseHeader.serviceResult),
+                LogLevel::ERRORS);
+        } else {
+            // Update our cached revised values so future modifies see the
+            // freshest server-acknowledged numbers.
+            auto sIt = ctx->subscriptions.find(groupName);
+            if(sIt != ctx->subscriptions.end()) {
+                sIt->second.revisedPublishingInterval =
+                    mresp.revisedPublishingInterval;
+                sIt->second.revisedMaxKeepAliveCount =
+                    mresp.revisedMaxKeepAliveCount;
+                sIt->second.revisedLifetimeCount =
+                    mresp.revisedLifetimeCount;
+            }
+            log("HotReload GroupUpdate: '" + groupName +
+                    "' modified | revisedInterval=" +
+                    std::to_string(mresp.revisedPublishingInterval) +
+                    "ms revisedKeepAlive=" +
+                    std::to_string(mresp.revisedMaxKeepAliveCount) +
+                    " revisedLifetime=" +
+                    std::to_string(mresp.revisedLifetimeCount),
+                LogLevel::INFO);
+        }
+        UA_ModifySubscriptionResponse_clear(&mresp);
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPC_HI_SERVER dispatchers (Add / Delete / Update)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Find a connected ClientContext by serverHierarchyId. Returns nullptr if no
+// match. Caller MUST hold g_clientPoolMutex.
+static ClientContext *
+findServerByHierarchyId_locked(
+    int serverHierarchyId,
+    std::unordered_map<std::string, ClientContext *> &clientPool) {
+    for(auto &kv : clientPool) {
+        if(kv.second && kv.second->serverHierarchyId == serverHierarchyId)
+            return kv.second;
+    }
+    return nullptr;
+}
+
+// Subscribe to every MQTT control topic owned by a freshly-built server so
+// MQTT writes can route into it. Idempotent — duplicate subscriptions are
+// no-ops at the broker.
+static void
+subscribeServerControlTopics(const ServerInfoO &server) {
+    if(!g_mqttHandler || !g_mqttHandler->isConnected())
+        return;
+    std::vector<std::string> topics;
+    for(const auto &group : server.groups) {
+        for(const auto &tag : group.tags) {
+            if(tag.rdWtOpt != "RD_WRT_RW")
+                continue;
+            if(!tag.mappedInfospaceTags)
+                continue;
+            for(const auto &mi : *tag.mappedInfospaceTags) {
+                if(!mi.namespaces.empty())
+                    topics.push_back(mi.namespaces);
+            }
+        }
+    }
+    if(topics.empty())
+        return;
+    try {
+        g_mqttHandler->subscribeBatch(topics);
+        log("HotReload AddServer: subscribed " +
+                std::to_string(topics.size()) +
+                " MQTT control topic(s) for " + server.name,
+            LogLevel::INFO);
+    } catch(const std::exception &e) {
+        log(std::string("HotReload AddServer: subscribeBatch failed: ") +
+                e.what(),
+            LogLevel::WARNING);
+    }
+}
+
+// POST /api/EdgentHotReloading with automatic bearer refresh: uses the
+// in-memory token first, fetches a new one when it is empty, and on HTTP 401
+// / 403 re-signs in once and retries (JWT from startup often expires long
+// before the OPC UA client process exits).
+static json
+callHotReloadApiWithTokenRefresh(
+    const std::string &apiHost, const std::string &apiPort,
+    std::string &bearerToken, const std::string &authUsername,
+    const std::string &authPassword, const json &commandBody) {
+    std::string tok;
+    {
+        std::lock_guard<std::mutex> lk(g_bearerTokenMutex);
+        tok = bearerToken;
+    }
+
+    if(tok.empty()) {
+        log("HotReload: bearer token empty — fetching before API call",
+            LogLevel::INFO);
+        try {
+            std::string fresh =
+                getBearerTokenNow(apiHost, apiPort, authUsername,
+                                  authPassword, true).get();
+            if(!fresh.empty()) {
+                {
+                    std::lock_guard<std::mutex> lk(g_bearerTokenMutex);
+                    bearerToken = fresh;
+                }
+                tok = std::move(fresh);
+                if(g_sqliteService)
+                    g_sqliteService->SetApiAuth(tok);
+            }
+        } catch(const std::exception &e) {
+            log(std::string("HotReload: initial token fetch failed: ") +
+                    e.what(),
+                LogLevel::ERRORS);
+        }
+    }
+
+    unsigned st = 0;
+    json resp =
+        callHotReloadAPI(apiHost, apiPort, tok, commandBody, &st);
+    if(!resp.is_null())
+        return resp;
+
+    if(st == 401U || st == 403U) {
+        log("HotReload: EdgentHotReloading HTTP " + std::to_string(st) +
+                " — refreshing bearer token and retrying once",
+            LogLevel::WARNING);
+        try {
+            std::string fresh = getBearerTokenNow(apiHost, apiPort, authUsername,
+                                                  authPassword, true).get();
+            if(!fresh.empty()) {
+                {
+                    std::lock_guard<std::mutex> lk(g_bearerTokenMutex);
+                    bearerToken = fresh;
+                }
+                if(g_sqliteService)
+                    g_sqliteService->SetApiAuth(fresh);
+                return callHotReloadAPI(apiHost, apiPort, fresh,
+                                        commandBody, nullptr);
+            }
+        } catch(const std::exception &e) {
+            log(std::string("HotReload: token refresh failed: ") + e.what(),
+                LogLevel::ERRORS);
+        }
+    }
+    return json{};
+}
+
+// purpose=OPC_HI_SERVER, action=Add (Option C): hit the API to fetch the
+// new server's full descriptor (security, auth, groups, tags), then spawn a
+// fresh ClientContext via g_buildContext and register it in the pool.
+//
+// Idempotent: skips servers whose endpointUrl is already in the pool.
+static void
+applyAddServer(
+    const std::string &apiHost, const std::string &apiPort,
+    std::string &bearerToken, const std::string &authUsername,
+    const std::string &authPassword, const json &commandBody,
+    std::unordered_map<std::string, ClientContext *> &clientPool,
+    std::vector<std::unique_ptr<ClientContext>> &clientContexts) {
+    if(!g_buildContext) {
+        log("HotReload AddServer: g_buildContext not initialized — cannot "
+            "spawn new server contexts",
+            LogLevel::ERRORS);
+        return;
+    }
+
+    json resp = callHotReloadApiWithTokenRefresh(
+        apiHost, apiPort, bearerToken, authUsername, authPassword,
+        commandBody);
+    if(resp.is_null()) {
+        log("HotReload AddServer: API returned no usable payload",
+            LogLevel::ERRORS);
+        return;
+    }
+    std::vector<ServerInfoO> servers = parseHotReloadServerEntries(resp);
+    if(servers.empty()) {
+        log("HotReload AddServer: API returned no server entries",
+            LogLevel::WARNING);
+        return;
+    }
+
+    for(const auto &server : servers) {
+        if(server.endpointUrl.empty()) {
+            log("HotReload AddServer: skipping entry with empty endpointUrl",
+                LogLevel::WARNING);
+            continue;
+        }
+
+        // Idempotency: don't re-add an endpoint we already serve.
+        {
+            std::lock_guard<std::mutex> lk(g_clientPoolMutex);
+            if(clientPool.find(server.endpointUrl) != clientPool.end()) {
+                log("HotReload AddServer: '" + server.endpointUrl +
+                        "' already in pool — skipping",
+                    LogLevel::WARNING);
+                continue;
+            }
+        }
+
+        // Subscribe MQTT control topics first so any inbound writes after
+        // the context joins the pool can be routed immediately.
+        subscribeServerControlTopics(server);
+
+        auto ctx = g_buildContext(server);
+        if(!ctx) {
+            log("HotReload AddServer: failed to build context for '" +
+                    server.endpointUrl + "'",
+                LogLevel::ERRORS);
+            continue;
+        }
+
+        const std::string endpoint = ctx->endpoint;
+        const int hierarchyId = ctx->serverHierarchyId;
+        {
+            std::lock_guard<std::mutex> lk(g_clientPoolMutex);
+            clientPool[endpoint] = ctx.get();
+            clientContexts.push_back(std::move(ctx));
+        }
+        if(!server.typeId.empty()) {
+            std::lock_guard<std::mutex> lk(g_purposeMutex);
+            g_purposeToEndpoints[server.typeId].push_back(endpoint);
+        }
+
+        log("HotReload AddServer: '" + endpoint +
+                "' added (serverHierarchyId=" + std::to_string(hierarchyId) +
+                ")",
+            LogLevel::INFO);
+    }
+}
+
+// purpose=OPC_HI_SERVER, action=Delete (Option B): stop the matching
+// ClientContext, scrub global Mapping/TopicMapping/g_purposeToEndpoints, and
+// remove it from the pool. NEVER calls the API — driven purely by id.
+static void
+applyDeleteServer(
+    int serverHierarchyId,
+    std::unordered_map<std::string, ClientContext *> &clientPool,
+    std::vector<std::unique_ptr<ClientContext>> &clientContexts) {
+    // Hold the pool mutex only long enough to detach the context from the
+    // pool — stopLoop() joins the OPC + worker threads which may take a
+    // while, and we don't want to block MQTT control-write lookups for that
+    // duration.
+    std::unique_ptr<ClientContext> owned;
+    std::string endpoint;
+    std::string typeId;
+    {
+        std::lock_guard<std::mutex> lk(g_clientPoolMutex);
+        ClientContext *raw =
+            findServerByHierarchyId_locked(serverHierarchyId, clientPool);
+        if(!raw) {
+            log("HotReload DeleteServer: no server with hierarchyId=" +
+                    std::to_string(serverHierarchyId) + " in pool",
+                LogLevel::WARNING);
+            return;
+        }
+        endpoint = raw->endpoint;
+        typeId = raw->typeId;
+        clientPool.erase(endpoint);
+
+        auto it = std::find_if(
+            clientContexts.begin(), clientContexts.end(),
+            [raw](const std::unique_ptr<ClientContext> &up) {
+                return up.get() == raw;
+            });
+        if(it != clientContexts.end()) {
+            owned = std::move(*it);
+            clientContexts.erase(it);
+        }
+    }
+    if(!owned) {
+        log("HotReload DeleteServer: context for hierarchyId=" +
+                std::to_string(serverHierarchyId) +
+                " was in pool but missing from clientContexts",
+            LogLevel::ERRORS);
+        return;
+    }
+
+    // Scrub global Mapping/TopicMapping for every tag this server owns
+    // BEFORE stopping its threads — once we set running=false, no thread
+    // will be able to clean up after itself.
+    {
+        std::lock_guard<std::mutex> regLk(owned->registryMutex);
+        for(const auto &kv : owned->liveRegistry) {
+            for(const auto &e : kv.second) {
+                Mapping.erase(e.tagId);
+                TopicMapping.erase(e.tagId);
+            }
+        }
+        owned->liveRegistry.clear();
+    }
+
+    // Drop the routing entry so future hot reload commands don't dispatch
+    // to a dead context.
+    if(!typeId.empty()) {
+        std::lock_guard<std::mutex> lk(g_purposeMutex);
+        auto it = g_purposeToEndpoints.find(typeId);
+        if(it != g_purposeToEndpoints.end()) {
+            auto &eps = it->second;
+            eps.erase(std::remove(eps.begin(), eps.end(), endpoint),
+                      eps.end());
+            if(eps.empty())
+                g_purposeToEndpoints.erase(it);
+        }
+    }
+
+    // Stop OPC + worker threads (blocking — joins both). Caller is the hot
+    // reload worker thread, which is dedicated to serializing these
+    // operations.
+    log("HotReload DeleteServer: stopping '" + endpoint +
+            "' (serverHierarchyId=" + std::to_string(serverHierarchyId) +
+            ")",
+        LogLevel::INFO);
+    owned->stopLoop();
+    if(owned->client) {
+        UA_Client_disconnect(owned->client.get());
+    }
+
+    log("HotReload DeleteServer: '" + endpoint + "' removed from pool",
+        LogLevel::INFO);
+    // owned is destroyed here, freeing UA_Client_delete via the deleter.
+}
+
+static bool
+contextOwnsDatapointDeleteId(ClientContext *ctx, int id) {
+    if(!ctx) return false;
+    std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+    auto it = ctx->liveRegistry.find(id);
+    if(it != ctx->liveRegistry.end() && !it->second.empty())
+        return true;
+    for(const auto &kv : ctx->liveRegistry) {
+        for(const auto &e : kv.second) {
+            if(e.tagId == id)
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool
+contextOwnsGroupDeleteId(ClientContext *ctx, int id) {
+    return ctx && ctx->groupIdToName.find(id) != ctx->groupIdToName.end();
+}
+
+// Locate every connected ClientContext that handles a given purpose.
+//
+// `purpose` only matches a server-level typeId for the top-of-hierarchy case
+// (e.g. "OPC_HI_SERVER"). Sub-tree purposes like "OPC_HI_GROUP" or
+// "OPC_HI_DATAPOINT" never appear in `g_purposeToEndpoints`, so we fall back
+// to every connected client context. Wrong-server dispatches are absorbed by:
+//   - applyDelete: liveRegistry only has the matching hierarchyId on the
+//     owning server; other contexts no-op.
+//   - applyAdd:   the OPC UA service rejects unknown nodeIds with
+//     BadNodeIdInvalid, which is logged but harmless.
+//
+// For `Delete`, we first narrow to contexts that actually own the id(s) —
+// via liveRegistry (hierarchyId or tagId), groupIdToName, or global Mapping
+// — so we do not spam DEBUG logs on every other server in the pool.
+static std::vector<ClientContext *>
+resolveHotReloadTargets(
+    const HotReloadCommand &cmd,
+    const std::unordered_map<std::string, ClientContext *> &clientPool) {
+    std::vector<ClientContext *> out;
+    std::vector<std::string> endpoints;
+    {
+        std::lock_guard<std::mutex> lk(g_purposeMutex);
+        auto it = g_purposeToEndpoints.find(cmd.purpose);
+        if(it != g_purposeToEndpoints.end())
+            endpoints = it->second;
+    }
+    for(const auto &ep : endpoints) {
+        auto cit = clientPool.find(ep);
+        if(cit == clientPool.end() || !cit->second)
+            continue;
+        if(!cit->second->isConnected.load(std::memory_order_acquire))
+            continue;
+        out.push_back(cit->second);
+    }
+
+    if(!out.empty())
+        return out;
+
+    if(cmd.action == "Delete" &&
+       (cmd.purpose == "OPC_HI_DATAPOINT" ||
+        cmd.purpose == "OPC_HI_GROUP")) {
+        std::lock_guard<std::mutex> plk(g_clientPoolMutex);
+        for(const auto &kv : clientPool) {
+            ClientContext *ctx = kv.second;
+            if(!ctx ||
+               !ctx->isConnected.load(std::memory_order_acquire))
+                continue;
+            bool use = false;
+            for(int delId : cmd.ids) {
+                if(cmd.purpose == "OPC_HI_GROUP")
+                    use = contextOwnsGroupDeleteId(ctx, delId);
+                else
+                    use = contextOwnsDatapointDeleteId(ctx, delId);
+                if(use) break;
+            }
+            if(use)
+                out.push_back(ctx);
+        }
+        if(!out.empty()) {
+            log("HotReload: Delete — routing to " +
+                    std::to_string(out.size()) +
+                    " context(s) that own the id(s) (registry match)",
+                LogLevel::DEBUG);
+            return out;
+        }
+
+        if(cmd.purpose == "OPC_HI_DATAPOINT") {
+            for(int delId : cmd.ids) {
+                auto mit = Mapping.find(delId);
+                if(mit == Mapping.end())
+                    continue;
+                auto cit = clientPool.find(mit->second.second);
+                if(cit == clientPool.end() || !cit->second ||
+                   !cit->second->isConnected.load(std::memory_order_acquire))
+                    continue;
+                if(std::find(out.begin(), out.end(), cit->second) ==
+                   out.end())
+                    out.push_back(cit->second);
+            }
+            if(!out.empty()) {
+                log("HotReload: Delete — routing via Mapping endpoint to " +
+                        std::to_string(out.size()) + " context(s)",
+                    LogLevel::DEBUG);
+                return out;
+            }
+        }
+    }
+
+    // Fallback: route to every connected context.
+    log("HotReload: purpose '" + cmd.purpose +
+            "' is not a server typeId — routing to all connected contexts",
+        LogLevel::DEBUG);
+    for(const auto &kv : clientPool) {
+        if(!kv.second)
+            continue;
+        if(!kv.second->isConnected.load(std::memory_order_acquire))
+            continue;
+        out.push_back(kv.second);
+    }
+    return out;
 }
 
 
@@ -863,6 +2144,21 @@ runClient(bool isService, int argc, char *argv[]) {
             }
         }
     }
+
+    // ── Build purpose → endpoint(s) map for hot reload routing ───────────────
+    // HotReloadCommand::purpose carries the ServerInfoO::typeId of the target
+    // hierarchy (e.g. "OPC_HI_SERVER"); we may have multiple connected servers
+    // with the same typeId, so the value is a list.
+    {
+        std::lock_guard<std::mutex> lk(g_purposeMutex);
+        g_purposeToEndpoints.clear();
+        for(const auto &server : serverList) {
+            if(!server.typeId.empty()) {
+                g_purposeToEndpoints[server.typeId].push_back(
+                    server.endpointUrl);
+            }
+        }
+    }
     
     // The Mapping variable is already populated by ParseServerHierarchy in fetchAPI.cpp
     // Let's log the populated mapping for debugging
@@ -1024,7 +2320,8 @@ runClient(bool isService, int argc, char *argv[]) {
         // Register token refresh callback: called before every MQTT reconnect attempt.
         // Re-fetches the bearer token so an expired JWT never causes permanent not_authorized.
         g_mqttHandler->setPasswordRefreshCallback(
-            [applicationEndURLHost, applicationEndURLPort, &edgeCfg]() -> std::string {
+            [applicationEndURLHost, applicationEndURLPort, &edgeCfg,
+             &BearerToken]() -> std::string {
                 try {
                     log("MQTT token refresh: fetching new bearer token ...", LogLevel::INFO);
                     std::string freshToken = getBearerTokenNow(
@@ -1037,6 +2334,13 @@ runClient(bool isService, int argc, char *argv[]) {
                         log("MQTT token refresh: empty token returned.", LogLevel::WARNING);
                         return "";
                     }
+                    {
+                        std::lock_guard<std::mutex> lk(g_bearerTokenMutex);
+                        BearerToken = freshToken;
+                    }
+                    SetEdgeConfigMqttPassword(edgeCfg, freshToken);
+                    if(g_sqliteService)
+                        g_sqliteService->SetApiAuth(freshToken);
                     // Wrap in JSON exactly as the broker expects
                     nlohmann::json pw;
                     pw["token"] = freshToken;
@@ -1087,7 +2391,12 @@ runClient(bool isService, int argc, char *argv[]) {
 
     std::vector<std::string> topicsToSubscribe;
     //log("Collecting topics to subscribe...", LogLevel::INFO);
-    
+
+    // Hot reload trigger channel — subscribed alongside per-tag control topics
+    // so the broker delivers Add/Delete/Update/Reload commands on the same
+    // session.
+    topicsToSubscribe.push_back("HTRLD/Edgents");
+
     for(const auto &server : serverList) {
         //log(server.name + " ", LogLevel::DEBUG);
         //cout << (endl);
@@ -1166,11 +2475,19 @@ runClient(bool isService, int argc, char *argv[]) {
 
     
 
-    for(const auto &server : serverList) {
+    // Per-server setup wrapped as a callable so the hot reload worker can
+    // spawn brand-new ClientContexts at runtime (purpose=OPC_HI_SERVER, action=Add)
+    // using the exact same pipeline as startup. Returns a fully-started
+    // ClientContext on success, or nullptr if any blocking error (cert load
+    // failure, profile lookup error, etc.) prevents bringing the server up.
+    auto buildAndStartContext =
+        [&](const ServerInfoO &server) -> std::unique_ptr<ClientContext> {
         auto server_copy = server;
         auto context = std::make_unique<ClientContext>();
         context->name = server.name;
         context->endpoint = server.endpointUrl;
+        context->typeId = server.typeId;
+        context->serverHierarchyId = server.dataPointId;
         
         
     
@@ -1403,12 +2720,13 @@ runClient(bool isService, int argc, char *argv[]) {
         } catch(const std::exception &e) {
             log("❌ User profile request failed: " + std::string(e.what()),
                 LogLevel::ERRORS);
-            return UA_STATUSCODE_BADUSERACCESSDENIED;
+            return nullptr;
         }
 
         if(profile.currentOrgId.empty()) {
-            log("❌ No currentOrgId in user profile", LogLevel::ERRORS);
-            return UA_STATUSCODE_BADUSERACCESSDENIED;
+            log("❌ No currentOrgId in user profile for " + server.name,
+                LogLevel::ERRORS);
+            return nullptr;
         }
 
         log("✓ User profile: " + profile.displayName + " (OrgID: " +
@@ -1423,6 +2741,9 @@ runClient(bool isService, int argc, char *argv[]) {
         std::string orgShortCode = profile.currentOrgCode;
 
         std::string NamespaceURI = "Anexee:" + orgShortCode;
+        // Cache the URI on the context so hot reload paths (running outside
+        // onConnected) can re-resolve the namespace index after a reconnect.
+        context->namespaceURI = NamespaceURI;
         //------------------------------------------------------------------------------------------
 
         context->onConnected = [ctx = context.get(), server = server_copy,
@@ -1455,8 +2776,25 @@ runClient(bool isService, int argc, char *argv[]) {
                 UA_CreateSubscriptionResponse gsub =
                     UA_Client_Subscriptions_create(ctx->client.get(), greq, nullptr, nullptr, nullptr);
                 ctx->subscriptions[group.name] = gsub;
-                log("Subscription Created: " + group.name + " | ID: " + std::to_string(gsub.subscriptionId) + 
-                    " | Interval: " + std::to_string(gsub.revisedPublishingInterval) + "ms", LogLevel::INFO);
+                // The startup hierarchy API ships the group's hierarchy id
+                // under `dataPointId`; the hot reload MQTT command refers to
+                // the same number as `id`. Populating groupIdToName here lets
+                // applyGroupUpdate look up the subscription by id directly.
+                if(group.dataPointId != 0) {
+                    ctx->groupIdToName[group.dataPointId] = group.name;
+                } else {
+                    log("Subscription Created with no hierarchy id for '" +
+                            group.name +
+                            "' — hot reload group updates will resolve by "
+                            "name only",
+                        LogLevel::DEBUG);
+                }
+                log("Subscription Created: " + group.name +
+                        " (hierarchyId=" + std::to_string(group.dataPointId) +
+                        ") | ID: " + std::to_string(gsub.subscriptionId) +
+                        " | Interval: " +
+                        std::to_string(gsub.revisedPublishingInterval) + "ms",
+                    LogLevel::INFO);
             }
 #endif
 
@@ -1483,6 +2821,10 @@ runClient(bool isService, int argc, char *argv[]) {
                            &tmp) == UA_STATUSCODE_GOOD) {
                         resolvedNs = tmp;
                         nsResolved = true;
+                        // Cache for hot reload (applyAdd builds node paths
+                        // from ctx->resolvedNs + the API's short nodeId).
+                        ctx->resolvedNs.store(resolvedNs,
+                                              std::memory_order_release);
                     }
                 }
 
@@ -1617,17 +2959,34 @@ runClient(bool isService, int argc, char *argv[]) {
 
                     // ── Process results ──────────────────────────────────────
                     size_t ok = 0;
-                    for(size_t i = 0; i < resp.resultsSize; ++i) {
-                        if(resp.results[i].statusCode != UA_STATUSCODE_GOOD) {
-                            log("MonitoredItem failed for TagId " +
-                                    std::to_string(batchInfoSpaces[i].tagId) +
-                                    ": " +
-                                    UA_StatusCode_name(resp.results[i].statusCode),
-                                LogLevel::ERRORS);
-                            delete batchContexts[i];
-                            batchContexts[i] = nullptr;
-                        } else {
-                            ++ok;
+                    {
+                        std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+                        for(size_t i = 0; i < resp.resultsSize; ++i) {
+                            if(resp.results[i].statusCode != UA_STATUSCODE_GOOD) {
+                                log("MonitoredItem failed for TagId " +
+                                        std::to_string(batchInfoSpaces[i].tagId) +
+                                        ": " +
+                                        UA_StatusCode_name(resp.results[i].statusCode),
+                                    LogLevel::ERRORS);
+                                delete batchContexts[i];
+                                batchContexts[i] = nullptr;
+                            } else {
+                                ++ok;
+                                // Record live monitor for later hot-reload
+                                // delete/update operations.
+                                LiveMonitorEntry entry;
+                                entry.hierarchyId =
+                                    batchInfoSpaces[i].hierarchyId;
+                                entry.tagId = batchInfoSpaces[i].tagId;
+                                entry.monitoredItemId =
+                                    resp.results[i].monitoredItemId;
+                                entry.subscriptionId = sub.subscriptionId;
+                                entry.groupName = groupName;
+                                entry.endpointUrl = ctx->endpoint;
+                                entry.infoSpace = batchInfoSpaces[i];
+                                ctx->liveRegistry[entry.hierarchyId]
+                                    .push_back(std::move(entry));
+                            }
                         }
                     }
                     UA_CreateMonitoredItemsResponse_clear(&resp);
@@ -1643,21 +3002,314 @@ runClient(bool isService, int argc, char *argv[]) {
         // cout<<"Event Monitoring Created"<<endl;
 
         context->startLoop();
-        clientPool[context->endpoint] = context.get();
-        clientContexts.push_back(std::move(context));
+        return context;
+    };
 
-                // ADD THIS: Give each thread time to initialize before starting the next
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Publish the factory so the hot reload worker can spawn additional
+    // ClientContexts at runtime (purpose=OPC_HI_SERVER, action=Add).
+    g_buildContext = buildAndStartContext;
+
+    for(const auto &server : serverList) {
+        auto ctx = buildAndStartContext(server);
+        if(ctx) {
+            std::lock_guard<std::mutex> lk(g_clientPoolMutex);
+            clientPool[ctx->endpoint] = ctx.get();
+            clientContexts.push_back(std::move(ctx));
+        } else {
+            log("Skipping server '" + server.name +
+                    "' (" + server.endpointUrl + "): setup failed",
+                LogLevel::ERRORS);
+        }
+        // ADD THIS: Give each thread time to initialize before starting the next
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     log("Client pool initialized. Press Ctrl+C to stop...");
 
-    g_mqttHandler->setCallback([&clientPool](const std::string &topic, const std::string &payload) {
+    // ── Hot reload worker thread ───────────────────────────────────────────
+    // Drains g_hrQueue (populated from the MQTT callback when topic ==
+    // "HTRLD/Edgents"). Each task is a self-contained lambda that calls the
+    // EdgentHotReloading API and dispatches to applyAdd/Delete/Update/Reload.
+    g_hrRunning.store(true, std::memory_order_release);
+    g_hrWorker = std::thread([]() {
+        log("HotReload worker thread started", LogLevel::INFO);
+        while(true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(g_hrMutex);
+                g_hrCv.wait(lk, [] {
+                    return !g_hrQueue.empty() ||
+                           !g_hrRunning.load(std::memory_order_acquire);
+                });
+                if(!g_hrRunning.load(std::memory_order_acquire) &&
+                   g_hrQueue.empty())
+                    break;
+                task = std::move(g_hrQueue.front());
+                g_hrQueue.pop();
+            }
+            try {
+                task();
+            } catch(const std::exception &e) {
+                log(std::string("HotReload task threw: ") + e.what(),
+                    LogLevel::ERRORS);
+            } catch(...) {
+                log("HotReload task threw unknown exception",
+                    LogLevel::ERRORS);
+            }
+        }
+        log("HotReload worker thread exiting", LogLevel::INFO);
+    });
+
+    g_mqttHandler->setCallback([&clientPool, &clientContexts,
+                                applicationEndURLHost,
+                                applicationEndURLPort, &BearerToken,
+                                authUsername, authPassword](
+                                   const std::string &topic,
+                                   const std::string &payload) {
         //log("Received MQTT message on topic: " + topic, LogLevel::DEBUG);
 
         // Parse and validate JSON payload
         if (payload.empty()) {
             log("Empty payload received on topic: " + topic, LogLevel::INFO);
+            return;
+        }
+
+        // ── Hot reload trigger ────────────────────────────────────────────
+        // Schema: {
+        //   id, orgId, Reference, purpose, action,
+        //   item_collection: [id, ...]   // optional, used by Delete
+        // }
+        // We hand off to the hot reload worker so the MQTT thread isn't
+        // blocked on a synchronous HTTP call + UA dispatch.
+        if(topic == "HTRLD/Edgents") {
+            json hr;
+            try {
+                hr = json::parse(payload);
+            } catch(const std::exception &e) {
+                log("HotReload: invalid JSON: " + std::string(e.what()),
+                    LogLevel::ERRORS);
+                return;
+            }
+
+            HotReloadCommand cmd;
+            // Parse fields case-insensitively: accept both PascalCase
+            // (e.g. "OrgId") and camelCase (e.g. "orgId") from MQTT.
+            cmd.orgId = hr.contains("OrgId")    ? hr.value("OrgId", 0)
+                       : hr.value("orgId", 0);
+            cmd.reference = hr.contains("Reference") ? hr.value("Reference", std::string{})
+                           : hr.value("reference", std::string{});
+            cmd.purpose = hr.contains("Purpose") ? hr.value("Purpose", std::string{})
+                         : hr.value("purpose", std::string{});
+            cmd.action = hr.contains("Action") ? hr.value("Action", std::string{})
+                        : hr.value("action", std::string{});
+
+            // Delete carries a list of ids under "ItemCollection" /
+            // "item_collection". For Delete we ONLY use these IDs and
+            // ignore the top-level Id field entirely.
+            const char *collKey =
+                hr.contains("ItemCollection")   ? "ItemCollection"
+              : hr.contains("item_collection")  ? "item_collection"
+              : nullptr;
+            if(collKey && hr[collKey].is_array()) {
+                for(const auto &x : hr[collKey]) {
+                    if(x.is_number_integer())
+                        cmd.ids.push_back(x.get<int>());
+                }
+            }
+
+            const bool isDelete = cmd.action == "Delete";
+
+            // Add / Update / Reload use the single "Id"/"id" field when
+            // ItemCollection is absent. Delete never uses it.
+            if(!isDelete && cmd.ids.empty()) {
+                const char *idKey =
+                    hr.contains("Id") ? "Id"
+                  : (hr.contains("id") ? "id" : nullptr);
+                if(idKey) {
+                    if(hr[idKey].is_number_integer()) {
+                        cmd.ids.push_back(hr[idKey].get<int>());
+                    } else if(hr[idKey].is_array()) {
+                        for(const auto &x : hr[idKey]) {
+                            if(x.is_number_integer())
+                                cmd.ids.push_back(x.get<int>());
+                        }
+                    }
+                }
+            }
+
+            // Reload acts on the entire client — id is not required.
+            // Delete does not require purpose (it tries all types).
+            const bool isReload = cmd.action == "Reload";
+            if(cmd.action.empty()) {
+                log("HotReload: missing action field",
+                    LogLevel::ERRORS);
+                return;
+            }
+            if(!isReload && !isDelete &&
+               (cmd.purpose.empty() || cmd.ids.empty())) {
+                log("HotReload: missing required fields "
+                    "(purpose/id) for action=" + cmd.action,
+                    LogLevel::ERRORS);
+                return;
+            }
+            if(isDelete && cmd.ids.empty()) {
+                log("HotReload: Delete requires ItemCollection with ids",
+                    LogLevel::ERRORS);
+                return;
+            }
+
+            const std::string apiHost = applicationEndURLHost;
+            const std::string apiPort = std::to_string(applicationEndURLPort);
+
+            // Build the API payload with PascalCase keys as required by
+            // /api/EdgentHotReloading (e.g. "Id", "OrgId", "Purpose").
+            json commandBody;
+            commandBody["Id"]        = cmd.firstId();
+            commandBody["OrgId"]     = cmd.orgId;
+            commandBody["Reference"] = cmd.reference;
+            commandBody["Purpose"]   = cmd.purpose;
+            commandBody["Action"]    = cmd.action;
+
+            postHotReloadTask([&clientPool, &clientContexts, apiHost, apiPort,
+                               &BearerToken, authUsername, authPassword,
+                               commandBody, cmd]() {
+                std::string idsStr;
+                for(size_t i = 0; i < cmd.ids.size(); ++i) {
+                    if(i) idsStr += ',';
+                    idsStr += std::to_string(cmd.ids[i]);
+                }
+                log("HotReload: action=" + cmd.action +
+                        " purpose=" + cmd.purpose +
+                        " ids=[" + idsStr + "]",
+                    LogLevel::INFO);
+
+                // ── Reload (no purpose dependency): restart EVERY connected
+                //    server context.
+                if(cmd.action == "Reload" && cmd.reference == "OPCUA") {
+                    std::vector<ClientContext *> all;
+                    {
+                        std::lock_guard<std::mutex> lk(g_clientPoolMutex);
+                        all.reserve(clientPool.size());
+                        for(const auto &kv : clientPool)
+                            if(kv.second) all.push_back(kv.second);
+                    }
+                    if(all.empty()) {
+                        log("HotReload Reload: client pool is empty",
+                            LogLevel::WARNING);
+                        return;
+                    }
+                    for(ClientContext *ctx : all)
+                        applyReload(ctx, cmd, {});
+                    return;
+                }
+
+                // ── Delete (purpose-agnostic) ─────────────────────────────
+                // Delete ignores `purpose`. For each id in ItemCollection,
+                // try server → group → datapoint across all contexts.
+                if(cmd.action == "Delete") {
+                    for(int id : cmd.ids) {
+                        // Try server-level delete first (may destroy a ctx).
+                        applyDeleteServer(id, clientPool, clientContexts);
+                        // Re-snapshot pool AFTER server delete so we never
+                        // dereference a freed context pointer.
+                        std::vector<ClientContext *> alive;
+                        {
+                            std::lock_guard<std::mutex> lk(g_clientPoolMutex);
+                            alive.reserve(clientPool.size());
+                            for(const auto &kv : clientPool)
+                                if(kv.second) alive.push_back(kv.second);
+                        }
+                        // Then try group and datapoint on every surviving context.
+                        for(ClientContext *ctx : alive) {
+                            applyDeleteGroup(ctx, id);
+                            applyDeleteSingle(ctx, id);
+                        }
+                    }
+                    return;
+                }
+
+                // ── Server-level Add / Update ──────────────────────────────
+                if(cmd.purpose == "OPC_HI_SERVER") {
+                    if(cmd.action == "Add") {
+                        applyAddServer(apiHost, apiPort, BearerToken,
+                                       authUsername, authPassword,
+                                       commandBody, clientPool,
+                                       clientContexts);
+                    } else if(cmd.action == "Update") {
+                        for(int id : cmd.ids) {
+                            ClientContext *ctx = nullptr;
+                            {
+                                std::lock_guard<std::mutex> lk(
+                                    g_clientPoolMutex);
+                                ctx = findServerByHierarchyId_locked(
+                                    id, clientPool);
+                            }
+                            if(!ctx) {
+                                log("HotReload UpdateServer: no server with "
+                                    "hierarchyId=" + std::to_string(id),
+                                    LogLevel::WARNING);
+                                continue;
+                            }
+                            HotReloadCommand sub = cmd;
+                            sub.ids = {id};
+                            applyReload(ctx, sub, {});
+                        }
+                    } else {
+                        log("HotReload: unknown action '" + cmd.action +
+                                "' for OPC_HI_SERVER",
+                            LogLevel::ERRORS);
+                    }
+                    return;
+                }
+
+                // ── Group / Datapoint Add / Update ────────────────────────
+                auto targets = resolveHotReloadTargets(cmd, clientPool);
+                if(targets.empty()) {
+                    log("HotReload: no connected target for purpose=" +
+                            cmd.purpose,
+                        LogLevel::ERRORS);
+                    return;
+                }
+
+                // Add and Update need the API payload (tag definitions or
+                // updated subscription params).
+                json resp =
+                    callHotReloadApiWithTokenRefresh(apiHost, apiPort, BearerToken,
+                                                     authUsername, authPassword,
+                                                     commandBody);
+                if(resp.is_null()) {
+                    log("HotReload: API call returned no usable payload for "
+                        "action=" + cmd.action + " ids=[" + idsStr +
+                            "] — aborting dispatch",
+                        LogLevel::ERRORS);
+                    return;
+                }
+                std::vector<HotReloadItem> items =
+                    parseHotReloadResponse(resp);
+                if(items.empty()) {
+                    log("HotReload: API returned no items for " + cmd.action +
+                            " ids=[" + idsStr + "]",
+                        LogLevel::WARNING);
+                    return;
+                }
+
+                for(ClientContext *ctx : targets) {
+                    if(cmd.action == "Add") {
+                        if(cmd.purpose == "OPC_HI_GROUP")
+                            applyAddGroup(ctx, cmd, items);
+                        else
+                            applyAdd(ctx, cmd, items);
+                    } else if(cmd.action == "Update") {
+                        if(cmd.purpose == "OPC_HI_GROUP")
+                            applyGroupUpdate(ctx, cmd, items);
+                        else
+                            applyUpdate(ctx, cmd, items);
+                    } else {
+                        log("HotReload: unknown action '" + cmd.action + "'",
+                            LogLevel::ERRORS);
+                    }
+                }
+            });
             return;
         }
 
@@ -1695,14 +3347,19 @@ runClient(bool isService, int argc, char *argv[]) {
         }
 
         std::string endpoint = Mapping[tagId].second;
-        auto it = clientPool.find(endpoint);
-        if (it == clientPool.end() ||
-            !it->second->isConnected.load(std::memory_order_acquire)) {
+        ClientContext *context = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_clientPoolMutex);
+            auto it = clientPool.find(endpoint);
+            if(it != clientPool.end() && it->second &&
+               it->second->isConnected.load(std::memory_order_acquire)) {
+                context = it->second;
+            }
+        }
+        if(!context) {
             log("Client not connected for endpoint: " + endpoint, LogLevel::ERRORS);
             return;
         }
-
-        auto context = it->second;
 
         if(updateType == static_cast<int>(UpdateType::Telemetry)) {
             // std::lock_guard<std::mutex> lock(context->taskMutex);
@@ -1781,6 +3438,14 @@ runClient(bool isService, int argc, char *argv[]) {
     }
 
     log("Cleaning up...");
+
+    // Stop the hot reload worker BEFORE tearing down the client pool: queued
+    // tasks reference clientPool / ClientContext pointers that are about to
+    // be destroyed.
+    g_hrRunning.store(false, std::memory_order_release);
+    g_hrCv.notify_all();
+    if(g_hrWorker.joinable())
+        g_hrWorker.join();
 
     for(auto &context : clientContexts) {
         //UA_Client_disconnect(context->client.get());

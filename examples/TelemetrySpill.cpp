@@ -24,7 +24,7 @@ TryEnqueueTelemetryWrapper(const std::string &topic, const std::string &wrapperJ
         p.name = "";
         p.tagId = data.value("TagId", 0);
         p.tagType = data.value("TagType", "INFO_DCR");
-        p.source = data.value("Source", static_cast<int>(AlarmSource::AEEngine));
+        p.source = data.value("Source", static_cast<int>(AlarmSource::OPC));
         p.infoId = data.value("InfoId", 1001);
         if(data.contains("Value"))
             p.value = data["Value"];

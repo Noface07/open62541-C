@@ -24,6 +24,7 @@
 #include <boost/beast/version.hpp>
 #include <nlohmann/json.hpp>
 #include <unordered_map>
+#include <vector>
 
 using json = nlohmann::ordered_json;
 
@@ -300,6 +301,14 @@ ParseServerHierarchyFromJson(const json &response) {
                                                 mappedTag.value("deadband", 0);
                                             mappedInfo.queuesize =
                                                 mappedTag.value("queueSize", 0);
+
+                                            // Hot reload's command id matches the parent tag's
+                                            // hierarchy id. The startup hierarchy API names that
+                                            // value `dataPointId` (the hot reload API names the
+                                            // same value `id`); both refer to the same number
+                                            // used to look up live monitors in liveRegistry.
+                                            mappedInfo.hierarchyId =
+                                                tagItem.value("dataPointId", 0);
 
                                             // Extract orgId if available in the JSON, else use global
                                             if(mappedTag.contains("orgId")) {
@@ -936,4 +945,620 @@ extractNsAndValue(const std::string &input) {
     std::string value = input.substr(equalPos + 1);       // Extract after '='
 
     return {ns, value};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hot reload helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST to /api/EdgentHotReloading with detailed diagnostics. Unlike
+// `getResponse`, this never throws — failures are logged with the HTTP status
+// code + a snippet of the raw body so the operator can tell 401 vs 500 vs an
+// empty 200 apart. On any failure the returned json is `null`.
+json
+callHotReloadAPI(const std::string &host, const std::string &port,
+                 const std::string &bearerToken, const json &commandBody,
+                 unsigned *outHttpStatus) {
+    if(outHttpStatus)
+        *outHttpStatus = 0;
+
+    const std::string target = "/api/EdgentHotReloading";
+    const std::string body = commandBody.dump();
+
+    if(bearerToken.empty()) {
+        log("callHotReloadAPI: bearer token is empty — request will likely "
+            "be rejected (host=" + host + " target=" + target + ")",
+            LogLevel::WARNING);
+    }
+
+    try {
+        const int version = 11;
+
+        tcp::resolver resolver(http_ioc);
+        beast::tcp_stream stream(http_ioc);
+
+        auto const results = resolver.resolve(host, port);
+        stream.connect(results);
+
+        beast::http::request<beast::http::string_body> req{
+            beast::http::verb::post, target, version};
+        req.set(beast::http::field::host, host);
+        req.set(beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+        req.set(beast::http::field::content_type, "application/json");
+        req.set(beast::http::field::accept, "application/json");
+        // Ask for an uncompressed body. Some stacks gzip by default; Beast does
+        // not inflate here — without this, a tiny binary body can break JSON
+        // parsing or yield a truncated-looking envelope vs Postman (which often
+        // inflates automatically).
+        req.set(beast::http::field::accept_encoding, "identity");
+        req.set(beast::http::field::connection, "close");
+        if(!bearerToken.empty())
+            req.set(beast::http::field::authorization,
+                    "Bearer " + bearerToken);
+        req.body() = body;
+        req.prepare_payload();
+
+        beast::http::write(stream, req);
+
+        beast::flat_buffer buffer;
+        beast::http::response_parser<beast::http::dynamic_body> parser;
+        parser.body_limit(100 * 1024 * 1024);
+        beast::http::read(stream, buffer, parser);
+
+        beast::http::response<beast::http::dynamic_body> res = parser.release();
+
+        beast::error_code ec;
+        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+
+        const unsigned status = res.result_int();
+        if(outHttpStatus)
+            *outHttpStatus = status;
+
+        const auto bodyStr =
+            boost::beast::buffers_to_string(res.body().data());
+        std::string enc;
+        if(auto it = res.find(beast::http::field::content_encoding);
+           it != res.end())
+            enc = std::string(it->value().data(), it->value().size());
+
+        log("callHotReloadAPI: POST " + target + " → HTTP " +
+                std::to_string(status) + " (" +
+                std::to_string(bodyStr.size()) + " bytes)" +
+                (enc.empty() ? std::string{} : (" Content-Encoding: " + enc)),
+            LogLevel::DEBUG);
+
+        if(status < 200 || status >= 300) {
+            std::string snippet = bodyStr.substr(
+                0, std::min<std::size_t>(bodyStr.size(), 512));
+            log("callHotReloadAPI: non-2xx response " +
+                    std::to_string(status) + ": " +
+                    (snippet.empty() ? std::string("<empty body>") : snippet),
+                LogLevel::ERRORS);
+            return json{};
+        }
+
+        if(bodyStr.empty()) {
+            log("callHotReloadAPI: 2xx response with empty body — request "
+                "body was: " +
+                    body,
+                LogLevel::ERRORS);
+            return json{};
+        }
+
+        try {
+            return json::parse(bodyStr);
+        } catch(const std::exception &pe) {
+            std::string snippet = bodyStr.substr(
+                0, std::min<std::size_t>(bodyStr.size(), 512));
+            log(std::string("callHotReloadAPI: JSON parse failed: ") +
+                    pe.what() + " — body snippet: " + snippet,
+                LogLevel::ERRORS);
+            return json{};
+        }
+    } catch(const std::exception &e) {
+        log(std::string("callHotReloadAPI: HTTP error: ") + e.what(),
+            LogLevel::ERRORS);
+        return json{};
+    }
+}
+
+// POST to /api/EventsHotReloading — mirrors callHotReloadAPI but uses the
+// alarm/events endpoint. Called by the UA Server when HTRLD/Events arrives.
+json
+callEventsHotReloadAPI(const std::string &host, const std::string &port,
+                       const std::string &bearerToken, const json &commandBody,
+                       unsigned *outHttpStatus) {
+    if(outHttpStatus)
+        *outHttpStatus = 0;
+
+    const std::string target = "/api/EventsHotReloading";
+    const std::string body = commandBody.dump();
+
+    if(bearerToken.empty()) {
+        log("callEventsHotReloadAPI: bearer token is empty — request will likely "
+            "be rejected (host=" + host + " target=" + target + ")",
+            LogLevel::WARNING);
+    }
+
+    try {
+        const int version = 11;
+
+        tcp::resolver resolver(http_ioc);
+        beast::tcp_stream stream(http_ioc);
+
+        auto const results = resolver.resolve(host, port);
+        stream.connect(results);
+
+        beast::http::request<beast::http::string_body> req{
+            beast::http::verb::post, target, version};
+        req.set(beast::http::field::host, host);
+        req.set(beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+        req.set(beast::http::field::content_type, "application/json");
+        req.set(beast::http::field::accept, "application/json");
+        req.set(beast::http::field::accept_encoding, "identity");
+        req.set(beast::http::field::connection, "close");
+        if(!bearerToken.empty())
+            req.set(beast::http::field::authorization,
+                    "Bearer " + bearerToken);
+        req.body() = body;
+        req.prepare_payload();
+
+        beast::http::write(stream, req);
+
+        beast::flat_buffer buffer;
+        beast::http::response_parser<beast::http::dynamic_body> parser;
+        parser.body_limit(100 * 1024 * 1024);
+        beast::http::read(stream, buffer, parser);
+
+        beast::http::response<beast::http::dynamic_body> res = parser.release();
+
+        beast::error_code ec;
+        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+
+        const unsigned status = res.result_int();
+        if(outHttpStatus)
+            *outHttpStatus = status;
+
+        const auto bodyStr =
+            boost::beast::buffers_to_string(res.body().data());
+        std::string enc;
+        if(auto it = res.find(beast::http::field::content_encoding);
+           it != res.end())
+            enc = std::string(it->value().data(), it->value().size());
+
+        log("callEventsHotReloadAPI: POST " + target + " → HTTP " +
+                std::to_string(status) + " (" +
+                std::to_string(bodyStr.size()) + " bytes)" +
+                (enc.empty() ? std::string{} : (" Content-Encoding: " + enc)),
+            LogLevel::DEBUG);
+
+        if(status < 200 || status >= 300) {
+            std::string snippet = bodyStr.substr(
+                0, std::min<std::size_t>(bodyStr.size(), 512));
+            log("callEventsHotReloadAPI: non-2xx response " +
+                    std::to_string(status) + ": " +
+                    (snippet.empty() ? std::string("<empty body>") : snippet),
+                LogLevel::ERRORS);
+            return json{};
+        }
+
+        if(bodyStr.empty()) {
+            log("callEventsHotReloadAPI: 2xx response with empty body — "
+                "request body was: " + body,
+                LogLevel::ERRORS);
+            return json{};
+        }
+
+        try {
+            return json::parse(bodyStr);
+        } catch(const std::exception &pe) {
+            std::string snippet = bodyStr.substr(
+                0, std::min<std::size_t>(bodyStr.size(), 512));
+            log(std::string("callEventsHotReloadAPI: JSON parse failed: ") +
+                    pe.what() + " — body snippet: " + snippet,
+                LogLevel::ERRORS);
+            return json{};
+        }
+    } catch(const std::exception &e) {
+        log(std::string("callEventsHotReloadAPI: HTTP error: ") + e.what(),
+            LogLevel::ERRORS);
+        return json{};
+    }
+}
+
+// Walk common EdgentHotReloading envelope shapes until we find the JSON array
+// of row objects. Tolerates:
+//   { "data": [ ... ] }
+//   { "data": { "data": [ ... ] } }
+//   { "data": { "data": { "data": [ ... ] } } }   // extra wrapper layers
+//   { "Data": ... } / { "Data": { "Data": [ ... ] } } (PascalCase fallback)
+static const json *
+findHotReloadItemsArray(const json &response) {
+    if(response.is_array())
+        return &response;
+
+    // Outer wrapper keys; inner object often uses "data" or sometimes "items".
+    static const char *keys[] = {"data",    "Data",    "items",    "Items",
+                                 "records", "Records", "result",   "Result"};
+    for(const char *topKey : keys) {
+        if(!response.contains(topKey))
+            continue;
+        const json &topVal = response.at(topKey);
+        if(topVal.is_null())
+            continue;
+        const json *cur = &topVal;
+        if(cur->is_array())
+            return cur;
+        // Unwrap object chains: each level may use "data" or "Data"
+        for(int depth = 0; depth < 10 && cur->is_object(); ++depth) {
+            const json *nextNode = nullptr;
+            for(const char *innerKey : keys) {
+                if(!cur->contains(innerKey))
+                    continue;
+                const json &n = cur->at(innerKey);
+                if(n.is_null())
+                    continue;
+                if(n.is_array())
+                    return &n;
+                if(n.is_object()) {
+                    nextNode = &n;
+                    break;
+                }
+            }
+            if(!nextNode)
+                break;
+            cur = nextNode;
+        }
+    }
+    return nullptr;
+}
+
+// Some gateways serialize the inner envelope as a *string* value of "data"
+// (double JSON encoding). Unwrap one or two levels and keep parsed values in
+// ownedParsedJson so pointers from findHotReloadItemsArray stay valid.
+static const json *
+resolveHotReloadDataArray(const json &response,
+                          std::vector<json> &ownedParsedJson) {
+    const json *p = findHotReloadItemsArray(response);
+    if(p)
+        return p;
+    if(!response.is_object() || !response.contains("data"))
+        return nullptr;
+    const auto &d = response.at("data");
+    if(!d.is_string())
+        return nullptr;
+    try {
+        ownedParsedJson.emplace_back(
+            json::parse(d.get_ref<const std::string &>()));
+    } catch(const std::exception &e) {
+        log(std::string("resolveHotReloadDataArray: data is not parseable "
+                        "JSON string: ") +
+                e.what(),
+            LogLevel::DEBUG);
+        return nullptr;
+    }
+    p = findHotReloadItemsArray(ownedParsedJson.back());
+    if(p)
+        return p;
+    // Rare: string wraps another string under "data"
+    if(ownedParsedJson.back().is_object() &&
+       ownedParsedJson.back().contains("data") &&
+       ownedParsedJson.back()["data"].is_string()) {
+        try {
+            ownedParsedJson.emplace_back(json::parse(
+                ownedParsedJson.back()["data"].get_ref<const std::string &>()));
+            return findHotReloadItemsArray(ownedParsedJson.back());
+        } catch(const std::exception &) {
+        }
+    }
+    return nullptr;
+}
+
+// The EdgentHotReloading endpoint returns a doubly-nested envelope:
+//   { "data": { "data": [ { ...item... }, ... ] } }
+// Some failure / partial responses may put the array directly under the outer
+// "data" key, so we tolerate both shapes.
+std::vector<HotReloadItem>
+parseHotReloadResponse(const json &response) {
+    std::vector<HotReloadItem> items;
+    try {
+        std::vector<json> owned;
+        const json *arr = resolveHotReloadDataArray(response, owned);
+
+        if(!arr) {
+            log("parseHotReloadResponse: unexpected response shape",
+                LogLevel::ERRORS);
+            return items;
+        }
+
+        items.reserve(arr->size());
+        for(const auto &item : *arr) {
+            if(!item.is_object())
+                continue;
+
+            HotReloadItem hr;
+            hr.id = item.value("id", 0);
+            hr.dataPointId = item.value("dataPointId", 0);
+            hr.name = item.value("name", std::string{});
+            hr.typeId = item.value("typeId", std::string{});
+            hr.nodeId = item.value("nodeId", std::string{});
+            // The API may include a fully-formed OPC UA path under
+            // "namespace" (e.g. "ns=2;i=32081"). When present, callers
+            // prefer it over reconstructing from nodeId.
+            if(item.contains("namespace") && item["namespace"].is_string())
+                hr.namespacePath = item["namespace"].get<std::string>();
+            hr.parentId = item.value("parentId", std::string{});
+            hr.orgId = item.value("orgId", 0);
+            // deadbandPercent comes through as a JSON number; tolerate either
+            // numeric or omitted.
+            if(item.contains("deadbandPercent") &&
+               item["deadbandPercent"].is_number()) {
+                hr.deadbandPercent = item["deadbandPercent"].get<double>();
+            }
+            hr.sampling = item.value("sampling", 0);
+            hr.queueSize = item.value("queueSize", 0);
+
+            // Group-only fields (present when typeId == "OPC_HI_GROUP").
+            // Tolerate both "maxNotification" (current API spelling) and
+            // "maxNotificationsPerPublish" (alt/legacy).
+            if(item.contains("publishingInterval") &&
+               item["publishingInterval"].is_number())
+                hr.publishingInterval =
+                    item["publishingInterval"].get<int>();
+            if(item.contains("maxKeepAliveCount") &&
+               item["maxKeepAliveCount"].is_number())
+                hr.maxKeepAliveCount = item["maxKeepAliveCount"].get<int>();
+            if(item.contains("lifeTimeCount") &&
+               item["lifeTimeCount"].is_number())
+                hr.lifetimeCount = item["lifeTimeCount"].get<int>();
+            if(item.contains("priority") && item["priority"].is_number())
+                hr.priority = item["priority"].get<int>();
+            if(item.contains("maxNotification") &&
+               item["maxNotification"].is_number())
+                hr.maxNotificationsPerPublish =
+                    item["maxNotification"].get<int>();
+            else if(item.contains("maxNotificationsPerPublish") &&
+                    item["maxNotificationsPerPublish"].is_number())
+                hr.maxNotificationsPerPublish =
+                    item["maxNotificationsPerPublish"].get<int>();
+
+            if(item.contains("dataPointsModel") &&
+               item["dataPointsModel"].is_object()) {
+                const auto &dpm = item["dataPointsModel"];
+                hr.rdWtOpt = dpm.value("rdWtOpt", std::string{});
+            }
+
+            if(item.contains("mappedTagOptions") &&
+               item["mappedTagOptions"].is_array()) {
+                for(const auto &mto : item["mappedTagOptions"]) {
+                    if(!mto.is_object())
+                        continue;
+                    HotReloadMappedTagOption opt;
+                    opt.id = mto.value("id", 0);
+                    opt.tagId = mto.value("tagId", 0);
+                    opt.orgId = mto.value("orgId", 0);
+                    opt.name = mto.value("name", std::string{});
+                    opt.namespaces = mto.value("namespace", std::string{});
+                    hr.mappedTagOptions.push_back(std::move(opt));
+                }
+            }
+
+            items.push_back(std::move(hr));
+        }
+    } catch(const std::exception &e) {
+        log("parseHotReloadResponse error: " + std::string(e.what()),
+            LogLevel::ERRORS);
+        items.clear();
+    }
+    return items;
+}
+
+// Parse a single hot reload "server" item into a ServerInfoO. The shape is
+// expected to mirror the startup hierarchy server entries (cfgName,
+// endpointUrl, security*, authType, credentials, plus a groups[] array of
+// group items, each containing a tags[] array). Any missing fields take
+// safe defaults.
+//
+// Side effect: populates Mapping / TopicMapping for every mapped tag found,
+// mirroring ParseServerHierarchyFromJson.
+static ServerInfoO
+parseSingleHotReloadServer(const json &item, int globalOrgId) {
+    ServerInfoO serverInfo;
+
+    // EdgentHotReloading often nests connection/auth fields under svrInfoModel
+    // while the outer row carries hierarchy id / display name / children.
+    const json *detail = &item;
+    if(item.contains("svrInfoModel") && item["svrInfoModel"].is_object())
+        detail = &item.at("svrInfoModel");
+
+    serverInfo.cfgName = detail->value("cfgName", "");
+    serverInfo.endpointUrl = detail->value("endpointUrl", "");
+    serverInfo.securityPolicy = detail->value("securityPolicy", "NONE");
+    serverInfo.msgSecurityMode = detail->value("msgSecurityMode", "NONE");
+    serverInfo.authType = detail->value("authType", "AUTH_STG_ANYMS");
+    if(serverInfo.authType == "anonymus" || serverInfo.authType == "anonymous")
+        serverInfo.authType = "AUTH_STG_ANYMS";
+    serverInfo.dataPointId =
+        item.value("id", item.value("dataPointId", 0));
+    if(serverInfo.dataPointId == 0)
+        serverInfo.dataPointId =
+            detail->value("dataPointId", detail->value("id", 0));
+    serverInfo.name =
+        item.value("name", detail->value("cfgName", std::string{}));
+    serverInfo.nodeId = item.value("nodeId", detail->value("nodeId", ""));
+    serverInfo.typeId = item.value("typeId", std::string{"OPC_HI_SERVER"});
+    serverInfo.parentId = item.value("parentId", detail->value("parentId", ""));
+
+    serverInfo.username = detail->value("username", "");
+    serverInfo.password = detail->value("userPwd", "");
+    serverInfo.certificate = detail->value("certificate", "");
+    serverInfo.privateKey = detail->value("privateKey", "");
+    serverInfo.sessionName = detail->value("sessionName", "");
+
+    const json *groupRoot = nullptr;
+    if(item.contains("groups") && item["groups"].is_array())
+        groupRoot = &item["groups"];
+    else if(item.contains("children") && item["children"].is_array())
+        groupRoot = &item["children"];
+
+    if(groupRoot && groupRoot->is_array()) {
+        std::vector<GroupInfo> groups;
+        for(const auto &groupItem : *groupRoot) {
+            GroupInfo groupInfo;
+            groupInfo.dataPointId = groupItem.value("dataPointId",
+                                                    groupItem.value("id", 0));
+            groupInfo.name = groupItem.value("name", "");
+            groupInfo.nodeId = groupItem.value("nodeId", "");
+            groupInfo.typeId = groupItem.value("typeId", "");
+            groupInfo.parentId = groupItem.value("parentId", "");
+            groupInfo.publishingInterval =
+                groupItem.value("publishingInterval", 0);
+            groupInfo.lifetimeCount = groupItem.value("lifeTimeCount", 0);
+            groupInfo.maxKeepAliveCount = groupItem.value("maxKeepAlive", 0);
+            groupInfo.priority = groupItem.value("priority", 0);
+            groupInfo.maxNotificationsPerPublish =
+                groupItem.value("maxNotificationsPublish", 0);
+
+            if(groupItem.contains("tags") && groupItem["tags"].is_array()) {
+                std::vector<TagInfo> groupTags;
+                for(const auto &tagItem : groupItem["tags"]) {
+                    TagInfo tagInfo;
+                    tagInfo.scaling = tagItem.value("scaling", false);
+                    tagInfo.rawMin = tagItem.value("rawMin", 0.0);
+                    tagInfo.rawMax = tagItem.value("rawMax", 0.0);
+                    tagInfo.scaleMin = tagItem.value("scaleMin", 0.0);
+                    tagInfo.scaleMax = tagItem.value("scaleMax", 0.0);
+                    tagInfo.enableExpression =
+                        tagItem.value("enableExpression", false);
+                    tagInfo.expression = tagItem.value("expression", "");
+                    tagInfo.dataPointId =
+                        tagItem.value("dataPointId", tagItem.value("id", 0));
+                    tagInfo.name = tagItem.value("name", "");
+                    tagInfo.nodeId = tagItem.value("nodeId", "");
+                    tagInfo.typeId = tagItem.value("typeId", "");
+                    tagInfo.parentId = tagItem.value("parentId", "");
+                    tagInfo.samplingInterval =
+                        tagItem.value("samplingInterval", 0);
+                    tagInfo.deadband = tagItem.value("deadband", 0);
+                    tagInfo.queuesize = tagItem.value("queueSize", 0);
+                    tagInfo.rdWtOpt = tagItem.value("rdWtOpt", "");
+                    tagInfo.sourceDatatype =
+                        tagItem.value("sourceDatatype", "");
+
+                    std::string opcUaNamespace;
+                    if(tagItem.contains("namespace") &&
+                       tagItem["namespace"].is_string()) {
+                        tagInfo.namespaceNodeID =
+                            tagItem["namespace"].get<std::string>();
+                        opcUaNamespace =
+                            tagItem["namespace"].get<std::string>();
+                    }
+
+                    if(tagItem.contains("mappedInfospaceTags") &&
+                       tagItem["mappedInfospaceTags"].is_array()) {
+                        std::vector<MappedInfospaceTag> mapped;
+                        for(const auto &mt : tagItem["mappedInfospaceTags"]) {
+                            MappedInfospaceTag mi;
+                            mi.id = mt.value("id", 0);
+                            mi.tagId = mt.value("tagId", 0);
+                            mi.name = mt.value("name", "");
+                            mi.namespaces = mt.value("namespace", "");
+                            mi.scaling = tagInfo.scaling;
+                            mi.rawMin = tagInfo.rawMin;
+                            mi.rawMax = tagInfo.rawMax;
+                            mi.scaleMin = tagInfo.scaleMin;
+                            mi.scaleMax = tagInfo.scaleMax;
+                            mi.tagType = mt.value("tagType", "");
+                            mi.enableExpression = tagInfo.enableExpression;
+                            mi.expression = tagInfo.expression;
+                            mi.samplingInterval =
+                                mt.value("samplingInterval", 0);
+                            mi.deadband = mt.value("deadband", 0);
+                            mi.queuesize = mt.value("queueSize", 0);
+                            mi.hierarchyId = tagInfo.dataPointId;
+                            mi.orgId = mt.contains("orgId")
+                                           ? mt["orgId"].get<int>()
+                                           : globalOrgId;
+
+                            // Side-effect: register the new tag so MQTT
+                            // control writes can route to this server right
+                            // after onConnected fires.
+                            Mapping[mi.tagId] = {opcUaNamespace,
+                                                 serverInfo.endpointUrl};
+                            TopicMapping[mi.tagId] = mi.namespaces;
+                            mapped.push_back(std::move(mi));
+                        }
+                        tagInfo.mappedInfospaceTags = std::move(mapped);
+                    }
+
+                    groupTags.push_back(std::move(tagInfo));
+                }
+                groupInfo.tags = std::move(groupTags);
+            }
+
+            groups.push_back(std::move(groupInfo));
+        }
+        serverInfo.groups = std::move(groups);
+    }
+
+    return serverInfo;
+}
+
+std::vector<ServerInfoO>
+parseHotReloadServerEntries(const json &response) {
+    std::vector<ServerInfoO> servers;
+    try {
+        std::vector<json> owned;
+        const json *arr = resolveHotReloadDataArray(response, owned);
+
+        if(!arr) {
+            std::string preview = response.dump();
+            constexpr std::size_t MAX = 600;
+            if(preview.size() > MAX) {
+                preview.resize(MAX);
+                preview += "…";
+            }
+            log("parseHotReloadServerEntries: unexpected response shape — "
+                "no data[] array found. Body preview (parsed JSON): " +
+                    preview,
+                LogLevel::ERRORS);
+            return servers;
+        }
+
+        const int globalOrgId =
+            (response.contains("orgId") && response["orgId"].is_number())
+                ? response["orgId"].get<int>()
+                : 1;
+
+        for(const auto &item : *arr) {
+            if(!item.is_object())
+                continue;
+
+            const std::string typeId = item.value("typeId", std::string{});
+            bool hasTopUrl =
+                item.contains("endpointUrl") &&
+                item["endpointUrl"].is_string() &&
+                !item["endpointUrl"].get<std::string>().empty();
+            bool hasModelUrl = false;
+            if(item.contains("svrInfoModel") && item["svrInfoModel"].is_object()) {
+                const auto &m = item["svrInfoModel"];
+                hasModelUrl = m.contains("endpointUrl") &&
+                              m["endpointUrl"].is_string() &&
+                              !m["endpointUrl"].get<std::string>().empty();
+            }
+            const bool looksLikeServer =
+                typeId == "OPC_HI_SERVER" || hasTopUrl || hasModelUrl;
+            if(!looksLikeServer)
+                continue;
+
+            ServerInfoO s = parseSingleHotReloadServer(item, globalOrgId);
+            if(!s.endpointUrl.empty())
+                servers.push_back(std::move(s));
+        }
+    } catch(const std::exception &e) {
+        log("parseHotReloadServerEntries error: " + std::string(e.what()),
+            LogLevel::ERRORS);
+        servers.clear();
+    }
+    return servers;
 }

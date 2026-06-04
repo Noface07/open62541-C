@@ -12,7 +12,7 @@ enum class AlarmSource {
     OPC = 1,
     Simulator = 2,
     Expr = 3,
-    AEEngine = 4
+    AEEngine = 24
 };
 
 // Quality enum: Data quality indicator
@@ -50,7 +50,7 @@ inline AlarmSource intToAlarmSource(int value) {
         case 1: return AlarmSource::OPC;
         case 2: return AlarmSource::Simulator;
         case 3: return AlarmSource::Expr;
-        case 4: return AlarmSource::AEEngine;
+        case 24: return AlarmSource::AEEngine;
         default: return AlarmSource::AEEngine;
     }
 }

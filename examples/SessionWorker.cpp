@@ -576,37 +576,15 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
         // Log completion (approximate, since job is async)
         log("✓ Submitted Address Space Creation Job for " + ctx->shortCode, LogLevel::INFO);
             
-        // 📡 BATCH SUBSCRIBE: Now that all nodes are created, perform subscription
-        if(ctx->shouldStop.load()) throw std::runtime_error("Session cancelled before subscription");
-
-        std::vector<std::string> topicsToSubscribe;
-        topicsToSubscribe.reserve(ctx->topics.size());
-
+        // We now delay the MQTT wildcard subscription until AFTER alarms are mapped 
+        // to ensure we don't receive retained alarm events before the map is ready.
+        std::vector<std::string> telemetryTopicsToSubscribe;
         {
             std::lock_guard<std::mutex> lock(g_sub_mutex);
-            for(const auto &topic : ctx->topics) {
-                // Skip if already globally subscribed
-                if(g_subscribed_topics.contains(topic)) {
-                    continue;
-                }
-
-                // Skip if already queued for subscription
-                // O(1) Check using Pending Set (Fixes CPU Spike)
-                if(g_pending_subscriptions.contains(topic)) {
-                    continue;
-                }
-
-                topicsToSubscribe.emplace_back(topic);
+            std::string wildcardTopic = ctx->shortCode + "/#";
+            if(!g_subscribed_topics.contains(wildcardTopic) && !g_pending_subscriptions.contains(wildcardTopic)) {
+                telemetryTopicsToSubscribe.push_back(wildcardTopic);
             }
-        }
-
-        if(!topicsToSubscribe.empty()) {
-            log("📡 Batch subscribing to " + std::to_string(topicsToSubscribe.size()) +
-                    " new topics (filtered from " + std::to_string(ctx->topics.size()) +
-                    ")",
-                LogLevel::INFO);
-
-            GlobalMQTT_SubscribeBatch(topicsToSubscribe);
         }
 
         // } // UNLOCK SERVER MUTEX - REMOVED STRAY BRACE
@@ -872,23 +850,17 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                                     }
                                 } // End Lock Scope
 
-                                // ------------------------------------------------------------------
-                                // 3. Subscribe to /Event topics (Safe outside lock)
-                                // ------------------------------------------------------------------
+                                // Subscribe to /event/# wildcard to capture topic/event/408/guid patterns
                                 std::string emitterTopic = searchKey;
                                 if(!emitterTopic.empty()) {
-                                    pendingEventSubs.push_back(emitterTopic + "/Event");
+                                    pendingEventSubs.push_back(emitterTopic + "/event/#");
                                 }
                                 if(alarm.alarmTriggers.has_value()) {
                                     for(const auto& trigger : alarm.alarmTriggers.value()) {
                                         if(!trigger.topic.empty()) {
-                                            pendingEventSubs.push_back(trigger.topic + "/Event");
+                                            pendingEventSubs.push_back(trigger.topic + "/event/#");
                                         }
                                     }
-                                }
-                                
-                                if(!pendingEventSubs.empty()) {
-                                    GlobalMQTT_SubscribeBatch(pendingEventSubs);
                                 }
                                 
                                 UA_NodeId_clear(&alarmId);
@@ -992,15 +964,15 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                                     }
                                 }
 
-                                // 3. Subscribe to /Event topics
+                                // 3. Subscribe to /event/# wildcard to capture topic/event/408/guid patterns
                                 std::string emitterTopic = searchKey;
                                 if(!emitterTopic.empty()) {
-                                    pendingEventSubs.push_back(emitterTopic + "/Event");
+                                    pendingEventSubs.push_back(emitterTopic + "/event/#");
                                 }
                                 if(alarm.alarmTriggers.has_value()) {
                                     for(const auto& trigger : alarm.alarmTriggers.value()) {
                                         if(!trigger.topic.empty()) {
-                                            pendingEventSubs.push_back(trigger.topic + "/Event");
+                                            pendingEventSubs.push_back(trigger.topic + "/event/#");
                                         }
                                     }
                                 }
@@ -1012,8 +984,19 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                                 UA_NodeId_clear(&alarmId);
                             }
                         }
+
+
                   }
              }, ServerJobType::AddAlarms);
+        }
+
+        // 📡 BATCH SUBSCRIBE: Enqueue a final job to subscribe to telemetry wildcards 
+        // AFTER all alarm mapping jobs have executed on the server thread.
+        if(!telemetryTopicsToSubscribe.empty()) {
+            enqueueServerJob([telemetryTopicsToSubscribe](UA_Server* server) {
+                log("📡 Batch subscribing to wildcard telemetry topic: " + telemetryTopicsToSubscribe[0], LogLevel::INFO);
+                GlobalMQTT_SubscribeBatch(telemetryTopicsToSubscribe);
+            }, ServerJobType::AddAlarms);
         }
 
         // ====================================================================
