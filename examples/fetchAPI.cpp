@@ -102,7 +102,10 @@ getBearerToken(string host, string port, string username, string password) {
         beast::http::response<beast::http::string_body> res;
         beast::http::read(stream, buffer, res);
 
-        json result = json::parse(res.body());
+        json result;
+        if (!res.body().empty()) {
+            result = json::parse(res.body());
+        }
         // log(res.body().c_str(),LogLevel::DEBUG);
 
         // Gracefully close the connection
@@ -159,7 +162,10 @@ getResponse(string host, string port, string bearerToken, string json_body,
         // ------------------------------
 
         auto bodyStr = boost::beast::buffers_to_string(res.body().data());
-        json result = json::parse(bodyStr);
+        json result;
+        if (!bodyStr.empty()) {
+            result = json::parse(bodyStr);
+        }
 
         beast::error_code ec;
         stream.socket().shutdown(tcp::socket::shutdown_both, ec);

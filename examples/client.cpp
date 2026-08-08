@@ -977,8 +977,7 @@ applyAddGroup(ClientContext *ctx, const HotReloadCommand &cmd,
         greq.maxNotificationsPerPublish = (UA_UInt32)maxNotif;
 
         UA_CreateSubscriptionResponse gsub =
-            UA_Client_Subscriptions_create(ctx->client.get(), greq,
-                                           nullptr, nullptr, nullptr);
+            UA_Client_Subscriptions_create(ctx->client.get(), greq, ctx, nullptr, nullptr);
         if(gsub.responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
             log("HotReload AddGroup: subscription creation failed for '" +
                     groupName + "' on " + ctx->endpoint + ": " +
@@ -2511,6 +2510,14 @@ runClient(bool isService, int argc, char *argv[]) {
             static_cast<UA_UInt16>(std::clamp<size_t>(expectedSubCount, 20, 256));
         if(config->timeout < 30000)
             config->timeout = 30000; // widen inactivity threshold under heavy load
+            
+        config->subscriptionInactivityCallback = [](UA_Client *, UA_UInt32, void *subCtx) {
+            auto c = static_cast<ClientContext*>(subCtx);
+            if(c) {
+                log(c->name + ": Subscription inactivity detected! Forcing reconnect.", LogLevel::ERRORS);
+                c->isConnected.store(false, std::memory_order_release);
+            }
+        };
     
         // --- Start of Corrected Security Logic ---
     
@@ -2751,7 +2758,7 @@ runClient(bool isService, int argc, char *argv[]) {
             // base subscription (events)
             UA_CreateSubscriptionRequest req = UA_CreateSubscriptionRequest_default();
             UA_CreateSubscriptionResponse sub =
-                UA_Client_Subscriptions_create(ctx->client.get(), req, nullptr, nullptr, nullptr);
+                UA_Client_Subscriptions_create(ctx->client.get(), req, ctx, nullptr, nullptr);
             ctx->subscriptions[server.name] = sub;
             MonitorEvent(ctx->client.get(), ctx->subscriptions[server.name]);
 
@@ -2774,7 +2781,7 @@ runClient(bool isService, int argc, char *argv[]) {
                 //greq.maxNotificationsPerPublish = 0;
 
                 UA_CreateSubscriptionResponse gsub =
-                    UA_Client_Subscriptions_create(ctx->client.get(), greq, nullptr, nullptr, nullptr);
+                    UA_Client_Subscriptions_create(ctx->client.get(), greq, ctx, nullptr, nullptr);
                 ctx->subscriptions[group.name] = gsub;
                 // The startup hierarchy API ships the group's hierarchy id
                 // under `dataPointId`; the hot reload MQTT command refers to
