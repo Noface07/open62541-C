@@ -3,6 +3,7 @@
 
 #include <open62541/plugin/accesscontrol_default.h>
 #include <open62541/plugin/certificategroup_default.h>
+#include <open62541/plugin/create_certificate.h>
 #include <open62541/plugin/log_stdout.h>
 #include <open62541/plugin/securitypolicy.h>
 #include <open62541/plugin/securitypolicy_default.h>
@@ -13,6 +14,7 @@
 #include <open62541/client_config_default.h>
 
 #include <algorithm>
+#include <cctype>
 #include <iostream>
 #include <map>
 #include <signal.h>
@@ -39,7 +41,6 @@
 #include "AccessControl.h"
 #include "ServerConfig.h"
 #include "ServiceUtils.h"
-#include "RedisClient.h"
 #include "SqliteQueueService.h"
 #include "EdgeConfigLoader.h"
 #include "InstrumentedMutex.cpp"
@@ -97,6 +98,12 @@ std::unique_ptr<boost::asio::steady_timer> g_sub_timer;
 std::map<std::string, UA_NodeId> nodeMap;
 std::mutex g_nodeMap_mutex;
 std::mutex g_topicMap_mutex;
+
+// Global TagId -> NodeId map. Incoming MQTT telemetry payloads identify the
+// target tag by numeric TagId (see the "Data" array entries), not by topic
+// string - a single topic can carry readings for multiple different tags.
+// Guarded by g_nodeMap_mutex (populated alongside nodeMap).
+std::unordered_map<int, UA_NodeId> g_tagIdToNode;
 // MULTI-TENANCY: Global Session Manager
 SessionManager g_sessionManager;
 
@@ -227,7 +234,7 @@ myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg
                 log(text, LogLevel::WARNING);
                 break;
             case UA_LOGLEVEL_INFO:
-                log(text, LogLevel::INFO);
+                //log(text, LogLevel::INFO);
                 break;
             case UA_LOGLEVEL_DEBUG:
                 // log(text, LogLevel::DEBUG);
@@ -335,8 +342,6 @@ customActivateSession(UA_Server *server, UA_AccessControl *ac,
     std::string finalPassword = password;
     if(!isAnonymous) {
         finalPassword = GetEncryptedString("", password, 0);
-        log("DEBUG: Encrypted Password for user '" + username + "': " + finalPassword,
-            LogLevel::INFO);
     }
 
     // ========================================================================
@@ -364,36 +369,41 @@ customActivateSession(UA_Server *server, UA_AccessControl *ac,
         std::string json_body = "{}";
         std::string cacheKey = "USER_PROFILE_" + username;
         nlohmann::ordered_json profileJson;
-        bool cacheHit = false;
+        bool gotProfile = false;
 
-        if(true) { 
-             auto start_time = std::chrono::steady_clock::now();
-             auto cachedVal = g_redisClient.get(cacheKey);
-             auto end_time = std::chrono::steady_clock::now();
-             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        if(!bearerToken.empty()) {
+            try {
+                auto futureResponse = std::async(std::launch::async, getResponse,
+                                                g_apiHost, g_apiPort, bearerToken, json_body, "/api/GetUserProfile");
 
-             if(cachedVal) {
-                 try {
-                     profileJson = nlohmann::ordered_json::parse(*cachedVal);
-                     profile = ParseUserProfileFromJson(profileJson);
-                     if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
-                        cacheHit = true;
-                        log("⚡ Redis Cache HIT for UserProfile (User: " + username + ") - Fetched in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
-                     } else {
-                        log("⚠️ Cached UserProfile incomplete (missing OrgCode/ID). Forcing refresh.", LogLevel::WARNING);
-                        cacheHit = false;
-                     }
-                 } catch(const std::exception& e) {
-                      log("⚠️ Redis Cache Parse Error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
-                 }
-             } else {
-                 if(g_redisClient.isConnected())
-                    log("📉 Redis Cache MISS for UserProfile (User: " + username + ") - Checked in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
-             }
+                profileJson = futureResponse.get();
+                profile = ParseUserProfileFromJson(profileJson);
+
+                if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
+                    gotProfile = true;
+                    log("✓ Fetched UserProfile from API (User: " + username + ")", LogLevel::INFO);
+
+                    // Cache to local database for offline fallback
+                    if(g_sqliteService) {
+                        try {
+                            g_sqliteService->SetConfig(cacheKey, profileJson.dump());
+                            log("💾 Cached UserProfile to DB for user: " + username, LogLevel::INFO);
+                        } catch(const std::exception& e) {
+                            log("⚠️ Failed to cache UserProfile to DB: " + std::string(e.what()), LogLevel::WARNING);
+                        }
+                    }
+                } else {
+                    log("⚠️ API UserProfile response incomplete (missing OrgCode/ID).", LogLevel::WARNING);
+                }
+            } catch(const std::exception& e) {
+                log("⚠️ UserProfile API call failed: " + std::string(e.what()) + ". Falling back to cached DB profile.", LogLevel::WARNING);
+            }
+        } else {
+            log("⚠️ No bearer token acquired for: " + username + ". Falling back to cached DB profile.", LogLevel::WARNING);
         }
 
-        if(!cacheHit) {
-            // 2b. Try local database fallback
+        if(!gotProfile) {
+            // Fallback: try local database cache (e.g. offline mode / API failure)
             if(g_sqliteService) {
                 try {
                     std::string dbData = g_sqliteService->GetConfig(cacheKey);
@@ -401,43 +411,12 @@ customActivateSession(UA_Server *server, UA_AccessControl *ac,
                         log("💾 DB Hit for UserProfile (User: " + username + ")", LogLevel::INFO);
                         profileJson = nlohmann::ordered_json::parse(dbData);
                         profile = ParseUserProfileFromJson(profileJson);
-                        if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
-                            cacheHit = true;
-                        } else {
-                            log("⚠️ DB UserProfile incomplete. Falling back to API.", LogLevel::WARNING);
-                        }
                     } else {
                         log("📉 DB Miss for UserProfile (User: " + username + ")", LogLevel::INFO);
                     }
                 } catch(const std::exception& e) {
                     log("⚠️ DB Error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
                 }
-            }
-        }
-
-        if(!cacheHit) {
-            if(bearerToken.empty()) {
-                log("⚠️ No bearer token and no cached UserProfile for: " + username + ". Cannot authenticate offline.", LogLevel::WARNING);
-            } else {
-                auto futureResponse = std::async(std::launch::async, getResponse,
-                                                g_apiHost, g_apiPort, bearerToken, json_body, "/api/GetUserProfile");
-                
-                profileJson = futureResponse.get();
-                
-                // Store in Redis (Persistent - no TTL)
-                g_redisClient.setCompressed(cacheKey, profileJson.dump(), 0);
-
-                // Also store in local database
-                if(g_sqliteService) {
-                    try {
-                        g_sqliteService->SetConfig(cacheKey, profileJson.dump());
-                        log("💾 Cached UserProfile to DB for user: " + username, LogLevel::INFO);
-                    } catch(const std::exception& e) {
-                        log("⚠️ Failed to cache UserProfile to DB: " + std::string(e.what()), LogLevel::WARNING);
-                    }
-                }
-                
-                profile = ParseUserProfileFromJson(profileJson);
             }
         }
 
@@ -712,6 +691,49 @@ extractShortCodeFromEndpoint(const UA_String *endpointUrl) {
     }
 
     return "";  // No path component found
+}
+
+/**
+ * Extract a bare host/IP from a ServerConfig.ip value of unknown shape,
+ * e.g. "opc.tcp://Asce", "192.168.1.23", "opc.tcp://192.168.1.23:53535".
+ * Strips any "scheme://" prefix and any trailing ":port" or "/path".
+ * Returns "" if nothing usable remains.
+ */
+static std::string
+ExtractHostFromConfigIp(const std::string &rawIp) {
+    std::string host = rawIp;
+
+    // Trim whitespace
+    while(!host.empty() && std::isspace((unsigned char)host.front())) host.erase(host.begin());
+    while(!host.empty() && std::isspace((unsigned char)host.back())) host.pop_back();
+
+    // Strip a leading scheme like "opc.tcp://"
+    size_t schemePos = host.find("://");
+    if(schemePos != std::string::npos)
+        host = host.substr(schemePos + 3);
+
+    // Strip anything from the first ':' (port) or '/' (path) onward
+    size_t cutPos = host.find_first_of(":/");
+    if(cutPos != std::string::npos)
+        host = host.substr(0, cutPos);
+
+    return host;
+}
+
+/**
+ * True if `host` is a plain dotted-quad IPv4 address (e.g. "192.168.1.23"),
+ * as opposed to a DNS hostname - used to pick "IP:" vs "DNS:" for a cert SAN entry.
+ */
+static bool
+LooksLikeIpv4Address(const std::string &host) {
+    if(host.empty())
+        return false;
+    int dotCount = 0;
+    for(char c : host) {
+        if(c == '.') { dotCount++; continue; }
+        if(!std::isdigit((unsigned char)c)) return false;
+    }
+    return dotCount == 3;
 }
 
 
@@ -1056,7 +1078,14 @@ writeCallback(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
         }
 
         dataPoint["Source"] = (int)AlarmSource::OPC;       // 1 (OPC)
-        dataPoint["Quality"] = (int)AlarmQuality::Good;    // 1 (Good)
+        // Derive quality from the OPC UA StatusCode carried by the written DataValue.
+        if(data->hasStatus && UA_StatusCode_isBad(data->status)) {
+            dataPoint["Quality"] = (int)AlarmQuality::Bad;
+        } else if(data->hasStatus && UA_StatusCode_isUncertain(data->status)) {
+            dataPoint["Quality"] = (int)AlarmQuality::Unknown;
+        } else {
+            dataPoint["Quality"] = (int)AlarmQuality::Good;
+        }
         dataPoint["UpdateType"] = (int)UpdateType::Telemetry; // 1 (Telemetry)
         dataPoint["InfoId"] = 1001; // Hardcoded
 
@@ -2487,14 +2516,21 @@ void start_mqtt_client(UA_Server *server) {
                                             // 1. Handle the "Data" array format (New Structure)
                                             if (j.contains("Data") && j["Data"].is_array()) {
                                                 for (auto& entry : j["Data"]) {
-                                                    // Determine the topic/node. Usually, the 'topic' variable from MQTT 
-                                                    // is our key, but if your JSON provides a 'TagId' mapping, 
-                                                    // you might need to look up by ID instead.
+                                                    // Each entry names its own tag via TagId - a single topic can
+                                                    // batch readings for multiple different tags, so TagId (not the
+                                                    // topic string) is the authoritative way to find the node.
+                                                    // Fall back to topic-based lookup for older payloads without TagId.
                                                     UA_NodeId nodeId = UA_NODEID_NULL;
                                                     {
                                                         std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
-                                                        auto it = nodeMap.find(topic);
-                                                        if(it != nodeMap.end()) nodeId = it->second;
+                                                        if(entry.contains("TagId")) {
+                                                            auto tagIt = g_tagIdToNode.find(entry["TagId"].get<int>());
+                                                            if(tagIt != g_tagIdToNode.end()) nodeId = tagIt->second;
+                                                        }
+                                                        if(UA_NodeId_isNull(&nodeId)) {
+                                                            auto it = nodeMap.find(topic);
+                                                            if(it != nodeMap.end()) nodeId = it->second;
+                                                        }
                                                     }
 
                                                     if(UA_NodeId_isNull(&nodeId)) continue;
@@ -2903,11 +2939,21 @@ void start_mqtt_client(UA_Server *server) {
 
                                                 if (j.contains("Data") && j["Data"].is_array()) {
                                                     for (auto& entry : j["Data"]) {
+                                                        // Each entry names its own tag via TagId - a single topic can
+                                                        // batch readings for multiple different tags, so TagId (not the
+                                                        // topic string) is the authoritative way to find the node.
+                                                        // Fall back to topic-based lookup for older payloads without TagId.
                                                         UA_NodeId nodeId = UA_NODEID_NULL;
                                                         {
                                                             std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
-                                                            auto it = nodeMap.find(topic);
-                                                            if(it != nodeMap.end()) nodeId = it->second;
+                                                            if(entry.contains("TagId")) {
+                                                                auto tagIt = g_tagIdToNode.find(entry["TagId"].get<int>());
+                                                                if(tagIt != g_tagIdToNode.end()) nodeId = tagIt->second;
+                                                            }
+                                                            if(UA_NodeId_isNull(&nodeId)) {
+                                                                auto it = nodeMap.find(topic);
+                                                                if(it != nodeMap.end()) nodeId = it->second;
+                                                            }
                                                         }
 
                                                         if(UA_NodeId_isNull(&nodeId)) continue;
@@ -3067,25 +3113,6 @@ void start_mqtt_client(UA_Server *server) {
 
 // Migrated logic from main()
 int RunServer(int argc, char **argv) {
-    // Generate Unique Instance ID for Redis Isolation
-    // Generate Unique Instance ID for Redis Isolation
-    // CHANGED: Use Static Prefix for Persistence (as requested)
-    std::string uniquePrefix = "OPCUA_SERVER:";
-    
-    // auto now = std::chrono::system_clock::now().time_since_epoch().count();
-    // DWORD pid = GetCurrentProcessId();
-    // std::stringstream ss;
-    // ss << "OPC_UA:" << std::hex << now << "_" << pid;
-    // std::string uniquePrefix = ss.str();
-
-    // Initialize Redis Cache
-    // Host: 216.48.184.131, Port: 6379, Pass: xeeredis@techd, DB: 0
-    // Prefix: OPC_UA:<TimestampHex>_<PID>
-    log("Redis Cache Prefix: " + uniquePrefix, LogLevel::INFO);
-    // Redis Initialization moved after config loading
-    // g_redisClient.init(...) 
-
-
     // Determine if running as service (via arguments or context)
     bool isService = false;
     for(int i=0; i<argc; i++) {
@@ -3199,16 +3226,6 @@ int RunServer(int argc, char **argv) {
         Settingsconfig["Payload"]["OfflineQueueOptions"]["RetentionDays"].get<int>();
 
 
-    // Extract RedisConfig
-    std::string redisHost = Settingsconfig["RedisConfig"]["Host"].get<std::string>();
-    int redisPort = Settingsconfig["RedisConfig"]["Port"].get<int>();
-    std::string redisPassword = Settingsconfig["RedisConfig"]["Password"].get<std::string>();
-    int redisDb = Settingsconfig["RedisConfig"]["DbIndex"].get<int>();
-
-    // Initialize Redis Client
-    log("Redis Cache Prefix: " + uniquePrefix, LogLevel::INFO);
-    g_redisClient.init(redisHost, redisPort, redisPassword, redisDb, uniquePrefix);
-
     // Initialize SqliteQueueService for config cache fallback
     try {
         OfflineQueueOptions sqliteOpts;
@@ -3301,17 +3318,10 @@ int RunServer(int argc, char **argv) {
     init_logging("logs/server", "server", true);
     log("Server logging initialized with day-wise log files", LogLevel::INFO);
 
-    UA_ByteString certificate = loadFile("server/own/certs/server_cert.der");
-    UA_ByteString privateKey = loadFile("server/own/certs/server_key.der");
-
-    if(certificate.length == 0 || privateKey.length == 0) {
-        log("Failed to load server certificate or key", LogLevel::ERRORS);
-        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                     "Could not load server certificate or key from certs/own/");
-        return EXIT_FAILURE;
-    }
-
-    log("Server certificate and private key loaded successfully", LogLevel::INFO);
+    // NOTE: Server certificate/key are loaded (or generated if missing) further
+    // below, right before they're consumed by UA_ServerConfig_set*() - moved there
+    // so the API-provided current_config.ip can be included in the generated
+    // cert's SAN. See "IDENTITY: Load or generate server certificate" below.
 
     UA_ByteString *trustList = NULL;
     size_t trustListSize = loadCertsFromDirectory("server/trusted/certs", &trustList);
@@ -3363,7 +3373,12 @@ int RunServer(int argc, char **argv) {
 
     std::string json_body = std::format(R"(
     {{
-        "data": {{ "nodeId": "{}" }}
+        "data": {{
+            "nodeId": "{}"
+        }},
+        "filterModel": {{
+            "CustomValue": "all"
+        }}
     }}
     )", NodeID);
 
@@ -3417,70 +3432,85 @@ int RunServer(int argc, char **argv) {
 
         std::vector<ServerConfig> configs;
         std::string serverConfigCacheKey = "SERVER_CONFIGS_" + NodeID;
+        bool apiSucceeded = false;
+
+        log("Fetching server configurations...", LogLevel::INFO);
         try {
-            log("Fetching server configurations...", LogLevel::INFO);
-            configs = ParseServerConfig(applicationEndURLHost, std::to_string(applicationEndURLPort), 
+            configs = ParseServerConfig(applicationEndURLHost, std::to_string(applicationEndURLPort),
                                         bearerToken, json_body, target);
-            
-            // If API succeeded, cache the raw response to DB for offline use
-            if(!configs.empty() && g_sqliteService) {
-                try {
-                    json configsJson = json::array();
-                    for(const auto& cfg : configs) {
-                        json j;
-                        j["id"] = cfg.id;
-                        j["dataPointId"] = cfg.dataPointId;
-                        j["name"] = cfg.name;
-                        j["ip"] = cfg.ip;
-                        j["port"] = cfg.port;
-                        j["nodeId"] = cfg.nodeId;
-                        json mappingsArr = json::array();
-                        for(const auto& om : cfg.orgMappingList) {
-                            json mj;
-                            mj["id"] = om.id;
-                            mj["hierarchyId"] = om.hierarchyId;
-                            mj["mapOrgId"] = om.mapOrgId;
-                            mj["orgShortCode"] = om.orgShortCode;
-                            mappingsArr.push_back(mj);
-                        }
-                        j["orgMappings"] = mappingsArr;
-                        configsJson.push_back(j);
+            apiSucceeded = true; // Reached the API and got a well-formed response (configs may legitimately be empty)
+        } catch(const std::exception& e) {
+            log("⚠️ Failed to fetch server configs from API: " + std::string(e.what()) + ". Falling back to local database cache.", LogLevel::WARNING);
+        }
+
+        if(apiSucceeded && !configs.empty() && g_sqliteService) {
+            // API succeeded with real data - cache it to DB for offline use
+            try {
+                json configsJson = json::array();
+                for(const auto& cfg : configs) {
+                    json j;
+                    j["id"] = cfg.id;
+                    j["dataPointId"] = cfg.dataPointId;
+                    j["name"] = cfg.name;
+                    j["ip"] = cfg.ip;
+                    j["port"] = cfg.port;
+                    j["nodeId"] = cfg.nodeId;
+                    json mappingsArr = json::array();
+                    for(const auto& om : cfg.orgMappingList) {
+                        json mj;
+                        mj["id"] = om.id;
+                        mj["hierarchyId"] = om.hierarchyId;
+                        mj["mapOrgId"] = om.mapOrgId;
+                        mj["orgShortCode"] = om.orgShortCode;
+                        mappingsArr.push_back(mj);
                     }
-                    g_sqliteService->SetConfig(serverConfigCacheKey, configsJson.dump());
-                    log("💾 Cached server configs to DB (" + std::to_string(configs.size()) + " configs)", LogLevel::INFO);
-                } catch(const std::exception& e) {
-                    log("⚠️ Failed to cache server configs to DB: " + std::string(e.what()), LogLevel::WARNING);
+                    j["orgMappings"] = mappingsArr;
+                    configsJson.push_back(j);
                 }
+                g_sqliteService->SetConfig(serverConfigCacheKey, configsJson.dump());
+                log("💾 Cached server configs to DB (" + std::to_string(configs.size()) + " configs)", LogLevel::INFO);
+            } catch(const std::exception& e) {
+                log("⚠️ Failed to cache server configs to DB: " + std::string(e.what()), LogLevel::WARNING);
             }
+        } else if(apiSucceeded) {
+            log("ℹ️ API returned an authoritative empty server list for this node - nothing to run.", LogLevel::INFO);
+        }
 
-            // If API returned empty (e.g. token was empty/offline), try DB fallback
-            if(configs.empty() && g_sqliteService) {
-                log("📉 API returned no configs. Trying local database fallback...", LogLevel::INFO);
-                try {
-                    std::string dbData = g_sqliteService->GetConfig(serverConfigCacheKey);
-                    if(!dbData.empty()) {
-                        json cachedConfigs = json::parse(dbData);
-                        for(const auto& item : cachedConfigs) {
-                            configs.push_back(ServerConfigFromJSON(item));
-                        }
-                        log("💾 DB Hit! Loaded " + std::to_string(configs.size()) + " server configs from local database.", LogLevel::INFO);
-                    } else {
-                        log("📉 DB Miss for server configs.", LogLevel::INFO);
+        // Only fall back to the local DB cache if the API call itself failed.
+        // An API call that succeeded with zero results is authoritative and must
+        // NOT be overridden by a stale local cache (e.g. previously-decommissioned
+        // server instances would otherwise keep getting spawned forever).
+        if(!apiSucceeded && g_sqliteService) {
+            log("📉 Trying local database fallback for server configs...", LogLevel::INFO);
+            try {
+                std::string dbData = g_sqliteService->GetConfig(serverConfigCacheKey);
+                if(!dbData.empty()) {
+                    json cachedConfigs = json::parse(dbData);
+                    for(const auto& item : cachedConfigs) {
+                        configs.push_back(ServerConfigFromJSON(item));
                     }
-                } catch(const std::exception& e) {
-                    log("⚠️ DB Error for server configs: " + std::string(e.what()), LogLevel::WARNING);
+                    log("💾 DB Hit! Loaded " + std::to_string(configs.size()) + " server configs from local database.", LogLevel::INFO);
+                } else {
+                    log("📉 DB Miss for server configs.", LogLevel::INFO);
                 }
+            } catch(const std::exception& e) {
+                log("⚠️ DB Error for server configs: " + std::string(e.what()), LogLevel::WARNING);
             }
+        }
 
-            if(configs.empty()) {
-                log("❌ No server configurations found (API + DB). Exiting.", LogLevel::ERRORS);
-                return EXIT_FAILURE;
-            }
+        if(configs.empty()) {
+            log(apiSucceeded
+                    ? "❌ No server configurations for this node (API confirmed zero servers). Exiting."
+                    : "❌ No server configurations found (API unreachable and DB fallback empty). Exiting.",
+                LogLevel::ERRORS);
+            return EXIT_FAILURE;
+        }
 
+        try {
             // 1. Configure Manager (Instance 0)
             current_config = configs[0];
             log("✓ Manager Configured: " + current_config.name + " (" + std::to_string(current_config.port) + ")", LogLevel::INFO);
-            
+
             // DEBUG: Log all configs
             for(size_t i=0; i<configs.size(); i++) {
                 log("  Config[" + std::to_string(i) + "]: " + configs[i].name + " Port: " + std::to_string(configs[i].port), LogLevel::DEBUG);
@@ -3507,7 +3537,7 @@ int RunServer(int argc, char **argv) {
             }
 
         } catch(const std::exception& e) {
-            log("Failed to fetch server configs: " + std::string(e.what()), LogLevel::ERRORS);
+            log("Failed to configure manager/spawn children: " + std::string(e.what()), LogLevel::ERRORS);
             return EXIT_FAILURE;
         }
     }
@@ -3520,6 +3550,117 @@ int RunServer(int argc, char **argv) {
     // Append the instance ID to the MQTT Client ID to ensure uniqueness across spawned instances
     g_mqtt_client_id = g_mqtt_client_id + "_" + std::to_string(current_config.id);
     log("Dynamic MQTT Client ID set to: " + g_mqtt_client_id, LogLevel::INFO);
+
+    // ========================================================================
+    // IDENTITY: Load or generate server certificate
+    // ========================================================================
+    // Placed here (after current_config is populated from the API/stdin) rather
+    // than at startup, so a generated cert's SAN can include current_config.ip.
+    UA_ByteString certificate = loadFile("server/own/certs/server_cert.der");
+    UA_ByteString privateKey = loadFile("server/own/certs/server_key.der");
+
+    if(certificate.length == 0 || privateKey.length == 0) {
+        // No identity on disk yet (e.g. fresh install - the installer intentionally
+        // never ships a private key). Generate a unique self-signed cert+key locally
+        // so the server always has a working identity without any manual per-machine
+        // step. Never shipped/shared: this key is generated on and stays on this
+        // machine only.
+        log("No server certificate/key found - generating a new self-signed certificate...",
+            LogLevel::WARNING);
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+
+        UA_String certSubject[3] = {
+            UA_STRING_STATIC("C=IN"),
+            UA_STRING_STATIC("O=Anexee"),
+            UA_STRING_STATIC("CN=AnexeeServer")
+        };
+
+        // The cert's SAN must cover every address a client might use to connect
+        // (hostname mismatch => BadCertificateHostNameInvalid), so include
+        // localhost, the loopback IP, this machine's actual computer name (since
+        // open62541 advertises endpoints using the real hostname, not "localhost"),
+        // and - if the API gave us one for this server - its configured IP too.
+        std::string localHostname = "localhost";
+#ifdef _WIN32
+        {
+            char hostnameBuf[256];
+            DWORD hostnameLen = sizeof(hostnameBuf);
+            if(GetComputerNameA(hostnameBuf, &hostnameLen))
+                localHostname = std::string(hostnameBuf);
+        }
+#else
+        {
+            char hostnameBuf[256];
+            if(gethostname(hostnameBuf, sizeof(hostnameBuf)) == 0)
+                localHostname = std::string(hostnameBuf);
+        }
+#endif
+        std::string sanHostnameEntry = "DNS:" + localHostname;
+
+        // current_config.ip may be empty, a bare IP, a bare hostname, or a full
+        // "opc.tcp://host[:port]" URL - extract just the host/IP portion.
+        std::string apiHost = ExtractHostFromConfigIp(current_config.ip);
+        std::string sanApiHostEntry;
+        if(!apiHost.empty() && apiHost != localHostname && apiHost != "localhost") {
+            sanApiHostEntry = (LooksLikeIpv4Address(apiHost) ? "IP:" : "DNS:") + apiHost;
+            log("Including API-configured address in cert SAN: " + sanApiHostEntry, LogLevel::INFO);
+        }
+
+        std::vector<UA_String> certSubjectAltName = {
+            UA_STRING_STATIC("DNS:localhost"),
+            UA_STRING_ALLOC(sanHostnameEntry.c_str()),
+            UA_STRING_STATIC("IP:127.0.0.1"),
+            UA_STRING_STATIC("URI:urn:Anexee.server.application")
+        };
+        if(!sanApiHostEntry.empty())
+            certSubjectAltName.push_back(UA_STRING_ALLOC(sanApiHostEntry.c_str()));
+
+        UA_KeyValueMap *certParams = UA_KeyValueMap_new();
+        UA_UInt16 certExpiresInDays = 3650;
+        UA_KeyValueMap_setScalar(certParams, UA_QUALIFIEDNAME(0, (char*)"expires-in-days"),
+                                 (void*)&certExpiresInDays, &UA_TYPES[UA_TYPES_UINT16]);
+
+        UA_StatusCode certGenStatus = UA_CreateCertificate(
+            UA_Log_Stdout, certSubject, 3, certSubjectAltName.data(), certSubjectAltName.size(),
+            UA_CERTIFICATEFORMAT_DER, certParams, &privateKey, &certificate);
+        UA_KeyValueMap_delete(certParams);
+        // Index 1 (hostname) is always UA_STRING_ALLOC'd; index 4 (API host), if present, too.
+        UA_String_clear(&certSubjectAltName[1]);
+        if(!sanApiHostEntry.empty())
+            UA_String_clear(&certSubjectAltName[4]);
+
+        if(certGenStatus != UA_STATUSCODE_GOOD || certificate.length == 0 || privateKey.length == 0) {
+            log("Failed to auto-generate server certificate: " +
+                    std::string(UA_StatusCode_name(certGenStatus)),
+                LogLevel::ERRORS);
+            UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                         "Could not load or generate a server certificate/key in server/own/certs/");
+            return EXIT_FAILURE;
+        }
+
+        // Persist to disk so subsequent runs reuse the same identity instead of
+        // regenerating (and re-prompting clients to re-trust) on every restart.
+        FILE *certFp = fopen("server/own/certs/server_cert.der", "wb");
+        if(certFp) {
+            fwrite(certificate.data, sizeof(UA_Byte), certificate.length, certFp);
+            fclose(certFp);
+        } else {
+            log("WARNING: Could not persist generated server_cert.der to disk", LogLevel::WARNING);
+        }
+        FILE *keyFp = fopen("server/own/certs/server_key.der", "wb");
+        if(keyFp) {
+            fwrite(privateKey.data, sizeof(UA_Byte), privateKey.length, keyFp);
+            fclose(keyFp);
+        } else {
+            log("WARNING: Could not persist generated server_key.der to disk", LogLevel::WARNING);
+        }
+
+        log("✓ Generated and saved a new self-signed server certificate (server/own/certs/)",
+            LogLevel::INFO);
+    } else {
+        log("Server certificate and private key loaded successfully", LogLevel::INFO);
+    }
 
     // 1. Override Port
     if(current_config.port > 0) {
@@ -3852,11 +3993,6 @@ int RunServer(int argc, char **argv) {
 
 
     log("Cleaning up server resources", LogLevel::DEBUG);
-
-    // Clear Redis Cache (OPC_UA prefix)
-    g_redisClient.clearCache();
-
-
 
     // Clean up security policies
     for(size_t i = 0; i < config->securityPoliciesSize; i++) {

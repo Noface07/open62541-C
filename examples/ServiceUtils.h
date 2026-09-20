@@ -6,7 +6,7 @@
 #include <string>
 
 // Service Configuration
-#define SERVICE_NAME  "AnexeeServer"
+#define SERVICE_NAME  "XEE-UA-Server"
 #define DISPLAY_NAME  "Anexee OPC UA Server"
 
 // Global definition of the main server loop function

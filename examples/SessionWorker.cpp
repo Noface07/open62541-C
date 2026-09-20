@@ -19,6 +19,7 @@ extern void GlobalMQTT_UnsubscribeBatch(const std::vector<std::string> &topics);
 
 extern std::map<std::string, UA_NodeId> nodeMap;
 extern std::mutex g_nodeMap_mutex;
+extern std::unordered_map<int, UA_NodeId> g_tagIdToNode;
 //extern InstrumentedMutex g_alarmMutex("g_alarmMutex");
 
 // Extern declarations for MQTT Globals (Required for batch filtering in SessionWorker)
@@ -54,7 +55,6 @@ extern void enqueueServerJob(const std::function<void(UA_Server*)>& fn, ServerJo
 // ============================================================================
 // GLOBAL API CACHE (In-Memory)
 // ============================================================================
-#include "RedisClient.h"
 #include "SqliteQueueService.h"
 
 // Extern: SqliteQueueService from server.cpp for config cache fallback
@@ -175,61 +175,15 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
         })";
         
         json topicResponse;
-        bool cacheHit = false;
+        bool gotTopics = false;
         std::string cacheKey = "TOPIC_LIST_" + std::to_string(ctx->orgId);
 
-        if(true) { // Always check cache if enabled via RedisClient connection
-             auto start_time = std::chrono::steady_clock::now();
-             auto cachedVal = g_redisClient.get(cacheKey);
-             auto end_time = std::chrono::steady_clock::now();
-             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-
-             if(cachedVal) {
-
-                 try {
-                     auto parse_start = std::chrono::high_resolution_clock::now();
-                     topicResponse = json::parse(*cachedVal);
-                     auto parse_end = std::chrono::high_resolution_clock::now();
-                     auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(parse_end - parse_start).count();
-                     
-                     cacheHit = true;
-                     log("⚡ Redis Cache HIT for Topics (OrgID: " + std::to_string(ctx->orgId) + 
-                         ") - Fetch: " + std::to_string(elapsed_ms) + " ms, " +
-                         "Parse: " + std::to_string(parse_ms) + " ms (" + 
-                         std::to_string(cachedVal->size()) + " bytes)", LogLevel::INFO);
-                 } catch(const std::exception& e) {
-                     log("⚠️ Redis Cache Parse Error: " + std::string(e.what()), LogLevel::WARNING);
-                 }
-             } else {
-                 if(g_redisClient.isConnected())
-                    log("📉 Redis Cache MISS for Topics (OrgID: " + std::to_string(ctx->orgId) + ") - Checked in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
-             }
-        }
-
-        if(!cacheHit) {
-            // 2b. Try local database fallback
-            if(g_sqliteService) {
-                try {
-                    std::string dbData = g_sqliteService->GetConfig(cacheKey);
-                    if(!dbData.empty()) {
-                        log("💾 DB Hit for Topics (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
-                        topicResponse = json::parse(dbData);
-                        cacheHit = true;
-                    } else {
-                        log("📉 DB Miss for Topics (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
-                    }
-                } catch(const std::exception& e) {
-                    log("⚠️ DB Error for Topics: " + std::string(e.what()), LogLevel::WARNING);
-                }
-            }
-        }
-
-        if(!cacheHit) {
+        try {
             auto futureResponse =
                 std::async(std::launch::async, getResponse,
                                             apiHost, apiPort, bearerToken,
                                             topicJsonBody, "/api/GetTopicList");
-            
+
             // Responsive wait for API response
             while(futureResponse.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
                 if(ctx->shouldStop.load()) {
@@ -238,17 +192,38 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                 }
             }
             topicResponse = futureResponse.get();
-            
-            // Store in Redis (Persistent - no TTL)
-            g_redisClient.setCompressed(cacheKey, topicResponse.dump(), 0);
+            gotTopics = true;
+            log("✓ Fetched Topics from API (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
 
-            // Also store in local database
+            // Cache to local database for offline fallback
             if(g_sqliteService) {
                 try {
                     g_sqliteService->SetConfig(cacheKey, topicResponse.dump());
                     log("💾 Cached Topics to DB for OrgID: " + std::to_string(ctx->orgId), LogLevel::INFO);
                 } catch(const std::exception& e) {
                     log("⚠️ Failed to cache Topics to DB: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
+        } catch(const std::exception& e) {
+            if(ctx->shouldStop.load())
+                throw; // Propagate cancellation
+
+            log("⚠️ Topic List API call failed: " + std::string(e.what()) + ". Falling back to cached DB topics.", LogLevel::WARNING);
+        }
+
+        if(!gotTopics) {
+            // Fallback: try local database cache (e.g. offline mode / API failure)
+            if(g_sqliteService) {
+                try {
+                    std::string dbData = g_sqliteService->GetConfig(cacheKey);
+                    if(!dbData.empty()) {
+                        log("💾 DB Hit for Topics (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
+                        topicResponse = json::parse(dbData);
+                    } else {
+                        log("📉 DB Miss for Topics (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
+                    }
+                } catch(const std::exception& e) {
+                    log("⚠️ DB Error for Topics: " + std::string(e.what()), LogLevel::WARNING);
                 }
             }
         }
@@ -357,8 +332,8 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                         
                         // Create Variable
                         UA_VariableAttributes attr = UA_VariableAttributes_default;
-                        UA_Int32 value = 0;
-                        UA_Variant_setScalarCopy(&attr.value, &value, &UA_TYPES[UA_TYPES_INT32]);
+                        UA_Double value = 0.0;
+                        UA_Variant_setScalarCopy(&attr.value, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
                         attr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", parts.back().c_str());
                         if(item.contains("name")) {
                             attr.description = UA_LOCALIZEDTEXT_ALLOC("en-US", item["name"].get<std::string>().c_str());
@@ -390,9 +365,10 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                             // Update Global Map (Protected, used by Generic Telemetry)
                             {
                                 std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
-                                nodeMap[ns] = nodeId; 
+                                nodeMap[ns] = nodeId;
+                                g_tagIdToNode[tagId] = nodeId;
                             }
-                            
+
                             //// Add EURange property if available
                             //if(item.contains("rangeMin") && item.contains("rangeMax")) {
                             //    UA_Range range;
@@ -497,8 +473,8 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                             parent = getOrCreateFolder(server, currentPath, parts[i], parent, jobCtx->namespaceIndex, folderMap, jobCtx->nodeMap);
                         }
                         UA_VariableAttributes attr = UA_VariableAttributes_default;
-                        UA_Int32 value = 0;
-                        UA_Variant_setScalarCopy(&attr.value, &value, &UA_TYPES[UA_TYPES_INT32]);
+                        UA_Double value = 0.0;
+                        UA_Variant_setScalarCopy(&attr.value, &value, &UA_TYPES[UA_TYPES_DOUBLE]);
                         attr.displayName = UA_LOCALIZEDTEXT_ALLOC("en-US", parts.back().c_str());
                         if(item.contains("name")) attr.description = UA_LOCALIZEDTEXT_ALLOC("en-US", item["name"].get<std::string>().c_str());
                         attr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
@@ -517,8 +493,9 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                         if(rc == UA_STATUSCODE_GOOD || rc == UA_STATUSCODE_BADNODEIDEXISTS) {
                             {
                                 std::lock_guard<std::mutex> lock(g_nodeMap_mutex);
-                                jobCtx->nodeMap[ns] = nodeId; 
-                                nodeMap[ns] = nodeId; 
+                                jobCtx->nodeMap[ns] = nodeId;
+                                nodeMap[ns] = nodeId;
+                                g_tagIdToNode[tagId] = nodeId;
                             }
                             if(item.contains("rangeMin") && item.contains("rangeMax")) {
                                 UA_Range range; range.low = item["rangeMin"].get<double>(); range.high = item["rangeMax"].get<double>();
@@ -604,53 +581,15 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
         })";
         
         std::vector<AlarmConfig> alarms;
-        bool alarmCacheHit = false;
+        bool gotAlarms = false;
         std::string alarmCacheKey = "ALARMS_" + std::to_string(ctx->orgId);
 
-        if(true) { // Always check cache if enabled via RedisClient connection
-             auto start_time = std::chrono::steady_clock::now();
-             auto cachedVal = g_redisClient.get(alarmCacheKey);
-             auto end_time = std::chrono::steady_clock::now();
-             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-
-             if(cachedVal) {
-                 try {
-                     alarms = ParseAlarmConfigFromJson(json::parse(*cachedVal));
-                     alarmCacheHit = true;
-                     log("⚡ Redis Cache HIT for Alarms (OrgID: " + std::to_string(ctx->orgId) + ") - Fetched in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
-                 } catch(const std::exception& e) {
-                      log("⚠️ Redis Cache Parse Error for Alarms: " + std::string(e.what()), LogLevel::WARNING);
-                 }
-             } else {
-                 if(g_redisClient.isConnected())
-                    log("📉 Redis Cache MISS for Alarms (OrgID: " + std::to_string(ctx->orgId) + ") - Checked in " + std::to_string(elapsed_ms) + " ms", LogLevel::INFO);
-             }
-        }
-
-        if(!alarmCacheHit) {
-            // 2b. Try local database fallback
-            if(g_sqliteService) {
-                try {
-                    std::string dbData = g_sqliteService->GetConfig(alarmCacheKey);
-                    if(!dbData.empty()) {
-                        log("💾 DB Hit for Alarms (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
-                        alarms = ParseAlarmConfigFromJson(json::parse(dbData));
-                        alarmCacheHit = true;
-                    } else {
-                        log("📉 DB Miss for Alarms (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
-                    }
-                } catch(const std::exception& e) {
-                    log("⚠️ DB Error for Alarms: " + std::string(e.what()), LogLevel::WARNING);
-                }
-            }
-        }
-
-        if(!alarmCacheHit) {
+        try {
              auto futureResponse =
                 std::async(std::launch::async, getResponse,
                                             apiHost, apiPort, bearerToken,
                                             alarmJsonBody, "/api/GetAlarmsConfigDetailList");
-            
+
             // Responsive wait
             while(futureResponse.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
                 if(ctx->shouldStop.load()) {
@@ -659,11 +598,11 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                 }
             }
             json alarmResponse = futureResponse.get();
-            
-            // Store in Redis (Persistent - no TTL)
-            g_redisClient.setCompressed(alarmCacheKey, alarmResponse.dump(), 0);
+            alarms = ParseAlarmConfigFromJson(alarmResponse);
+            gotAlarms = true;
+            log("✓ Fetched Alarms from API (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
 
-            // Also store in local database
+            // Cache to local database for offline fallback
             if(g_sqliteService) {
                 try {
                     g_sqliteService->SetConfig(alarmCacheKey, alarmResponse.dump());
@@ -672,8 +611,28 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
                     log("⚠️ Failed to cache Alarms to DB: " + std::string(e.what()), LogLevel::WARNING);
                 }
             }
-            
-            alarms = ParseAlarmConfigFromJson(alarmResponse);
+        } catch(const std::exception& e) {
+            if(ctx->shouldStop.load())
+                throw; // Propagate cancellation
+
+            log("⚠️ Alarms API call failed: " + std::string(e.what()) + ". Falling back to cached DB alarms.", LogLevel::WARNING);
+        }
+
+        if(!gotAlarms) {
+            // Fallback: try local database cache (e.g. offline mode / API failure)
+            if(g_sqliteService) {
+                try {
+                    std::string dbData = g_sqliteService->GetConfig(alarmCacheKey);
+                    if(!dbData.empty()) {
+                        log("💾 DB Hit for Alarms (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
+                        alarms = ParseAlarmConfigFromJson(json::parse(dbData));
+                    } else {
+                        log("📉 DB Miss for Alarms (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
+                    }
+                } catch(const std::exception& e) {
+                    log("⚠️ DB Error for Alarms: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
         }
         
         log("✓ Fetched " + std::to_string(alarms.size()) + " alarms for org '" + 
@@ -1015,11 +974,15 @@ void sessionWorkerThread(std::shared_ptr<SessionContext> ctx, UA_Server* server,
         }
         
     } catch(const std::exception& e) {
-        log("❌ Worker error for org '" + ctx->shortCode + "': " + 
+        log("❌ Worker error for org '" + ctx->shortCode + "': " +
             std::string(e.what()), LogLevel::ERRORS);
     }
-    
-    log("🛑 [THREAD STOP] Worker thread stopped for org '" + ctx->shortCode + 
+
+    // Mark dead BEFORE returning, whether we got here via shouldStop or an error.
+    // SessionManager checks this to avoid handing out a dead context to new sessions.
+    ctx->workerAlive.store(false);
+
+    log("🛑 [THREAD STOP] Worker thread stopped for org '" + ctx->shortCode +
         "' (OrgID: " + std::to_string(ctx->orgId) + ")", LogLevel::INFO);
 
     // ====================================================================

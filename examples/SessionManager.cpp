@@ -110,12 +110,21 @@ bool SessionManager::registerSession(const UA_NodeId& sessionId,
     // DEDUPLICATION: Check if worker already exists for this Org
     std::shared_ptr<SessionContext> ctx;
     bool reused = false;
-    
+
     if(activeWorkers.find(orgConfig->orgId) != activeWorkers.end()) {
         ctx = activeWorkers[orgConfig->orgId].lock();
+        if(ctx && !ctx->workerAlive.load()) {
+            // Worker thread died early (e.g. an unhandled error before it reached its
+            // keep-alive loop). Don't hand this dead context to a new session - discard
+            // it and fall through to spawn a fresh one below.
+            log("⚠️ Discarding dead worker for org '" + shortCode + "' (OrgID: " +
+                std::to_string(orgConfig->orgId) + ") - spawning a replacement", LogLevel::WARNING);
+            ctx.reset();
+            activeWorkers.erase(orgConfig->orgId);
+        }
         if(ctx) {
             reused = true;
-            log("♻️ Reusing active worker for org '" + shortCode + "' (OrgID: " + 
+            log("♻️ Reusing active worker for org '" + shortCode + "' (OrgID: " +
                 std::to_string(orgConfig->orgId) + ") - Shared by multiple sessions", LogLevel::INFO);
         }
     }

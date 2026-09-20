@@ -85,10 +85,20 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
     p.name = myContext->infoSpace.name;
     p.tagId = myContext->infoSpace.tagId;  // Redundant?
     p.tagType = myContext->infoSpace.tagType;
-    p.source = static_cast<int>(AlarmSource::OPC);           // TODO: parameterize
+    p.source = static_cast<int>(AlarmSource::OPC);
     p.infoId = 1001;                                         // TODO: parameterize
-    p.quality = static_cast<int>(AlarmSource::OPC);          // Good quality by default
     p.UpdateType = static_cast<int>(UpdateType::Telemetry);  // Simple update by default
+
+    // Derive quality from the OPC UA StatusCode delivered by the server.
+    // The top 2 bits of the StatusCode encode the severity class:
+    //   0x00xxxxxx = Good, 0x40xxxxxx = Uncertain, 0x80xxxxxx = Bad
+    if(value->hasStatus && UA_StatusCode_isBad(value->status)) {
+        p.quality = static_cast<int>(AlarmQuality::Bad);
+    } else if(value->hasStatus && UA_StatusCode_isUncertain(value->status)) {
+        p.quality = static_cast<int>(AlarmQuality::Unknown);
+    } else {
+        p.quality = static_cast<int>(AlarmQuality::Good);
+    }
 
     // Get timestamp
 

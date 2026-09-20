@@ -91,8 +91,9 @@ std::string GetEncryptedString(std::string encryptionKey, std::string data, int 
 
     // 4. Base64 encode the encrypted bytes
     std::string base64Str = base64_encode(encrypted);
-    log("DEBUG: Base64 Encrypted: " + base64Str, LogLevel::INFO);
-    
+    // SECURITY: this logged the "encrypted" (reversibly-obfuscated) login password - commented out.
+    // log("DEBUG: Base64 Encrypted: " + base64Str, LogLevel::INFO);
+
     return base64Str;
 }
 
@@ -149,7 +150,8 @@ GetDecryptedString(std::string decryptionKey, std::string encryptedBase64, int e
         result.push_back(decrypted[i]);  
     }
 
-    log("DEBUG: Decrypted String: " + result, LogLevel::INFO);
+    // SECURITY: this logged the full decrypted EdgeConfig JSON (includes Password) - commented out.
+    // log("DEBUG: Decrypted String: " + result, LogLevel::INFO);
 
     return result;
 } 

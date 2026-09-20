@@ -153,9 +153,10 @@ EdgeConfigData LoadEdgeConfig(const std::string& prefix) {
     }
 
     std::cerr  << "[EdgeConfig] Decrypted OK (" << plaintext.size() << " chars). Parsing JSON ..." << std::endl;
-    log("EdgeConfigLoader: Decrypted config successfully (" +
-        std::to_string(plaintext.size()) + " chars). Raw JSON: " + plaintext.substr(0, 120),
-        LogLevel::INFO);
+    // SECURITY: this logged a preview of the decrypted JSON (can include Password) - commented out.
+    // log("EdgeConfigLoader: Decrypted config successfully (" +
+    //     std::to_string(plaintext.size()) + " chars). Raw JSON: " + plaintext.substr(0, 120),
+    //     LogLevel::INFO);
 
     // 4. Parse JSON
     json j;
@@ -165,8 +166,11 @@ EdgeConfigData LoadEdgeConfig(const std::string& prefix) {
         std::string msg =
             std::string("EdgeConfigLoader: FAILED — JSON parse error: ") + e.what() +
             "\n  Plaintext (first 200 chars): " + plaintext.substr(0, 200);
-        std::cerr  << "[EdgeConfig] ERROR: " << msg << std::endl;
-        log(msg, LogLevel::ERRORS);
+        // SECURITY: msg embeds decrypted plaintext (can include Password) - commented out.
+        // NOTE: msg is still thrown below, so the caller's exception handler may still
+        // print/log it (e.g. server.cpp's "ex.what()" on EdgeConfig load failure).
+        // std::cerr  << "[EdgeConfig] ERROR: " << msg << std::endl;
+        // log(msg, LogLevel::ERRORS);
         throw std::runtime_error(msg);
     }
 
@@ -227,9 +231,10 @@ void SetEdgeConfigMqttPassword(EdgeConfigData& cfg, const std::string& bearerTok
     passwordPayload["token"] = bearerToken;
     cfg.mqttPassword = passwordPayload.dump();   // e.g. {"token":"eyJ..."}
 
-    std::cerr  << "[EdgeConfig] MQTT credentials set — User=" << cfg.mqttUsername
-               << ", Password={token:<bearer token " << (bearerToken.empty() ? "EMPTY" : "set")
-               << ">} " << cfg.mqttPassword << "the following is the password"  << std::endl;
+    // SECURITY: this printed the full MQTT password (embeds the raw bearer token) - commented out.
+    // std::cerr  << "[EdgeConfig] MQTT credentials set — User=" << cfg.mqttUsername
+    //            << ", Password={token:<bearer token " << (bearerToken.empty() ? "EMPTY" : "set")
+    //            << ">} " << cfg.mqttPassword << "the following is the password"  << std::endl;
     log("EdgeConfigLoader: MQTT credentials set — User=" + cfg.mqttUsername +
         (bearerToken.empty() ? " (WARNING: empty bearer token)" : ""),
         LogLevel::INFO);

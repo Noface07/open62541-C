@@ -5,6 +5,7 @@
  #include <open62541/client_highlevel.h>
  #include <open62541/client_subscriptions.h>
  #include <open62541/plugin/log_stdout.h>
+ #include <open62541/plugin/create_certificate.h>
  
 #include <algorithm>
 #include <atomic>
@@ -43,7 +44,7 @@
  #include <unordered_map>
  #include <nlohmann/json.hpp>
 #include "UserProfile.h"
-#include "RedisClient.h"
+
 #include "alarm_enums.h"
 #include "EdgeConfigLoader.h"
 #include "TelemetrySpill.h"
@@ -547,6 +548,43 @@ myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg
 
 // Custom logger plugin
 static UA_Logger myLogger = {myLog, nullptr, nullptr};
+
+/**
+ * Extract the host portion from an OPC UA endpoint URL like
+ * "opc.tcp://192.168.1.23:4840" → "192.168.1.23".
+ * Returns "" if nothing usable remains.
+ */
+static std::string
+ExtractHostFromUrl(const std::string &rawUrl) {
+    std::string host = rawUrl;
+    // Trim whitespace
+    while(!host.empty() && std::isspace((unsigned char)host.front())) host.erase(host.begin());
+    while(!host.empty() && std::isspace((unsigned char)host.back())) host.pop_back();
+    // Strip a leading scheme like "opc.tcp://"
+    size_t schemePos = host.find("://");
+    if(schemePos != std::string::npos)
+        host = host.substr(schemePos + 3);
+    // Strip anything from the first ':' (port) or '/' (path) onward
+    size_t cutPos = host.find_first_of(":/");
+    if(cutPos != std::string::npos)
+        host = host.substr(0, cutPos);
+    return host;
+}
+
+/**
+ * True if `host` is a plain dotted-quad IPv4 address (e.g. "192.168.1.23"),
+ * as opposed to a DNS hostname — used to pick "IP:" vs "DNS:" for a cert SAN entry.
+ */
+static bool
+LooksLikeIpv4Address(const std::string &host) {
+    if(host.empty()) return false;
+    int dotCount = 0;
+    for(char c : host) {
+        if(c == '.') { dotCount++; continue; }
+        if(!std::isdigit((unsigned char)c)) return false;
+    }
+    return dotCount == 3;
+}
 
 
 std::future<std::string> getBearerTokenNow(std::string applicationEndURLHost, std::string applicationEndURLPort, std::string authUsername, std::string authPassword, bool blocking = true) {
@@ -1873,22 +1911,7 @@ runClient(bool isService, int argc, char *argv[]) {
             dbPath = appendInstanceSuffixToPath(dbPath, cliOptions.instanceId);
         }
 
-        // Extract RedisConfig
-        std::string redisHost = config["RedisConfig"]["Host"].get<std::string>();
-        int redisPort = config["RedisConfig"]["Port"].get<int>();
-        std::string redisPassword = config["RedisConfig"]["Password"].get<std::string>();
-        int redisDb = config["RedisConfig"]["DbIndex"].get<int>();
-        
-        // Initialize Redis Client
-        // Use "OPCUA_SERVER:" prefix to match the server's storage for User Profiles
-        std::string uniquePrefix = "OPCUA_SERVER:"; 
-        log("Initializing Redis Client with prefix: " + uniquePrefix, LogLevel::INFO);
-        g_redisClient.init(redisHost, redisPort, redisPassword, redisDb, uniquePrefix);
-        if (!g_redisClient.connect()) {
-            log("Failed to connect to Redis at startup. Cache will be disabled.", LogLevel::WARNING);
-        } else {
-            log("Successfully connected to Redis.", LogLevel::INFO);
-        }
+
 
 
 
@@ -2015,40 +2038,14 @@ runClient(bool isService, int argc, char *argv[]) {
         try {
             log("Attempt " + std::to_string(attempt) + " - Fetching server hierarchy...", LogLevel::INFO);
 
-            // 1. Try Redis First
-            std::string redisKey = "OPCUA_HIERARCHY_" + NodeID;
+            // 1. Try local database cache first
+            std::string cacheKey = "OPCUA_HIERARCHY_" + NodeID;
             bool cacheHit = false;
 
-            if (g_redisClient.isConnected()) {
-                log("Redis is CONNECTED. Checking key: " + redisKey, LogLevel::INFO);
-                auto fromCache = g_redisClient.get(redisKey);
-                
-                if (fromCache.has_value()) {
-                    log("Cache Hit! Loading hierarchy for " + NodeID + " from Redis.",
-                        LogLevel::INFO);
-                    try {
-                        json cachedJson = json::parse(fromCache.value());
-                        serverList = ParseServerHierarchyFromJson(cachedJson);
-                        if (!serverList.empty()) {
-                            hierarchySuccess = true;
-                            cacheHit = true;
-                            log("Hierarchy loaded from Redis successfully.", LogLevel::INFO);
-                        } else {
-                            log("Redis data invalid or empty. Falling back to API.", LogLevel::WARNING);
-                        }
-                    } catch (const std::exception& e) {
-                       log("Error parsing Redis data: " + std::string(e.what()) + ". Falling back to API.", LogLevel::ERRORS); 
-                    }
-                } else {
-                    log("Cache Miss " + redisKey + ". Fetching from API...", LogLevel::INFO);
-                }
-            }
-
-            // 2. Fallback to Database if Redis miss/fail
             if (!cacheHit && g_sqliteService) {
-                log("Checking local database for key: " + redisKey, LogLevel::INFO);
+                log("Checking local database for key: " + cacheKey, LogLevel::INFO);
                 try {
-                    std::string dbData = g_sqliteService->GetConfig(redisKey);
+                    std::string dbData = g_sqliteService->GetConfig(cacheKey);
                     if (!dbData.empty()) {
                         log("DB Hit! Loading hierarchy for " + NodeID + " from local database.", LogLevel::INFO);
                         json dbJson = json::parse(dbData);
@@ -2061,14 +2058,14 @@ runClient(bool isService, int argc, char *argv[]) {
                             log("Database data invalid or empty. Falling back to API.", LogLevel::WARNING);
                         }
                     } else {
-                        log("DB Miss for " + redisKey + ". Falling back to API...", LogLevel::INFO);
+                        log("DB Miss for " + cacheKey + ". Falling back to API...", LogLevel::INFO);
                     }
                 } catch (const std::exception& e) {
                     log("Error reading from database: " + std::string(e.what()) + ". Falling back to API.", LogLevel::ERRORS);
                 }
             }
 
-            // 3. Fallback to API if both Redis and DB miss
+            // 2. Fallback to API if DB miss
             if (!cacheHit) {
                 std::string target = "/api/GetOpcUaHierarchy";
                 // JSON body
@@ -2092,19 +2089,13 @@ runClient(bool isService, int argc, char *argv[]) {
                 
                 json apiResponse = futureResponse.get();
 
-                // Cache the fresh response to Redis
-                if (!apiResponse.is_null()) {
-                     g_redisClient.setCompressed(redisKey, apiResponse.dump(), 0);
-                     log("Cached fresh hierarchy to Redis key: " + redisKey, LogLevel::INFO);
-
-                     // Also cache to local database
-                     if (g_sqliteService) {
-                         try {
-                             g_sqliteService->SetConfig(redisKey, apiResponse.dump());
-                             log("Cached fresh hierarchy to local database key: " + redisKey, LogLevel::INFO);
-                         } catch (const std::exception& e) {
-                             log("Failed to cache to database: " + std::string(e.what()), LogLevel::WARNING);
-                         }
+                // Cache the fresh response to local database
+                if (!apiResponse.is_null() && g_sqliteService) {
+                     try {
+                         g_sqliteService->SetConfig(cacheKey, apiResponse.dump());
+                         log("Cached fresh hierarchy to local database key: " + cacheKey, LogLevel::INFO);
+                     } catch (const std::exception& e) {
+                         log("Failed to cache to database: " + std::string(e.what()), LogLevel::WARNING);
                      }
                 }
 
@@ -2529,7 +2520,101 @@ runClient(bool isService, int argc, char *argv[]) {
             // This server requires security. Load certificates and apply them.
             UA_ByteString client_cert = loadFile("client/own/certs/client_cert.der");
             UA_ByteString client_key = loadFile("client/own/certs/client_key.der");
-            
+
+            // ── Auto-generate if cert or key is missing ──────────────────────
+            if(client_cert.length == 0 || client_key.length == 0) {
+                log("No client certificate/key found — generating a new self-signed certificate...",
+                    LogLevel::WARNING);
+                UA_ByteString_clear(&client_cert);
+                UA_ByteString_clear(&client_key);
+
+                UA_String certSubject[3] = {
+                    UA_STRING_STATIC("C=IN"),
+                    UA_STRING_STATIC("O=Anexee"),
+                    UA_STRING_STATIC("CN=AnexeeClient")
+                };
+
+                // Build SAN entries. For a client cert the server typically
+                // only checks the ApplicationURI, but we include the machine
+                // hostname + loopback for completeness and to match the
+                // server's pattern.
+                std::string localHostname = "localhost";
+#ifdef _WIN32
+                {
+                    char hostnameBuf[256];
+                    DWORD hostnameLen = sizeof(hostnameBuf);
+                    if(GetComputerNameA(hostnameBuf, &hostnameLen))
+                        localHostname = std::string(hostnameBuf);
+                }
+#else
+                {
+                    char hostnameBuf[256];
+                    if(gethostname(hostnameBuf, sizeof(hostnameBuf)) == 0)
+                        localHostname = std::string(hostnameBuf);
+                }
+#endif
+                std::string sanHostnameEntry = "DNS:" + localHostname;
+
+                // Optionally include the target OPC UA server's host in the
+                // SAN so the cert is also valid if the server validates the
+                // client address (rare, but defensive).
+                std::string serverHost = ExtractHostFromUrl(server.endpointUrl);
+                std::string sanServerHostEntry;
+                if(!serverHost.empty() && serverHost != localHostname && serverHost != "localhost") {
+                    sanServerHostEntry = (LooksLikeIpv4Address(serverHost) ? "IP:" : "DNS:") + serverHost;
+                    log("Including target server address in client cert SAN: " + sanServerHostEntry, LogLevel::INFO);
+                }
+
+                std::vector<UA_String> certSubjectAltName = {
+                    UA_STRING_STATIC("DNS:localhost"),
+                    UA_STRING_ALLOC(sanHostnameEntry.c_str()),
+                    UA_STRING_STATIC("IP:127.0.0.1"),
+                    UA_STRING_STATIC("URI:urn:Anexee.client.application")
+                };
+                if(!sanServerHostEntry.empty())
+                    certSubjectAltName.push_back(UA_STRING_ALLOC(sanServerHostEntry.c_str()));
+
+                UA_KeyValueMap *certParams = UA_KeyValueMap_new();
+                UA_UInt16 certExpiresInDays = 3650;
+                UA_KeyValueMap_setScalar(certParams, UA_QUALIFIEDNAME(0, (char*)"expires-in-days"),
+                                         (void*)&certExpiresInDays, &UA_TYPES[UA_TYPES_UINT16]);
+
+                UA_StatusCode certGenStatus = UA_CreateCertificate(
+                    UA_Log_Stdout, certSubject, 3,
+                    certSubjectAltName.data(), certSubjectAltName.size(),
+                    UA_CERTIFICATEFORMAT_DER, certParams, &client_key, &client_cert);
+                UA_KeyValueMap_delete(certParams);
+
+                // Clean up UA_STRING_ALLOC'd SAN entries
+                UA_String_clear(&certSubjectAltName[1]); // hostname
+                if(!sanServerHostEntry.empty())
+                    UA_String_clear(&certSubjectAltName[4]); // server host
+
+                if(certGenStatus != UA_STATUSCODE_GOOD || client_cert.length == 0 || client_key.length == 0) {
+                    log("Failed to auto-generate client certificate: " +
+                            std::string(UA_StatusCode_name(certGenStatus)),
+                        LogLevel::ERRORS);
+                } else {
+                    // Persist to disk so subsequent runs reuse the same identity.
+                    FILE *certFp = fopen("client/own/certs/client_cert.der", "wb");
+                    if(certFp) {
+                        fwrite(client_cert.data, sizeof(UA_Byte), client_cert.length, certFp);
+                        fclose(certFp);
+                    } else {
+                        log("WARNING: Could not persist generated client_cert.der to disk", LogLevel::WARNING);
+                    }
+                    FILE *keyFp = fopen("client/own/certs/client_key.der", "wb");
+                    if(keyFp) {
+                        fwrite(client_key.data, sizeof(UA_Byte), client_key.length, keyFp);
+                        fclose(keyFp);
+                    } else {
+                        log("WARNING: Could not persist generated client_key.der to disk", LogLevel::WARNING);
+                    }
+                    log("✓ Generated and saved a new self-signed client certificate (client/own/certs/)",
+                        LogLevel::INFO);
+                }
+            }
+
             // Load trusted certificates from directory
             UA_ByteString *trustList = NULL;
             size_t trustListSize = loadCertsFromDirectory("client/trusted/certs", &trustList);
@@ -2553,7 +2638,7 @@ runClient(bool isService, int argc, char *argv[]) {
                     
                 log("Encryption configured for secure connection to " + server.name, LogLevel::INFO);
             } else {
-                 log("Warning: Could not load client certificate or key for secure server " + server.name, LogLevel::ERRORS);
+                 log("Warning: Could not load or generate client certificate for secure server " + server.name, LogLevel::ERRORS);
             }
     
             // Clean up byte strings after use
@@ -2643,60 +2728,24 @@ runClient(bool isService, int argc, char *argv[]) {
             nlohmann::ordered_json profileJson;
             bool cacheHit = false;
 
-            if(true) {
-                auto start_time = std::chrono::steady_clock::now();
-                auto cachedVal = g_redisClient.get(cacheKey);
-                auto end_time = std::chrono::steady_clock::now();
-                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      end_time - start_time)
-                                      .count();
-
-                if(cachedVal) {
-                    try {
-                        profileJson = nlohmann::ordered_json::parse(*cachedVal);
+            // Try DB cache for UserProfile
+            if(g_sqliteService) {
+                try {
+                    std::string dbData = g_sqliteService->GetConfig(cacheKey);
+                    if(!dbData.empty()) {
+                        log("💾 DB Hit for UserProfile: " + cacheKey, LogLevel::INFO);
+                        profileJson = nlohmann::ordered_json::parse(dbData);
                         profile = ParseUserProfileFromJson(profileJson);
-                        
-                        // Validate critical fields
                         if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
                             cacheHit = true;
-                            log("⚡ Redis Cache HIT for UserProfile (User: " + APIusername +
-                                    ") - Fetched in " + std::to_string(elapsed_ms) + " ms",
-                                LogLevel::INFO);
-                        } else {
-                            log("⚠️ Cached UserProfile incomplete (missing OrgCode/ID). Forcing refresh.", LogLevel::WARNING);
-                            cacheHit = false;
                         }
-                    } catch(const std::exception &e) {
-                        log("⚠️ Redis Cache Parse Error for UserProfile: " +
-                                std::string(e.what()),
-                            LogLevel::WARNING);
                     }
-                } else {
-                    if(g_redisClient.isConnected())
-                        log("📉 Redis Cache MISS for UserProfile (User: " + APIusername +
-                                ") - Checked in " + std::to_string(elapsed_ms) + " ms",
-                            LogLevel::INFO);
+                } catch(const std::exception& e) {
+                    log("⚠️ DB cache error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
                 }
             }
 
-            if(!cacheHit) {
-                // Try DB fallback before API
-                if(g_sqliteService) {
-                    try {
-                        std::string dbData = g_sqliteService->GetConfig(cacheKey);
-                        if(!dbData.empty()) {
-                            log("💾 DB Hit for UserProfile: " + cacheKey, LogLevel::INFO);
-                            profileJson = nlohmann::ordered_json::parse(dbData);
-                            profile = ParseUserProfileFromJson(profileJson);
-                            if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
-                                cacheHit = true;
-                            }
-                        }
-                    } catch(const std::exception& e) {
-                        log("⚠️ DB fallback error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
-                    }
-                }
-            }
+
 
             if(!cacheHit) {
                 if(BearerToken.empty()) {
@@ -2709,8 +2758,7 @@ runClient(bool isService, int argc, char *argv[]) {
 
                     profileJson = futureResponse.get();
 
-                    // Store in Redis (Persistent - no TTL)
-                    g_redisClient.setCompressed(cacheKey, profileJson.dump(), 0);
+
                     // Also store in DB
                     if(g_sqliteService) {
                         try {

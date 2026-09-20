@@ -36,6 +36,11 @@ struct SessionContext {
     // Dedicated worker thread
     std::thread workerThread;
     std::atomic<bool> shouldStop;
+
+    // Set false by sessionWorkerThread right before it returns (success or error).
+    // Lets SessionManager detect a worker that died early (e.g. before reaching its
+    // keep-alive loop) so it doesn't keep handing out a dead context to new sessions.
+    std::atomic<bool> workerAlive{true};
     
     // Thread synchronization for fast shutdown
     std::condition_variable cv;

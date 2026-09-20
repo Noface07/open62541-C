@@ -743,8 +743,9 @@ SqliteQueueService::SendToApi(const std::string &jsonPayload, bool isRetry) {
                       << std::endl;
             log("[SQLite] API call failed with status: " + std::to_string(statusCode),
                 LogLevel::ERRORS);
-            std::cerr << "[SQLite] Response body: " << res.body() << std::endl;
-            log("[SQLite] Response body: " + res.body(), LogLevel::ERRORS);
+            // SECURITY: unfiltered API response body - commented out.
+            // std::cerr << "[SQLite] Response body: " << res.body() << std::endl;
+            // log("[SQLite] Response body: " + res.body(), LogLevel::ERRORS);
             return false;
         }
     } catch(std::exception const &e) {

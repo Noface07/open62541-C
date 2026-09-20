@@ -900,6 +900,11 @@ ServerConfigFromJSON(const json &item) {
     return serverConfig;
 }
 
+// Throws std::runtime_error if the API call itself fails (no bearer token, network
+// error, malformed response). A well-formed response with an empty 'data' array is
+// NOT an error - it means the API authoritatively reported zero servers for this
+// node, and is returned normally as an empty vector. Callers rely on this distinction
+// to decide whether falling back to a local cache is appropriate.
 std::vector<ServerConfig>
 ParseServerConfig(const std::string &host, const std::string &port,
                   const std::string &bearerToken, const std::string &json_body,
@@ -907,29 +912,24 @@ ParseServerConfig(const std::string &host, const std::string &port,
     std::vector<ServerConfig> serverConfigs;
 
     if(bearerToken.empty()) {
-        log("ParseServerConfig: empty bearerToken; returning empty list", LogLevel::INFO);
+        throw std::runtime_error("ParseServerConfig: empty bearerToken; cannot authenticate");
+    }
+
+    auto futureResponse = std::async(std::launch::async, getResponse, host, port,
+                                     bearerToken, json_body, target);
+    json response = futureResponse.get();
+
+    if(!response.contains("data") || !response["data"].is_array()) {
+        throw std::runtime_error("ParseServerConfig: malformed response (missing/invalid 'data' field)");
+    }
+
+    if(response["data"].empty()) {
+        log("ParseServerConfig: API returned an authoritative empty server list.", LogLevel::INFO);
         return serverConfigs;
     }
 
-    try {
-        auto futureResponse = std::async(std::launch::async, getResponse, host, port,
-                                         bearerToken, json_body, target);
-        json response = futureResponse.get();
-
-        if(!response.contains("data") || !response["data"].is_array() ||
-           response["data"].empty()) {
-            log("ERROR: No 'data' field found in server config response or data is "
-                "empty!",
-                LogLevel::ERRORS);
-            return serverConfigs;
-        }
-
-        for(const auto &item : response["data"]) {
-            serverConfigs.push_back(ServerConfigFromJSON(item));
-        }
-
-    } catch(const std::exception &e) {
-        log(std::string("Error in ParseServerConfig: ") + e.what(), LogLevel::ERRORS);
+    for(const auto &item : response["data"]) {
+        serverConfigs.push_back(ServerConfigFromJSON(item));
     }
 
     return serverConfigs;
@@ -1036,10 +1036,11 @@ callHotReloadAPI(const std::string &host, const std::string &port,
         if(status < 200 || status >= 300) {
             std::string snippet = bodyStr.substr(
                 0, std::min<std::size_t>(bodyStr.size(), 512));
-            log("callHotReloadAPI: non-2xx response " +
-                    std::to_string(status) + ": " +
-                    (snippet.empty() ? std::string("<empty body>") : snippet),
-                LogLevel::ERRORS);
+            // SECURITY: response snippet can include credential fields - commented out.
+            // log("callHotReloadAPI: non-2xx response " +
+            //         std::to_string(status) + ": " +
+            //         (snippet.empty() ? std::string("<empty body>") : snippet),
+            //     LogLevel::ERRORS);
             return json{};
         }
 
@@ -1056,9 +1057,10 @@ callHotReloadAPI(const std::string &host, const std::string &port,
         } catch(const std::exception &pe) {
             std::string snippet = bodyStr.substr(
                 0, std::min<std::size_t>(bodyStr.size(), 512));
-            log(std::string("callHotReloadAPI: JSON parse failed: ") +
-                    pe.what() + " — body snippet: " + snippet,
-                LogLevel::ERRORS);
+            // SECURITY: response snippet can include credential fields - commented out.
+            // log(std::string("callHotReloadAPI: JSON parse failed: ") +
+            //         pe.what() + " — body snippet: " + snippet,
+            //     LogLevel::ERRORS);
             return json{};
         }
     } catch(const std::exception &e) {
@@ -1141,10 +1143,11 @@ callEventsHotReloadAPI(const std::string &host, const std::string &port,
         if(status < 200 || status >= 300) {
             std::string snippet = bodyStr.substr(
                 0, std::min<std::size_t>(bodyStr.size(), 512));
-            log("callEventsHotReloadAPI: non-2xx response " +
-                    std::to_string(status) + ": " +
-                    (snippet.empty() ? std::string("<empty body>") : snippet),
-                LogLevel::ERRORS);
+            // SECURITY: response snippet can include credential fields - commented out.
+            // log("callEventsHotReloadAPI: non-2xx response " +
+            //         std::to_string(status) + ": " +
+            //         (snippet.empty() ? std::string("<empty body>") : snippet),
+            //     LogLevel::ERRORS);
             return json{};
         }
 
@@ -1160,9 +1163,10 @@ callEventsHotReloadAPI(const std::string &host, const std::string &port,
         } catch(const std::exception &pe) {
             std::string snippet = bodyStr.substr(
                 0, std::min<std::size_t>(bodyStr.size(), 512));
-            log(std::string("callEventsHotReloadAPI: JSON parse failed: ") +
-                    pe.what() + " — body snippet: " + snippet,
-                LogLevel::ERRORS);
+            // SECURITY: response snippet can include credential fields - commented out.
+            // log(std::string("callEventsHotReloadAPI: JSON parse failed: ") +
+            //         pe.what() + " — body snippet: " + snippet,
+            //     LogLevel::ERRORS);
             return json{};
         }
     } catch(const std::exception &e) {
@@ -1524,10 +1528,12 @@ parseHotReloadServerEntries(const json &response) {
                 preview.resize(MAX);
                 preview += "…";
             }
-            log("parseHotReloadServerEntries: unexpected response shape — "
-                "no data[] array found. Body preview (parsed JSON): " +
-                    preview,
-                LogLevel::ERRORS);
+            // SECURITY: preview can include downstream server username/password/
+            // certificate/privateKey fields - commented out.
+            // log("parseHotReloadServerEntries: unexpected response shape — "
+            //     "no data[] array found. Body preview (parsed JSON): " +
+            //         preview,
+            //     LogLevel::ERRORS);
             return servers;
         }
 
