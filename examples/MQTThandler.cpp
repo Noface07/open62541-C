@@ -6,6 +6,7 @@
 
 #include "MQTThandler.h"
 
+#include <future>
 #include <iostream>  // For std::cerr
 
 #include "Logger.h"  // For logging
@@ -49,9 +50,32 @@ MQTTHandler::MQTTHandler(boost::asio::io_context &ioc, boost::asio::ssl::context
 
 MQTTHandler::~MQTTHandler() {
     m_running = false;
-    disconnect();
-    m_reconnect_timer.cancel();  // Stop the timer
-    m_ioc.stop();                // Allow the thread to exit
+
+    // Issue a clean DISCONNECT on the io thread and give it a bounded moment
+    // to go out before stopping the io_context. Previously disconnect() was
+    // posted and the io_context stopped immediately after, so the packet was
+    // almost never sent and the broker saw an abrupt drop.
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> doneFut = done->get_future();
+    as::post(m_ioc, [this, done]() {
+        m_reconnect_timer.cancel();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if(!m_connected) {
+            done->set_value();
+            return;
+        }
+        m_connected = false;
+        auto onDone = [done](am::error_code /*ec*/) { done->set_value(); };
+        if(m_protocol)
+            m_client->async_disconnect(onDone);
+        else
+            wm_client->async_disconnect(onDone);
+    });
+    // Only wait if the io thread is actually able to run the handler.
+    if(m_mqtt_thread.joinable())
+        doneFut.wait_for(std::chrono::seconds(1));
+
+    m_ioc.stop();  // Allow the thread to exit
     if(m_mqtt_thread.joinable()) {
         m_mqtt_thread.join();
     }
@@ -311,22 +335,28 @@ MQTTHandler::publish(const std::string &topic, const std::string &payload) {
     //     LogLevel::INFO);
     // log("MQTT connection confirmed - proceeding with publish", LogLevel::INFO);
 
-    // Capture the payload by value and move it to avoid deep copies
     as::co_spawn(
         m_ioc,
-        [this, topic, payload = std::move(payload)]() -> as::awaitable<void> {
+        [this, topic, payload]() -> as::awaitable<void> {
             try {
                 auto qos = am::qos::at_most_once;
 
                 if(!m_connected.load(std::memory_order_relaxed)) {
-                    // log("Publish coroutine (QoS 0): Client disconnected",
-                    //     LogLevel::ERRORS);
+                    // Connection dropped between enqueue and send: don't lose
+                    // the sample, hand it to the spill path.
+                    std::vector<PendingMessage> lost;
+                    lost.emplace_back(topic, payload);
+                    reportFailed(std::move(lost));
                     co_return;
                 }
 
-                auto completion_handler = [this](am::error_code ec, auto pubres) {
+                auto completion_handler = [this, topic, payload](am::error_code ec,
+                                                                 auto pubres) {
                     if(ec) {
                         log("MQTT publish error: " + ec.message(), LogLevel::ERRORS);
+                        std::vector<PendingMessage> lost;
+                        lost.emplace_back(topic, payload);
+                        reportFailed(std::move(lost));
                         notifyDisconnected();
                     }
                 };
@@ -351,6 +381,9 @@ MQTTHandler::publish(const std::string &topic, const std::string &payload) {
 
             } catch(const std::exception &e) {
                 log("MQTT publish exception: " + std::string(e.what()), LogLevel::ERRORS);
+                std::vector<PendingMessage> lost;
+                lost.emplace_back(topic, payload);
+                reportFailed(std::move(lost));
                 notifyDisconnected();
             }
             co_return;
@@ -366,17 +399,32 @@ MQTTHandler::publishBatch(std::vector<std::pair<std::string, std::string>> messa
 
     // Use a single ASIO dispatch to pipeline all messages avoiding coroutine overhead
     as::post(m_ioc, [this, msgs = std::move(messages)]() {
-        if(!m_connected.load(std::memory_order_relaxed)) return;
+        if(!m_connected.load(std::memory_order_relaxed)) {
+            // Connection dropped between enqueue and send: spill the whole
+            // batch instead of silently dropping it.
+            std::vector<PendingMessage> lost;
+            lost.reserve(msgs.size());
+            for(const auto &msg : msgs)
+                lost.emplace_back(msg.first, msg.second);
+            reportFailed(std::move(lost));
+            return;
+        }
 
         auto qos = am::qos::at_most_once;
-        auto completion_handler = [this](am::error_code ec, auto pubres) {
-            if(ec) {
-                log("MQTT batch publish error: " + ec.message(), LogLevel::ERRORS);
-                notifyDisconnected();
-            }
-        };
 
         for(const auto& msg : msgs) {
+            // Per-message handler so a failed message can be spilled individually.
+            auto completion_handler = [this, topic = msg.first, payload = msg.second](
+                                          am::error_code ec, auto pubres) {
+                if(ec) {
+                    log("MQTT batch publish error: " + ec.message(), LogLevel::ERRORS);
+                    std::vector<PendingMessage> lost;
+                    lost.emplace_back(topic, payload);
+                    reportFailed(std::move(lost));
+                    notifyDisconnected();
+                }
+            };
+
             if (m_protocol) {
                 m_client->async_publish(
                     am::v5::publish_packet{
@@ -562,22 +610,13 @@ MQTTHandler::setSqliteService(SqliteQueueService *service) {
 void
 MQTTHandler::notifyConnected() {
     std::function<void()> callback_to_fire;
-    std::function<void(const std::vector<PendingMessage> &)> failed_callback;
-    std::vector<PendingMessage> pending_to_save;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if(!m_connected) {
             m_connected = true;
             m_reconnect_timer.cancel();
-
-            for(const auto &pair : m_pending_messages) {
-                pending_to_save.push_back(pair.second);
-            }
-            clearPendingMessages();
-
             callback_to_fire = m_connect_callback;
-            failed_callback = m_failed_message_callback;
         }
     }
 
@@ -591,21 +630,11 @@ MQTTHandler::notifyConnected() {
 
     if(callback_to_fire)
         as::post(m_ioc, callback_to_fire);
-    if(failed_callback && !pending_to_save.empty()) {
-        log("Saving " + std::to_string(pending_to_save.size()) +
-                " pending messages to database on reconnection",
-            LogLevel::INFO);
-        as::post(m_ioc, [failed_callback, pending_to_save]() {
-            failed_callback(pending_to_save);
-        });
-    }
 }
 
 void
 MQTTHandler::notifyDisconnected() {
     std::function<void()> disconnect_cb;
-    std::function<void(const std::vector<PendingMessage> &)> failed_cb;
-    std::vector<PendingMessage> failed_messages;
     bool transitioned = false;
 
     {
@@ -613,14 +642,7 @@ MQTTHandler::notifyDisconnected() {
         if(m_connected) {
             m_connected = false;
             transitioned = true;
-
-            for(auto &[_, msg] : m_pending_messages) {
-                failed_messages.push_back(msg);
-            }
-            m_pending_messages.clear();
-
             disconnect_cb = m_disconnect_callback;
-            failed_cb = m_failed_message_callback;
         }
     }
 
@@ -634,9 +656,6 @@ MQTTHandler::notifyDisconnected() {
 
         if(disconnect_cb)
             as::post(m_ioc, disconnect_cb);
-        if(failed_cb && !failed_messages.empty()) {
-            as::post(m_ioc, [failed_cb, failed_messages]() { failed_cb(failed_messages); });
-        }
     }
 
     if(m_running) {
@@ -649,28 +668,23 @@ MQTTHandler::notifyDisconnected() {
 }
 
 void
-MQTTHandler::clearPendingMessages() {
-    // PRECONDITION: m_mutex must already be locked by caller
-    // This method is private and should only be called from thread-safe contexts
-    m_pending_messages.clear();
-    log("Cleared all pending messages", LogLevel::DEBUG);
-}
+MQTTHandler::reportFailed(std::vector<PendingMessage> msgs) {
+    if(msgs.empty())
+        return;
 
-void
-MQTTHandler::processPendingMessages() {
-    // PRECONDITION: m_mutex must already be locked by caller
-    // This method is private and should only be called from thread-safe contexts
-    auto now = std::chrono::steady_clock::now();
-    auto it = m_pending_messages.begin();
-
-    while(it != m_pending_messages.end()) {
-        if(now - it->second.timestamp > m_message_timeout) {
-            log("Message timed out: " + it->second.topic, LogLevel::DEBUG);
-            it = m_pending_messages.erase(it);
-        } else {
-            ++it;
-        }
+    std::function<void(const std::vector<PendingMessage> &)> cb;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        cb = m_failed_message_callback;
     }
+    if(!cb) {
+        log("MQTT: " + std::to_string(msgs.size()) +
+                " message(s) failed to publish and no failed-message callback is set - dropped",
+            LogLevel::ERRORS);
+        return;
+    }
+    // Always post: callers may be inside a completion handler.
+    as::post(m_ioc, [cb, msgs = std::move(msgs)]() { cb(msgs); });
 }
 
 void

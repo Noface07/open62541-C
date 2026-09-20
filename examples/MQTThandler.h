@@ -93,10 +93,11 @@ class MQTTHandler {
     notifyConnected();
     void
     notifyDisconnected();
+    // Hand messages whose publish failed (or that could not be published
+    // because the connection dropped between enqueue and send) to the
+    // failed-message callback so the caller can spill them to SQLite.
     void
-    clearPendingMessages();
-    void
-    processPendingMessages();
+    reportFailed(std::vector<PendingMessage> msgs);
 
     // --- Member Variables ---
     boost::asio::io_context &m_ioc;
@@ -110,14 +111,6 @@ class MQTTHandler {
     mutable std::mutex m_mutex;  // Protects m_connected, callbacks, and connection params
     std::atomic<bool> m_connected{false};
     std::atomic<bool> m_is_connecting{false};  // Prevents concurrent connect attempts
-
-    using packet_id_t =
-        async_mqtt::packet_id_type;  // adjust if the library exposes a typedef
-    std::unordered_map<packet_id_t, PendingMessage> m_pending_messages;
-
-    uint16_t m_next_message_id{1};
-    std::chrono::seconds m_message_timeout{
-        10};  // Messages older than this are considered failed
 
     // Callbacks
     std::function<void(const std::string &, const std::string &)> m_message_callback;

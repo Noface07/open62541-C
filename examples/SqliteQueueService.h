@@ -65,6 +65,9 @@ struct ApiTagData {
 struct OfflineQueueOptions {
     int batchSize = 100;
     int uploadIntervalSeconds = 10;
+    // Rows in OfflineQueue older than this are purged (0 = never purge).
+    // Purge runs once at StartQueueWorker() and then roughly hourly.
+    int retentionDays = 0;
 };
 
 // --- Service Class Definition ---
@@ -126,6 +129,11 @@ class SqliteQueueService {
     SetConfig(const std::string &key, const std::string &value);
     std::string
     GetConfig(const std::string &key);
+
+    // Delete OfflineQueue rows older than options_.retentionDays. No-op when
+    // retentionDays <= 0. Safe to call from any thread.
+    void
+    PurgeExpiredMessages();
 
     using TokenRefreshCallback = std::function<std::string()>;
     void

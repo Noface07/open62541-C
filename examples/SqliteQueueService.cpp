@@ -188,26 +188,78 @@ SqliteQueueService::StopQueueWorker() {
 
 void
 SqliteQueueService::QueueWorkerLoop() {
+    // Retention purge: once at start, then about once an hour. Done on this
+    // thread so it never contends with the insert path on another thread.
+    const auto purgeInterval = std::chrono::hours(1);
+    auto lastPurge = std::chrono::steady_clock::now();
+    PurgeExpiredMessages();
+
     while(queueWorkerRunning_) {
         std::unique_lock<std::mutex> lock(queueMutex_);
-        queueCv_.wait(lock, [&] { return !queue_.empty() || !queueWorkerRunning_; });
+        // wait_for (not wait) so the loop wakes periodically for the purge even
+        // when nothing is being enqueued.
+        queueCv_.wait_for(lock, std::chrono::minutes(5),
+                          [&] { return !queue_.empty() || !queueWorkerRunning_; });
 
         if(!queueWorkerRunning_ && queue_.empty())
             break;
 
-        QueueItem item = queue_.front();
-        queue_.pop();
-        lock.unlock();
+        if(queue_.empty()) {
+            lock.unlock();
+        } else {
+            QueueItem item = queue_.front();
+            queue_.pop();
+            lock.unlock();
 
-        try {
-            InsertMessageToDatabase(item);
-            // If connected and backlog exists, start a finite drain worker.
-            if(SqliteQueueService::mqttConnected_.load(std::memory_order_acquire)) {
-                StartApiUploadTimer();
+            try {
+                InsertMessageToDatabase(item);
+                // If connected and backlog exists, start a finite drain worker.
+                if(SqliteQueueService::mqttConnected_.load(std::memory_order_acquire)) {
+                    StartApiUploadTimer();
+                }
+            } catch(const std::exception &ex) {
+                std::cerr << "SQLite insert failed for a message: " << ex.what()
+                          << std::endl;
             }
-        } catch(const std::exception &ex) {
-            std::cerr << "SQLite insert failed for a message: " << ex.what() << std::endl;
         }
+
+        if(std::chrono::steady_clock::now() - lastPurge >= purgeInterval) {
+            PurgeExpiredMessages();
+            lastPurge = std::chrono::steady_clock::now();
+        }
+    }
+}
+
+void
+SqliteQueueService::PurgeExpiredMessages() {
+    if(options_.retentionDays <= 0)
+        return;
+    try {
+        ExecuteDbCommand([&](sqlite3 *db) {
+            // CreatedAt is written as "%Y-%m-%dT%H:%M:%SZ" (UTC). Compare against
+            // a cutoff rendered in the same format so this is a plain string
+            // comparison and does not depend on SQLite's date parsing.
+            const std::string sql =
+                "DELETE FROM OfflineQueue WHERE CreatedAt < strftime('%Y-%m-%dT%H:%M:%SZ', "
+                "'now', '-" + std::to_string(options_.retentionDays) + " days');";
+            char *errMsg = nullptr;
+            if(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg) != SQLITE_OK) {
+                std::string err = errMsg ? errMsg : "unknown";
+                sqlite3_free(errMsg);
+                throw std::runtime_error("Purge failed: " + err);
+            }
+            int removed = sqlite3_changes(db);
+            if(removed > 0) {
+                log("[SQLite] Purged " + std::to_string(removed) +
+                        " OfflineQueue row(s) older than " +
+                        std::to_string(options_.retentionDays) + " day(s)",
+                    LogLevel::INFO);
+            }
+            return SQLITE_OK;
+        });
+    } catch(const std::exception &ex) {
+        log(std::string("[SQLite] PurgeExpiredMessages error: ") + ex.what(),
+            LogLevel::ERRORS);
     }
 }
 

@@ -126,7 +126,7 @@ struct MappedInfospaceTag{
     string name;
     string namespaces;
     int samplingInterval;
-    int deadband;
+    double deadband;   // absolute deadband; fractional values are meaningful
     int queuesize;
     int orgId;
 
@@ -157,7 +157,7 @@ struct TagInfo{
     string sourceDatatype;
     bool enableExpression;
     int samplingInterval;
-    int deadband;
+    double deadband;
     int queuesize;
     string rdWtOpt;
     string expression;
@@ -221,16 +221,22 @@ struct ExprTkContext {
     exprtk::expression<double> expression;
 };
 
-struct MyMonitorContext {
+// Per-monitored-item context handed to open62541 as the raw `void *monContext`.
+//
+// OWNERSHIP: always create with std::make_shared and keep the shared_ptr in
+// ClientContext::liveRegistry (LiveMonitorEntry::monCtx). The SDK only ever
+// sees the raw pointer. handler_NodeValueChanged takes a shared_ptr via
+// shared_from_this() into the worker task it posts, so a context can never be
+// destroyed while a queued task still references it. Releasing the registry
+// entry (on the OPC thread, after the monitored item / client is gone) is
+// therefore always safe.
+struct MyMonitorContext : public std::enable_shared_from_this<MyMonitorContext> {
     MappedInfospaceTag infoSpace;
     MQTTHandler* mqttHandler;
     SqliteQueueService* sqliteService;
     std::shared_ptr<ExprTkContext> exprContext;
     std::shared_ptr<AsyncPublisher> asyncPublisher; // Helper for non-blocking publish
     std::function<void(std::function<void()>)> postWorkerTask;
-    // unordered_map<int, string> TopicMapping;
-    // json payload;
-    // Add more fields as needed
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -267,6 +273,19 @@ struct LiveMonitorEntry {
     std::uint32_t subscriptionId = 0;
     std::string groupName;
     std::string endpointUrl;
+    MappedInfospaceTag infoSpace;
+    // Owning reference to the SDK context for this monitored item. Dropping
+    // the entry (after the item/client is gone) frees the context.
+    std::shared_ptr<MyMonitorContext> monCtx;
+};
+
+// A datapoint added at runtime via hot reload. Kept per ClientContext so the
+// monitor can be re-created after a reconnect/Reload (onConnected only replays
+// the startup hierarchy).
+struct HotAddedMonitor {
+    int hierarchyId = 0;
+    std::string nodePath;      // full "ns=..;i=.." / "ns=..;s=.." path
+    std::string groupName;     // preferred subscription (may no longer exist)
     MappedInfospaceTag infoSpace;
 };
 

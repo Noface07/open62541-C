@@ -64,8 +64,9 @@ static std::mutex cert_loading_mutex;
 unordered_map<string, int> groupIdMap;
 
 std::atomic<bool> g_running(true);
-std::string APIusername = "bhupesh.paliwal@techondater.com";
-std::string APIpassword = "Admin@123";
+// NOTE: the former hardcoded APIusername/APIpassword fallback was removed
+// (C-10). Servers that omit credentials now fall back to the EdgeConfig
+// identity (see buildAndStartContext).
 
 // ─── Hot reload routing ──────────────────────────────────────────────────────
 // Maps HotReloadCommand::purpose (= ServerInfoO::typeId) to the list of
@@ -104,6 +105,11 @@ struct ClientContext; // defined below
 static std::function<std::unique_ptr<ClientContext>(const ServerInfoO &)>
     g_buildContext;
 
+// Re-creates every monitored item that was added at runtime via hot reload
+// (ClientContext::hotAdded) after a (re)connect. Defined after the hot reload
+// dispatchers below; invoked from the OPC thread right after onConnected().
+static void replayHotAddedMonitors(ClientContext *ctx);
+
 static void
 postHotReloadTask(std::function<void()> fn) {
     {
@@ -121,6 +127,9 @@ static SERVICE_STATUS_HANDLE g_StatusHandle = nullptr;
 static HANDLE g_ServiceStopEvent = nullptr;
 static const char *SERVICE_NAME = "AnexeeOPCUAClient";
 static HANDLE g_EventLog = nullptr;
+// Exit code of runClient() when running as a service, so ServiceMain can
+// report a real failure to SCM (C-22).
+static std::atomic<int> g_serviceWorkerExitCode{0};
 
 // Forward declarations for service (Windows only)
 static void ReportSvcStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint);
@@ -230,7 +239,15 @@ struct ClientContext {
     // the client owns multiple connections.
     int serverHierarchyId = 0;
     std::unique_ptr<UA_Client, UA_Client_Deleter> client;
+
+    // `subscriptions` and `groupIdToName` are written on the OPC thread
+    // (onConnected, AddGroup/DeleteGroup/GroupUpdate tasks, reconnect
+    // teardown) and read on the hot-reload worker. Every access MUST hold
+    // subsMutex (C-02). Keep the critical sections short - never hold it
+    // across a UA_Client_* call that may block on the network.
+    std::mutex subsMutex;
     std::map<std::string, UA_CreateSubscriptionResponse> subscriptions;
+
     std::atomic<bool> running;
     std::atomic<bool> isConnected;
 
@@ -242,7 +259,9 @@ struct ClientContext {
     // Thread 1: OPC UA network loop (run_iterate + OPC writes)
     std::thread opcThread;
     // Thread pool: general workers (non-OPC tasks: MQTT, DB, JSON parsing, etc.)
-    static constexpr int WORKER_COUNT = 32;
+    // Tasks are microsecond-scale (build a JSON payload, enqueue). 4 per
+    // server is plenty; 32 was 33 threads per connected server (C-26).
+    static constexpr int WORKER_COUNT = 4;
     std::vector<std::thread> workers;
 
     // Queue for non-OPC tasks — consumed by workerThread
@@ -257,12 +276,18 @@ struct ClientContext {
     // Live monitored item registry indexed by hierarchyId. Populated when
     // monitored items are created at startup or by applyAdd; consumed by
     // applyDelete / applyUpdate / applyReload to undo previously created items.
+    // Each entry OWNS its MyMonitorContext (shared_ptr) - see structs.h.
     std::mutex registryMutex;
     std::unordered_map<int, std::vector<LiveMonitorEntry>> liveRegistry;
 
+    // Datapoints added at runtime via hot reload. onConnected only replays the
+    // startup hierarchy, so these are re-created separately after every
+    // (re)connect (C-06). Guarded by registryMutex.
+    std::vector<HotAddedMonitor> hotAdded;
+
     // Maps a group's hierarchy id to its `subscriptions` key (group.name) so
     // hot reload's applyGroupUpdate can look up the OPC UA subscriptionId
-    // from the MQTT command's `id`.
+    // from the MQTT command's `id`. Guarded by subsMutex.
     std::unordered_map<int, std::string> groupIdToName;
 
     std::function<UA_StatusCode()> connectOnce;
@@ -270,6 +295,28 @@ struct ClientContext {
     static constexpr size_t MAX_OPC_TASKS_PER_TICK = 256;
 
     ClientContext() : running(true), isConnected(false) {}
+
+    // Drop all per-session state that a fresh connect will rebuild:
+    // subscriptions, group id map, resolved namespace, and every live
+    // monitor registry entry (which frees the MyMonitorContexts - C-05).
+    //
+    // MUST be called on the OPC thread, and only when no UA_Client callback
+    // can run concurrently: i.e. after UA_Client_disconnect()/reset() or
+    // before the next connectOnce(). Queued worker tasks keep their own
+    // shared_ptr to a context, so freeing here can never dangle them.
+    //
+    // Does NOT touch Mapping/TopicMapping or hotAdded: onConnected and
+    // replayHotAddedMonitors need them to rebuild the session.
+    void resetSessionState() {
+        {
+            std::lock_guard<std::mutex> lk(subsMutex);
+            subscriptions.clear();
+            groupIdToName.clear();
+        }
+        resolvedNs.store(0, std::memory_order_release);
+        std::lock_guard<std::mutex> regLk(registryMutex);
+        liveRegistry.clear();
+    }
 
     void
     startLoop() {
@@ -283,10 +330,21 @@ struct ClientContext {
                 // ── reconnect logic ──────────────────────────────────────────
                 if(!isConnected.load(std::memory_order_acquire)) {
                     if(connectOnce) {
+                        // Whatever session state is left from the previous
+                        // connection is dead now (the old UA_Client is either
+                        // disconnected or about to be replaced inside
+                        // connectOnce). Free it so monitor contexts don't
+                        // leak across reconnects (C-05).
+                        resetSessionState();
+
                         UA_StatusCode rc = connectOnce();
                         if(rc == UA_STATUSCODE_GOOD) {
                             isConnected.store(true, std::memory_order_release);
                             if(onConnected) onConnected();
+                            // Re-create anything added via hot reload since
+                            // startup (C-06). Runs on this thread, after the
+                            // startup monitors have been queued.
+                            replayHotAddedMonitors(this);
                             log("Connected to " + endpoint);
                         } else {
                             std::this_thread::sleep_for(std::chrono::seconds(10));
@@ -352,7 +410,7 @@ struct ClientContext {
                     UA_Client_disconnect(client.get());
                     client.reset();
                     isConnected.store(false, std::memory_order_release);
-                    subscriptions.clear();
+                    resetSessionState();
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     continue;
                 }
@@ -519,30 +577,66 @@ loadCertsFromDirectory(const char *dirPath, UA_ByteString **certs) {
 }
 #endif
 
-// Your custom logger callback
+// open62541 log messages may use custom conversion specifiers (%N for NodeId,
+// %S for UA_String, ...) that the CRT's vsnprintf does not understand; on
+// MSVC an unknown specifier trips an invalid-parameter assertion (the server
+// hit exactly this). Returns true only if every '%' in `fmt` is a standard C
+// conversion that vsnprintf can safely expand.
+static bool
+formatIsCrtSafe(const char *fmt) {
+    for(const char *p = fmt; *p; ++p) {
+        if(*p != '%')
+            continue;
+        ++p;
+        if(*p == '%')
+            continue; // literal percent
+        // flags / width / precision
+        while(*p && strchr("-+ #0", *p)) ++p;
+        while(*p && (isdigit((unsigned char)*p) || *p == '.' || *p == '*')) ++p;
+        // length modifiers
+        while(*p && strchr("hlLqjzt", *p)) ++p;
+        if(!*p || !strchr("diouxXeEfFgGcsp", *p))
+            return false;
+    }
+    return true;
+}
+
+// Custom logger callback for open62541 (C-13). Formats only CRT-safe format
+// strings; otherwise logs the raw format string, which still identifies the
+// event. Wrapped in try/catch because this is a C callback boundary - a C++
+// exception escaping it would terminate the process.
 static void
 myLog(void *context, UA_LogLevel level, UA_LogCategory category, const char *msg,
       va_list args) {
+    try {
+        if(!msg)
+            return;
 
-    char buffer[1024];
-    vsnprintf(buffer, sizeof(buffer), msg, args);
+        std::string text;
+        if(formatIsCrtSafe(msg)) {
+            char buffer[1024];
+            vsnprintf(buffer, sizeof(buffer), msg, args);
+            text = buffer;
+        } else {
+            text = msg;
+        }
 
-    switch(level) {
-        case UA_LOGLEVEL_FATAL:
-            log(buffer, LogLevel::ERRORS);
-            break;
-        case UA_LOGLEVEL_ERROR:
-            log(buffer, LogLevel::ERRORS);
-            break;
-        case UA_LOGLEVEL_WARNING:
-            log(buffer, LogLevel::INFO);
-            break;
-        case UA_LOGLEVEL_INFO:
-            log(buffer, LogLevel::INFO);
-            break;
-        case UA_LOGLEVEL_DEBUG:
-            // log(buffer, LogLevel::DEBUG); // Silenced library debug logs
-            break;
+        switch(level) {
+            case UA_LOGLEVEL_FATAL:
+            case UA_LOGLEVEL_ERROR:
+                log(text, LogLevel::ERRORS);
+                break;
+            case UA_LOGLEVEL_WARNING:
+            case UA_LOGLEVEL_INFO:
+                log(text, LogLevel::INFO);
+                break;
+            case UA_LOGLEVEL_DEBUG:
+            default:
+                // Silenced library debug logs
+                break;
+        }
+    } catch(...) {
+        // Never let an exception unwind across the C boundary.
     }
 }
 
@@ -571,6 +665,26 @@ ExtractHostFromUrl(const std::string &rawUrl) {
     return host;
 }
 
+/** Current UTC time as "YYYY-MM-DDTHH:MM:SS.mmmZ" (C-32). */
+static std::string
+currentUtcIso8601() {
+    using namespace std::chrono;
+    const auto now = system_clock::now();
+    const std::time_t t = system_clock::to_time_t(now);
+    const int ms = (int)(duration_cast<milliseconds>(now.time_since_epoch()).count() % 1000);
+    std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+             tm.tm_sec, ms);
+    return buf;
+}
+
 /**
  * True if `host` is a plain dotted-quad IPv4 address (e.g. "192.168.1.23"),
  * as opposed to a DNS hostname — used to pick "IP:" vs "DNS:" for a cert SAN entry.
@@ -587,57 +701,58 @@ LooksLikeIpv4Address(const std::string &host) {
 }
 
 
-std::future<std::string> getBearerTokenNow(std::string applicationEndURLHost, std::string applicationEndURLPort, std::string authUsername, std::string authPassword, bool blocking = true) {
+// Sign in with up to 3 attempts, 10 s apart. Returns "" if all attempts fail.
+static std::string
+fetchBearerTokenWithRetry(const std::string &host, const std::string &port,
+                          const std::string &username, const std::string &password) {
     const int retryDelay = 10; // seconds
-    int attempt = 1;
+    const int maxRetries = 3;  // Max retries before giving up (for offline fallback)
 
-    auto fut = std::async(std::launch::async, [&]() {  // <-- capture by reference
-        std::string token;
-        bool tokenSuccess = false;
-        const int maxRetries = 3; // Max retries before giving up (for offline fallback)
-
-        while (!tokenSuccess && attempt <= maxRetries) {
-            try {
-                auto futureToken = std::async(std::launch::async, [&]() {
-                    return ::getBearerToken(applicationEndURLHost, applicationEndURLPort, authUsername, authPassword);
-                });
-
-                json tokenResponse = futureToken.get();
-
-                if (tokenResponse.contains("access_token")) {
-                    token = tokenResponse["access_token"].get<std::string>();
-                    tokenSuccess = true;
-                    std::cout << "Bearer token fetched successfully!" << std::endl;
-                    return token;
-                } else {
-                    std::cout << "Invalid token response - retrying in " 
-                            << retryDelay << " seconds..." << std::endl;
-                }
-            } catch (const std::exception& e) {
-                std::cout << "Token fetch failed (attempt " << attempt << "/" << maxRetries << "): " << e.what() << std::endl;
+    for(int attempt = 1; attempt <= maxRetries; ++attempt) {
+        try {
+            json tokenResponse = ::getBearerToken(host, port, username, password);
+            if(tokenResponse.contains("access_token")) {
+                std::cout << "Bearer token fetched successfully!" << std::endl;
+                return tokenResponse["access_token"].get<std::string>();
             }
-
-            if (!tokenSuccess) {
-                std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
-                attempt++;   // ✅ now valid, because attempt is captured by reference
-            }
+            std::cout << "Invalid token response - retrying in " << retryDelay
+                      << " seconds..." << std::endl;
+        } catch(const std::exception &e) {
+            std::cout << "Token fetch failed (attempt " << attempt << "/" << maxRetries
+                      << "): " << e.what() << std::endl;
         }
+        if(attempt < maxRetries)
+            std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
+    }
 
-        if (!tokenSuccess) {
-            std::cout << "WARNING: All " << maxRetries << " token attempts failed. Proceeding without token (DB fallback mode)." << std::endl;
-        }
+    std::cout << "WARNING: All " << maxRetries
+              << " token attempts failed. Proceeding without token (DB fallback mode)."
+              << std::endl;
+    return {};
+}
 
-        return token;  // Returns empty string if all retries failed
-    });
-
-    if (blocking) {
-        // Consume future immediately and return a ready future
+// C-17: previously captured its by-value parameters BY REFERENCE into a
+// detached std::async, which dangles the moment this function returns when
+// blocking == false. Everything is now captured by value; the blocking path
+// runs inline (no thread hop) and returns an already-satisfied future.
+std::future<std::string>
+getBearerTokenNow(std::string applicationEndURLHost, std::string applicationEndURLPort,
+                  std::string authUsername, std::string authPassword,
+                  bool blocking = true) {
+    if(blocking) {
         std::promise<std::string> p;
-        p.set_value(fut.get());
+        p.set_value(fetchBearerTokenWithRetry(applicationEndURLHost, applicationEndURLPort,
+                                              authUsername, authPassword));
         return p.get_future();
     }
 
-    return fut; // async: caller decides when to wait
+    return std::async(std::launch::async,
+                      [host = std::move(applicationEndURLHost),
+                       port = std::move(applicationEndURLPort),
+                       user = std::move(authUsername),
+                       pass = std::move(authPassword)]() {
+                          return fetchBearerTokenWithRetry(host, port, user, pass);
+                      });
 }
 
 
@@ -665,6 +780,167 @@ buildNodePath(std::uint16_t nsIdx, const std::string &nodeId) {
     return "ns=" + std::to_string(nsIdx) + (numeric ? ";i=" : ";s=") + nodeId;
 }
 
+// Parse "ns=<n>;i=<num>" / "ns=<n>;s=<str>" into a UA_NodeId. Returns
+// UA_NODEID_NULL on anything else. String ids are heap-allocated; the caller
+// must UA_NodeId_clear() the result.
+static UA_NodeId
+parseUaNodePath(const std::string &p) {
+    UA_NodeId nodeId = UA_NODEID_NULL;
+    const char *nsStart = strstr(p.c_str(), "ns=");
+    if(!nsStart) return nodeId;
+    const char *nsEnd = strchr(nsStart + 3, ';');
+    if(!nsEnd) return nodeId;
+    UA_UInt16 nsI = (UA_UInt16)strtoul(nsStart + 3, nullptr, 10);
+    const char *idStart = nsEnd + 1;
+    if(strncmp(idStart, "i=", 2) == 0)
+        nodeId = UA_NODEID_NUMERIC(nsI, (UA_UInt32)strtoul(idStart + 2, nullptr, 10));
+    else if(strncmp(idStart, "s=", 2) == 0)
+        nodeId = UA_NODEID_STRING_ALLOC(nsI, idStart + 2);
+    return nodeId;
+}
+
+// OPC-thread half of a hot-reload Add: create the monitored items for
+// (infoSpaces[i], nodePaths[i]) on `targetSubId` and register the survivors in
+// ctx->liveRegistry under `hierarchyId`. Shared by applyAdd (first creation)
+// and replayHotAddedMonitors (re-creation after a reconnect). MUST run on the
+// OPC thread (it uses ctx->client directly).
+static void
+createHotReloadMonitorsOnOpc(ClientContext *ctx, UA_UInt32 targetSubId,
+                             const std::string &targetGroupName,
+                             const std::vector<MappedInfospaceTag> &infoSpaces,
+                             const std::vector<std::string> &nodePaths,
+                             int hierarchyId, const char *logPrefix) {
+    if(!ctx->client || !ctx->isConnected.load(std::memory_order_acquire)) {
+        log(std::string(logPrefix) + ": client not connected for " + ctx->endpoint,
+            LogLevel::ERRORS);
+        return;
+    }
+
+    const size_t count = infoSpaces.size();
+    if(count == 0)
+        return;
+
+    UA_CreateMonitoredItemsRequest batchReq;
+    UA_CreateMonitoredItemsRequest_init(&batchReq);
+    batchReq.subscriptionId     = targetSubId;
+    batchReq.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+    batchReq.itemsToCreate =
+        (UA_MonitoredItemCreateRequest *)UA_Array_new(
+            count, &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
+    batchReq.itemsToCreateSize = count;
+
+    std::vector<std::shared_ptr<MyMonitorContext>> ctxs(count);
+    std::vector<void *> rawCtxs(count, nullptr);
+    std::vector<UA_Client_DataChangeNotificationCallback> cbs(
+        count, handler_NodeValueChanged);
+    std::vector<UA_Client_DeleteMonitoredItemCallback> delCbs(count, nullptr);
+
+    for(size_t i = 0; i < count; ++i) {
+        UA_NodeId nodeId = parseUaNodePath(nodePaths[i]);
+
+        UA_MonitoredItemCreateRequest &req = batchReq.itemsToCreate[i];
+        UA_MonitoredItemCreateRequest_init(&req);
+        UA_NodeId_copy(&nodeId, &req.itemToMonitor.nodeId);
+        UA_NodeId_clear(&nodeId);
+        req.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
+        req.monitoringMode = UA_MONITORINGMODE_REPORTING;
+        // C-20: honour the per-tag backend settings (0 = server default,
+        // which is what the old hardcoded values effectively requested).
+        req.requestedParameters.samplingInterval =
+            (UA_Double)(infoSpaces[i].samplingInterval > 0 ? infoSpaces[i].samplingInterval : 0);
+        req.requestedParameters.queueSize =
+            (UA_UInt32)(infoSpaces[i].queuesize > 0 ? infoSpaces[i].queuesize : 10000);
+        req.requestedParameters.discardOldest = false;
+
+        UA_DataChangeFilter *filter =
+            (UA_DataChangeFilter *)UA_malloc(sizeof(UA_DataChangeFilter));
+        UA_DataChangeFilter_init(filter);
+        if(infoSpaces[i].deadband > 0) {
+            filter->deadbandType = UA_DEADBANDTYPE_ABSOLUTE;
+            filter->deadbandValue = infoSpaces[i].deadband;
+        }
+        filter->trigger = UA_DATACHANGETRIGGER_STATUSVALUE;
+        UA_ExtensionObject &fobj = req.requestedParameters.filter;
+        memset(&fobj, 0, sizeof(fobj));
+        fobj.encoding = UA_EXTENSIONOBJECT_DECODED;
+        fobj.content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER];
+        fobj.content.decoded.data = filter;
+
+        ctxs[i] = std::make_shared<MyMonitorContext>();
+        ctxs[i]->infoSpace = infoSpaces[i];
+        ctxs[i]->mqttHandler = g_mqttHandler;
+        ctxs[i]->sqliteService = g_sqliteService;
+        ctxs[i]->asyncPublisher = g_asyncPublisher;
+        ctxs[i]->postWorkerTask = [ctx](std::function<void()> task) {
+            ctx->postTask(std::move(task));
+        };
+        rawCtxs[i] = ctxs[i].get();
+    }
+
+    UA_CreateMonitoredItemsResponse resp =
+        UA_Client_MonitoredItems_createDataChanges(
+            ctx->client.get(), batchReq, rawCtxs.data(), cbs.data(), delCbs.data());
+
+    UA_CreateMonitoredItemsRequest_clear(&batchReq);
+
+    size_t ok = 0;
+    {
+        std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+        for(size_t i = 0; i < resp.resultsSize && i < count; ++i) {
+            if(resp.results[i].statusCode != UA_STATUSCODE_GOOD) {
+                log(std::string(logPrefix) + ": monitor failed for tagId " +
+                        std::to_string(infoSpaces[i].tagId) + ": " +
+                        UA_StatusCode_name(resp.results[i].statusCode),
+                    LogLevel::ERRORS);
+                // ctxs[i] is dropped when this vector goes out of scope.
+            } else {
+                ++ok;
+                LiveMonitorEntry entry;
+                entry.hierarchyId = hierarchyId;
+                entry.tagId = infoSpaces[i].tagId;
+                entry.monitoredItemId = resp.results[i].monitoredItemId;
+                entry.subscriptionId = targetSubId;
+                entry.groupName = targetGroupName;
+                entry.endpointUrl = ctx->endpoint;
+                entry.infoSpace = infoSpaces[i];
+                entry.monCtx = ctxs[i];
+                ctx->liveRegistry[hierarchyId].push_back(std::move(entry));
+            }
+        }
+    }
+    UA_CreateMonitoredItemsResponse_clear(&resp);
+
+    log(std::string(logPrefix) + ": hierarchy " + std::to_string(hierarchyId) +
+            " on " + ctx->endpoint + ": " + std::to_string(ok) + "/" +
+            std::to_string(count) + " monitors created",
+        LogLevel::INFO);
+}
+
+// Pick the subscription a hot-reloaded datapoint should live on. Prefers the
+// group named by `preferredGroup` (C-21: resolved from the item's parentId),
+// then any group subscription. Returns false if none exists.
+static bool
+pickTargetSubscription(ClientContext *ctx, const std::string &preferredGroup,
+                       UA_UInt32 &subIdOut, std::string &groupNameOut) {
+    std::lock_guard<std::mutex> lk(ctx->subsMutex);
+    if(!preferredGroup.empty()) {
+        auto it = ctx->subscriptions.find(preferredGroup);
+        if(it != ctx->subscriptions.end()) {
+            subIdOut = it->second.subscriptionId;
+            groupNameOut = it->first;
+            return true;
+        }
+    }
+    for(const auto &kv : ctx->subscriptions) {
+        if(kv.first == ctx->name)
+            continue; // legacy events subscription key, if present
+        subIdOut = kv.second.subscriptionId;
+        groupNameOut = kv.first;
+        return true;
+    }
+    return false;
+}
+
 static void
 applyAdd(ClientContext *ctx, const HotReloadCommand &cmd,
          const std::vector<HotReloadItem> &items) {
@@ -679,31 +955,38 @@ applyAdd(ClientContext *ctx, const HotReloadCommand &cmd,
     const std::uint16_t nsIdx =
         ctx->resolvedNs.load(std::memory_order_acquire);
 
-    // Pick a target subscription. The hot reload payload doesn't carry a
-    // group, so use the first available group subscription.
-    UA_UInt32 targetSubId = 0;
-    std::string targetGroupName;
-    {
-        // subscriptions is read on multiple threads. The OPC thread mutates
-        // it inside onConnected; we only read here, but the values are POD
-        // so a snapshot is safe enough for routing decisions.
-        for(const auto &kv : ctx->subscriptions) {
-            if(kv.first == ctx->name)
-                continue; // skip the events subscription
-            targetSubId = kv.second.subscriptionId;
-            targetGroupName = kv.first;
+    // C-21: route the datapoint to its own group when the payload tells us
+    // which one that is (parentId == the group's hierarchy id).
+    std::string preferredGroup;
+    for(const auto &it : items) {
+        if(it.parentId.empty()) continue;
+        int parentHierarchyId = 0;
+        try { parentHierarchyId = std::stoi(it.parentId); } catch(...) { continue; }
+        std::lock_guard<std::mutex> lk(ctx->subsMutex);
+        auto git = ctx->groupIdToName.find(parentHierarchyId);
+        if(git != ctx->groupIdToName.end()) {
+            preferredGroup = git->second;
             break;
         }
     }
-    if(targetSubId == 0) {
+
+    UA_UInt32 targetSubId = 0;
+    std::string targetGroupName;
+    if(!pickTargetSubscription(ctx, preferredGroup, targetSubId, targetGroupName)) {
         log("HotReload Add: no group subscription available on " +
                 ctx->endpoint,
             LogLevel::ERRORS);
         return;
     }
+    if(!preferredGroup.empty() && targetGroupName != preferredGroup) {
+        log("HotReload Add: preferred group '" + preferredGroup +
+                "' not active on " + ctx->endpoint + "; using '" +
+                targetGroupName + "'",
+            LogLevel::WARNING);
+    }
 
     // Pre-build everything that does NOT need the UA_Client.
-    // Each (item × mappedTagOption) pair becomes one monitor; if an item has
+    // Each (item x mappedTagOption) pair becomes one monitor; if an item has
     // no mappedTagOptions, we register a single placeholder monitor keyed on
     // dataPointId/id.
     std::vector<MappedInfospaceTag> infoSpaces;
@@ -725,7 +1008,7 @@ applyAdd(ClientContext *ctx, const HotReloadCommand &cmd,
         return buildNodePath(nsIdx, it.nodeId);
     };
 
-    // A valid OPC UA node path must start with "ns=" and contain a ";<i|s>=…"
+    // A valid OPC UA node path must start with "ns=" and contain a ";<i|s>=..."
     // identifier. Anything else (e.g. the hierarchy label "Node 7" returned
     // for OPC_HI_GROUP rows) cannot be monitored.
     auto isValidUaPath = [](const std::string &p) {
@@ -738,7 +1021,7 @@ applyAdd(ClientContext *ctx, const HotReloadCommand &cmd,
 
     for(const auto &it : items) {
         // Hot reload payloads can describe non-leaf hierarchy nodes
-        // (OPC_HI_GROUP / OPC_HI_SERVER) — those aren't monitorable.
+        // (OPC_HI_GROUP / OPC_HI_SERVER) - those aren't monitorable.
         if(!it.typeId.empty() && it.typeId != "OPC_HI_DATAPOINT") {
             log("HotReload Add: skipping non-datapoint item " +
                     std::to_string(it.id) + " (typeId=" + it.typeId + ")",
@@ -750,7 +1033,7 @@ applyAdd(ClientContext *ctx, const HotReloadCommand &cmd,
         if(path.empty() || !isValidUaPath(path)) {
             log("HotReload Add: item " + std::to_string(it.id) +
                     " has no valid OPC UA path (got '" + path +
-                    "') — skipping",
+                    "') - skipping",
                 LogLevel::WARNING);
             continue;
         }
@@ -768,7 +1051,11 @@ applyAdd(ClientContext *ctx, const HotReloadCommand &cmd,
             info.name = it.name;
             info.namespaces = mqttTopic;
             info.samplingInterval = it.sampling;
-            info.deadband = 0;
+            // The hot-reload API ships deadband as a PERCENT, but the monitor
+            // filter is ABSOLUTE; applying it as-is would be wrong. Keep the
+            // previous behaviour (no deadband) until the API exposes an
+            // absolute value.
+            info.deadband = 0.0;
             info.queuesize = it.queueSize > 0 ? it.queueSize : 10000;
             info.orgId = (orgId != 0) ? orgId
                                       : (it.orgId != 0 ? it.orgId : cmd.orgId);
@@ -781,19 +1068,25 @@ applyAdd(ClientContext *ctx, const HotReloadCommand &cmd,
             for(const auto &opt : it.mappedTagOptions) {
                 const int tagId = opt.tagId;
                 if(tagId == 0) continue;
-                Mapping[tagId] = {path, ctx->endpoint};
-                if(!opt.namespaces.empty()) {
-                    TopicMapping[tagId] = opt.namespaces;
-                    newTopics.push_back(opt.namespaces);
+                {
+                    std::lock_guard<std::mutex> mlk(g_mappingMutex);
+                    Mapping[tagId] = {path, ctx->endpoint};
+                    if(!opt.namespaces.empty())
+                        TopicMapping[tagId] = opt.namespaces;
                 }
+                if(!opt.namespaces.empty())
+                    newTopics.push_back(opt.namespaces);
                 infoSpaces.push_back(
                     buildInfo(opt.id, tagId, opt.namespaces, opt.orgId));
                 nodePaths.push_back(path);
             }
         } else {
-            // Fallback: no mappedTagOptions in payload → use dataPointId / id.
+            // Fallback: no mappedTagOptions in payload -> use dataPointId / id.
             const int tagId = (it.dataPointId != 0) ? it.dataPointId : it.id;
-            Mapping[tagId] = {path, ctx->endpoint};
+            {
+                std::lock_guard<std::mutex> mlk(g_mappingMutex);
+                Mapping[tagId] = {path, ctx->endpoint};
+            }
             infoSpaces.push_back(buildInfo(0, tagId, std::string{}, 0));
             nodePaths.push_back(path);
         }
@@ -821,122 +1114,93 @@ applyAdd(ClientContext *ctx, const HotReloadCommand &cmd,
         }
     }
 
+    // C-06: remember these so they are re-created after a reconnect/Reload.
+    // Recorded up front (not on OPC success) so a transient failure now still
+    // gets retried on the next connect.
+    {
+        const int hierarchyId = cmd.firstId();
+        std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+        for(size_t i = 0; i < infoSpaces.size(); ++i) {
+            // Replace any older record for the same tagId (Update = Delete+Add).
+            const int tagId = infoSpaces[i].tagId;
+            ctx->hotAdded.erase(
+                std::remove_if(ctx->hotAdded.begin(), ctx->hotAdded.end(),
+                               [tagId](const HotAddedMonitor &h) {
+                                   return h.infoSpace.tagId == tagId;
+                               }),
+                ctx->hotAdded.end());
+            HotAddedMonitor h;
+            h.hierarchyId = hierarchyId;
+            h.nodePath = nodePaths[i];
+            h.groupName = targetGroupName;
+            h.infoSpace = infoSpaces[i];
+            ctx->hotAdded.push_back(std::move(h));
+        }
+    }
+
     ctx->postOpcTask([ctx, targetSubId, targetGroupName,
                       infoSpaces = std::move(infoSpaces),
                       nodePaths  = std::move(nodePaths),
                       hierarchyId = cmd.firstId()]() mutable {
-        if(!ctx->client || !ctx->isConnected.load(std::memory_order_acquire)) {
-            log("HotReload Add: client not connected for " + ctx->endpoint,
-                LogLevel::ERRORS);
-            return;
-        }
-
-        const size_t count = infoSpaces.size();
-
-        UA_CreateMonitoredItemsRequest batchReq;
-        UA_CreateMonitoredItemsRequest_init(&batchReq);
-        batchReq.subscriptionId     = targetSubId;
-        batchReq.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
-        batchReq.itemsToCreate =
-            (UA_MonitoredItemCreateRequest *)UA_Array_new(
-                count, &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
-        batchReq.itemsToCreateSize = count;
-
-        std::vector<MyMonitorContext *> ctxs(count, nullptr);
-        std::vector<UA_Client_DataChangeNotificationCallback> cbs(
-            count, handler_NodeValueChanged);
-        std::vector<UA_Client_DeleteMonitoredItemCallback> delCbs(count, nullptr);
-
-        for(size_t i = 0; i < count; ++i) {
-            UA_NodeId nodeId = UA_NODEID_NULL;
-            const std::string &p = nodePaths[i];
-            const char *nsStart = strstr(p.c_str(), "ns=");
-            if(nsStart) {
-                const char *nsEnd = strchr(nsStart + 3, ';');
-                if(nsEnd) {
-                    UA_UInt16 nsI = (UA_UInt16)strtoul(nsStart + 3, nullptr, 10);
-                    const char *idStart = nsEnd + 1;
-                    if(strncmp(idStart, "i=", 2) == 0)
-                        nodeId = UA_NODEID_NUMERIC(
-                            nsI, (UA_UInt32)strtoul(idStart + 2, nullptr, 10));
-                    else if(strncmp(idStart, "s=", 2) == 0)
-                        nodeId = UA_NODEID_STRING_ALLOC(nsI, idStart + 2);
-                }
-            }
-
-            UA_MonitoredItemCreateRequest &req = batchReq.itemsToCreate[i];
-            UA_MonitoredItemCreateRequest_init(&req);
-            UA_NodeId_copy(&nodeId, &req.itemToMonitor.nodeId);
-            UA_NodeId_clear(&nodeId);
-            req.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
-            req.monitoringMode = UA_MONITORINGMODE_REPORTING;
-            req.requestedParameters.samplingInterval = 0;
-            req.requestedParameters.queueSize =
-                (UA_UInt32)(infoSpaces[i].queuesize > 0 ? infoSpaces[i].queuesize
-                                                       : 10000);
-            req.requestedParameters.discardOldest = false;
-
-            UA_DataChangeFilter *filter =
-                (UA_DataChangeFilter *)UA_malloc(sizeof(UA_DataChangeFilter));
-            UA_DataChangeFilter_init(filter);
-            if(infoSpaces[i].deadband > 0) {
-                filter->deadbandType = UA_DEADBANDTYPE_ABSOLUTE;
-                filter->deadbandValue = infoSpaces[i].deadband;
-            }
-            filter->trigger = UA_DATACHANGETRIGGER_STATUSVALUE;
-            UA_ExtensionObject &fobj = req.requestedParameters.filter;
-            memset(&fobj, 0, sizeof(fobj));
-            fobj.encoding = UA_EXTENSIONOBJECT_DECODED;
-            fobj.content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER];
-            fobj.content.decoded.data = filter;
-
-            ctxs[i] = new MyMonitorContext{
-                infoSpaces[i], g_mqttHandler, g_sqliteService, nullptr,
-                g_asyncPublisher,
-                [ctx](std::function<void()> task) {
-                    ctx->postTask(std::move(task));
-                }};
-        }
-
-        UA_CreateMonitoredItemsResponse resp =
-            UA_Client_MonitoredItems_createDataChanges(
-                ctx->client.get(), batchReq, (void **)ctxs.data(), cbs.data(),
-                delCbs.data());
-
-        UA_CreateMonitoredItemsRequest_clear(&batchReq);
-
-        size_t ok = 0;
-        {
-            std::lock_guard<std::mutex> regLk(ctx->registryMutex);
-            for(size_t i = 0; i < resp.resultsSize; ++i) {
-                if(resp.results[i].statusCode != UA_STATUSCODE_GOOD) {
-                    log("HotReload Add: monitor failed for tagId " +
-                            std::to_string(infoSpaces[i].tagId) + ": " +
-                            UA_StatusCode_name(resp.results[i].statusCode),
-                        LogLevel::ERRORS);
-                    delete ctxs[i];
-                    ctxs[i] = nullptr;
-                } else {
-                    ++ok;
-                    LiveMonitorEntry entry;
-                    entry.hierarchyId = hierarchyId;
-                    entry.tagId = infoSpaces[i].tagId;
-                    entry.monitoredItemId = resp.results[i].monitoredItemId;
-                    entry.subscriptionId = targetSubId;
-                    entry.groupName = targetGroupName;
-                    entry.endpointUrl = ctx->endpoint;
-                    entry.infoSpace = infoSpaces[i];
-                    ctx->liveRegistry[hierarchyId].push_back(std::move(entry));
-                }
-            }
-        }
-        UA_CreateMonitoredItemsResponse_clear(&resp);
-
-        log("HotReload Add: hierarchy " + std::to_string(hierarchyId) +
-                " on " + ctx->endpoint + ": " + std::to_string(ok) + "/" +
-                std::to_string(count) + " monitors created",
-            LogLevel::INFO);
+        createHotReloadMonitorsOnOpc(ctx, targetSubId, targetGroupName, infoSpaces,
+                                     nodePaths, hierarchyId, "HotReload Add");
     });
+}
+
+// C-06: after onConnected has rebuilt the startup subscriptions, re-create
+// every datapoint that was added via hot reload since startup. Runs on the
+// OPC thread (called from startLoop right after onConnected). The monitors
+// are grouped by their original subscription name; if that group no longer
+// exists, any available group is used.
+static void
+replayHotAddedMonitors(ClientContext *ctx) {
+    if(!ctx) return;
+
+    std::vector<HotAddedMonitor> snapshot;
+    {
+        std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+        snapshot = ctx->hotAdded;
+    }
+    if(snapshot.empty())
+        return;
+
+    log("HotReload Replay: re-creating " + std::to_string(snapshot.size()) +
+            " hot-added monitor(s) on " + ctx->endpoint,
+        LogLevel::INFO);
+
+    // Group by (preferred group, hierarchyId) so each batch lands on one
+    // subscription and one registry key, exactly as the original Add did.
+    std::map<std::pair<std::string, int>, std::vector<size_t>> buckets;
+    for(size_t i = 0; i < snapshot.size(); ++i)
+        buckets[{snapshot[i].groupName, snapshot[i].hierarchyId}].push_back(i);
+
+    for(const auto &bucket : buckets) {
+        UA_UInt32 subId = 0;
+        std::string groupName;
+        if(!pickTargetSubscription(ctx, bucket.first.first, subId, groupName)) {
+            log("HotReload Replay: no group subscription available on " +
+                    ctx->endpoint + " - " + std::to_string(bucket.second.size()) +
+                    " monitor(s) not restored",
+                LogLevel::ERRORS);
+            continue;
+        }
+        std::vector<MappedInfospaceTag> infoSpaces;
+        std::vector<std::string> nodePaths;
+        infoSpaces.reserve(bucket.second.size());
+        nodePaths.reserve(bucket.second.size());
+        for(size_t idx : bucket.second) {
+            infoSpaces.push_back(snapshot[idx].infoSpace);
+            nodePaths.push_back(snapshot[idx].nodePath);
+        }
+        // Queue rather than run inline so it lands after the startup batches
+        // that onConnected has already queued.
+        ctx->postOpcTask([ctx, subId, groupName, infoSpaces = std::move(infoSpaces),
+                          nodePaths = std::move(nodePaths),
+                          hierarchyId = bucket.first.second]() mutable {
+            createHotReloadMonitorsOnOpc(ctx, subId, groupName, infoSpaces, nodePaths,
+                                         hierarchyId, "HotReload Replay");
+        });
+    }
 }
 
 // purpose=OPC_HI_GROUP, action=Add: create a new OPC UA subscription with the
@@ -971,11 +1235,14 @@ applyAddGroup(ClientContext *ctx, const HotReloadCommand &cmd,
                                  : ("group_" + std::to_string(hierarchyId));
 
     // Check if this group already exists.
-    if(ctx->subscriptions.find(groupName) != ctx->subscriptions.end()) {
-        log("HotReload AddGroup: subscription '" + groupName +
-                "' already exists on " + ctx->endpoint + " — skipping",
-            LogLevel::WARNING);
-        return;
+    {
+        std::lock_guard<std::mutex> lk(ctx->subsMutex);
+        if(ctx->subscriptions.find(groupName) != ctx->subscriptions.end()) {
+            log("HotReload AddGroup: subscription '" + groupName +
+                    "' already exists on " + ctx->endpoint + " — skipping",
+                LogLevel::WARNING);
+            return;
+        }
     }
 
     // Extract subscription parameters (mirroring the startup pattern at
@@ -1024,9 +1291,12 @@ applyAddGroup(ClientContext *ctx, const HotReloadCommand &cmd,
             return;
         }
 
-        ctx->subscriptions[groupName] = gsub;
-        if(hierarchyId != 0) {
-            ctx->groupIdToName[hierarchyId] = groupName;
+        {
+            std::lock_guard<std::mutex> lk(ctx->subsMutex);
+            ctx->subscriptions[groupName] = gsub;
+            if(hierarchyId != 0) {
+                ctx->groupIdToName[hierarchyId] = groupName;
+            }
         }
 
         log("HotReload AddGroup: subscription '" + groupName +
@@ -1084,12 +1354,31 @@ applyDeleteSingle(ClientContext *ctx, int deleteId) {
 
     // Clear global Mapping / TopicMapping for these tag ids up front so MQTT
     // control writes targeting these tags fail fast while the OPC delete is
-    // queued.
-    for(const auto &e : snapshot) {
-        Mapping.erase(e.tagId);
-        TopicMapping.erase(e.tagId);
+    // queued. Also forget them for reconnect replay (C-06).
+    {
+        std::lock_guard<std::mutex> mlk(g_mappingMutex);
+        for(const auto &e : snapshot) {
+            Mapping.erase(e.tagId);
+            TopicMapping.erase(e.tagId);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+        for(const auto &e : snapshot) {
+            const int tagId = e.tagId;
+            ctx->hotAdded.erase(
+                std::remove_if(ctx->hotAdded.begin(), ctx->hotAdded.end(),
+                               [tagId](const HotAddedMonitor &h) {
+                                   return h.infoSpace.tagId == tagId;
+                               }),
+                ctx->hotAdded.end());
+        }
     }
 
+    // `snapshot` carries the owning shared_ptr for each MyMonitorContext. It
+    // is released when this task's closure is destroyed - i.e. AFTER the
+    // SDK has dropped the monitored item (deleteSingle is synchronous), so
+    // no callback can still be scheduled with the raw pointer (C-05).
     ctx->postOpcTask([ctx, snapshot = std::move(snapshot), deleteId]() {
         if(!ctx->client) {
             log("HotReload Delete: client null for " + ctx->endpoint,
@@ -1127,7 +1416,9 @@ applyDeleteGroup(ClientContext *ctx, int groupHierarchyId) {
 
     // Resolve the subscription via groupIdToName (populated in onConnected).
     std::string groupName;
+    UA_UInt32 subscriptionId = 0;
     {
+        std::lock_guard<std::mutex> lk(ctx->subsMutex);
         auto it = ctx->groupIdToName.find(groupHierarchyId);
         if(it == ctx->groupIdToName.end()) {
             log("HotReload DeleteGroup: id " +
@@ -1137,16 +1428,16 @@ applyDeleteGroup(ClientContext *ctx, int groupHierarchyId) {
             return;
         }
         groupName = it->second;
-    }
 
-    auto subIt = ctx->subscriptions.find(groupName);
-    if(subIt == ctx->subscriptions.end()) {
-        log("HotReload DeleteGroup: subscription '" + groupName +
-                "' not active on " + ctx->endpoint,
-            LogLevel::WARNING);
-        return;
+        auto subIt = ctx->subscriptions.find(groupName);
+        if(subIt == ctx->subscriptions.end()) {
+            log("HotReload DeleteGroup: subscription '" + groupName +
+                    "' not active on " + ctx->endpoint,
+                LogLevel::WARNING);
+            return;
+        }
+        subscriptionId = subIt->second.subscriptionId;
     }
-    const UA_UInt32 subscriptionId = subIt->second.subscriptionId;
 
     // Snapshot every live entry under this subscription so we can scrub
     // Mapping/TopicMapping eagerly (MQTT writes that arrive after this point
@@ -1172,13 +1463,32 @@ applyDeleteGroup(ClientContext *ctx, int groupHierarchyId) {
                 ++rit;
         }
     }
-    for(const auto &e : doomed) {
-        Mapping.erase(e.tagId);
-        TopicMapping.erase(e.tagId);
+    {
+        std::lock_guard<std::mutex> mlk(g_mappingMutex);
+        for(const auto &e : doomed) {
+            Mapping.erase(e.tagId);
+            TopicMapping.erase(e.tagId);
+        }
+    }
+    {
+        // Hot-added datapoints that lived on this group must not be replayed
+        // after a reconnect either (C-06).
+        std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+        for(const auto &e : doomed) {
+            const int tagId = e.tagId;
+            ctx->hotAdded.erase(
+                std::remove_if(ctx->hotAdded.begin(), ctx->hotAdded.end(),
+                               [tagId](const HotAddedMonitor &h) {
+                                   return h.infoSpace.tagId == tagId;
+                               }),
+                ctx->hotAdded.end());
+        }
     }
 
+    // `doomed` owns the MyMonitorContexts; it is released with this closure,
+    // after the subscription (and its items) are gone (C-05).
     ctx->postOpcTask([ctx, subscriptionId, groupName,
-                      groupHierarchyId, removed = doomed.size()]() {
+                      groupHierarchyId, doomed = std::move(doomed)]() {
         if(!ctx->client) {
             log("HotReload DeleteGroup: client null for " + ctx->endpoint,
                 LogLevel::ERRORS);
@@ -1196,8 +1506,12 @@ applyDeleteGroup(ClientContext *ctx, int groupHierarchyId) {
         }
         // Drop client-side bookkeeping regardless of UA status — the
         // subscription is gone (or unreachable) either way.
-        ctx->subscriptions.erase(groupName);
-        ctx->groupIdToName.erase(groupHierarchyId);
+        {
+            std::lock_guard<std::mutex> lk(ctx->subsMutex);
+            ctx->subscriptions.erase(groupName);
+            ctx->groupIdToName.erase(groupHierarchyId);
+        }
+        const size_t removed = doomed.size();
 
         log("HotReload DeleteGroup: '" + groupName + "' (id=" +
                 std::to_string(groupHierarchyId) + ") on " + ctx->endpoint +
@@ -1244,32 +1558,26 @@ applyReload(ClientContext *ctx, const HotReloadCommand &cmd,
             UA_Client_disconnect(ctx->client.get());
         }
 
-        // 2. Wipe all derived state that onConnected will rebuild.
-        ctx->subscriptions.clear();
-        ctx->groupIdToName.clear();
-        ctx->resolvedNs.store(0, std::memory_order_release);
-
-        // 3. Drain liveRegistry and scrub the corresponding entries from
-        //    global Mapping / TopicMapping so MQTT control writes referencing
-        //    the reconnect repopulates them. (Removed because onConnected uses cached startup data)
-        std::vector<int> ownedTagIds;
+        // 2. Wipe all derived state that onConnected will rebuild
+        //    (subscriptions, group ids, namespace, live monitors + their
+        //    contexts). Mapping/TopicMapping and hotAdded are deliberately
+        //    kept: onConnected and replayHotAddedMonitors need them.
+        size_t released = 0;
         {
             std::lock_guard<std::mutex> regLk(ctx->registryMutex);
-            for(const auto &kv : ctx->liveRegistry) {
-                for(const auto &e : kv.second)
-                    ownedTagIds.push_back(e.tagId);
-            }
-            ctx->liveRegistry.clear();
+            for(const auto &kv : ctx->liveRegistry)
+                released += kv.second.size();
         }
+        ctx->resetSessionState();
 
-        // 4. LAST step: signal the OPC loop to reconnect on its next
+        // 3. LAST step: signal the OPC loop to reconnect on its next
         //    iteration. Order matters: any earlier flip would let the loop
         //    reconnect before the cleanup above completes.
         ctx->isConnected.store(false, std::memory_order_release);
 
         log("HotReload Reload: " + ctx->endpoint +
-                " teardown complete; reconnect pending (cleared " +
-                std::to_string(ownedTagIds.size()) + " tag mappings)",
+                " teardown complete; reconnect pending (released " +
+                std::to_string(released) + " live monitors)",
             LogLevel::INFO);
     });
 }
@@ -1316,33 +1624,37 @@ applyGroupUpdate(ClientContext *ctx, const HotReloadCommand &cmd,
     // is essential when the startup hierarchy API doesn't expose a top-level
     // `id` for groups but the hot reload API does.
     std::string groupName;
-    auto nameIt = ctx->groupIdToName.find(targetId);
-    if(nameIt != ctx->groupIdToName.end()) {
-        groupName = nameIt->second;
-    } else if(!match->name.empty() &&
-              ctx->subscriptions.find(match->name) != ctx->subscriptions.end()) {
-        groupName = match->name;
-        log("HotReload GroupUpdate: id " + std::to_string(targetId) +
-                " not in groupIdToName; resolved by name '" + match->name +
-                "' on " + ctx->endpoint,
-            LogLevel::DEBUG);
-        ctx->groupIdToName[targetId] = match->name;
-    } else {
-        log("HotReload GroupUpdate: no group with id " +
-                std::to_string(targetId) + " or name '" + match->name +
-                "' known on " + ctx->endpoint,
-            LogLevel::DEBUG);
-        return;
-    }
+    UA_CreateSubscriptionResponse current;
+    {
+        std::lock_guard<std::mutex> lk(ctx->subsMutex);
+        auto nameIt = ctx->groupIdToName.find(targetId);
+        if(nameIt != ctx->groupIdToName.end()) {
+            groupName = nameIt->second;
+        } else if(!match->name.empty() &&
+                  ctx->subscriptions.find(match->name) != ctx->subscriptions.end()) {
+            groupName = match->name;
+            log("HotReload GroupUpdate: id " + std::to_string(targetId) +
+                    " not in groupIdToName; resolved by name '" + match->name +
+                    "' on " + ctx->endpoint,
+                LogLevel::DEBUG);
+            ctx->groupIdToName[targetId] = match->name;
+        } else {
+            log("HotReload GroupUpdate: no group with id " +
+                    std::to_string(targetId) + " or name '" + match->name +
+                    "' known on " + ctx->endpoint,
+                LogLevel::DEBUG);
+            return;
+        }
 
-    auto subIt = ctx->subscriptions.find(groupName);
-    if(subIt == ctx->subscriptions.end()) {
-        log("HotReload GroupUpdate: subscription '" + groupName +
-                "' not active on " + ctx->endpoint,
-            LogLevel::WARNING);
-        return;
+        auto subIt = ctx->subscriptions.find(groupName);
+        if(subIt == ctx->subscriptions.end()) {
+            log("HotReload GroupUpdate: subscription '" + groupName +
+                    "' not active on " + ctx->endpoint,
+                LogLevel::WARNING);
+            return;
+        }
+        current = subIt->second;
     }
-    const UA_CreateSubscriptionResponse current = subIt->second;
 
     // Build the Modify request. Where the API didn't ship a value, keep the
     // current revised value so we don't downgrade settings the server has
@@ -1403,14 +1715,17 @@ applyGroupUpdate(ClientContext *ctx, const HotReloadCommand &cmd,
         } else {
             // Update our cached revised values so future modifies see the
             // freshest server-acknowledged numbers.
-            auto sIt = ctx->subscriptions.find(groupName);
-            if(sIt != ctx->subscriptions.end()) {
-                sIt->second.revisedPublishingInterval =
-                    mresp.revisedPublishingInterval;
-                sIt->second.revisedMaxKeepAliveCount =
-                    mresp.revisedMaxKeepAliveCount;
-                sIt->second.revisedLifetimeCount =
-                    mresp.revisedLifetimeCount;
+            {
+                std::lock_guard<std::mutex> lk(ctx->subsMutex);
+                auto sIt = ctx->subscriptions.find(groupName);
+                if(sIt != ctx->subscriptions.end()) {
+                    sIt->second.revisedPublishingInterval =
+                        mresp.revisedPublishingInterval;
+                    sIt->second.revisedMaxKeepAliveCount =
+                        mresp.revisedMaxKeepAliveCount;
+                    sIt->second.revisedLifetimeCount =
+                        mresp.revisedLifetimeCount;
+                }
             }
             log("HotReload GroupUpdate: '" + groupName +
                     "' modified | revisedInterval=" +
@@ -1678,16 +1993,22 @@ applyDeleteServer(
 
     // Scrub global Mapping/TopicMapping for every tag this server owns
     // BEFORE stopping its threads — once we set running=false, no thread
-    // will be able to clean up after itself.
+    // will be able to clean up after itself. The registry itself (and the
+    // monitor contexts it owns) is released below, after the OPC thread has
+    // been joined and the client disconnected (C-05).
     {
         std::lock_guard<std::mutex> regLk(owned->registryMutex);
+        std::lock_guard<std::mutex> mlk(g_mappingMutex);
         for(const auto &kv : owned->liveRegistry) {
             for(const auto &e : kv.second) {
                 Mapping.erase(e.tagId);
                 TopicMapping.erase(e.tagId);
             }
         }
-        owned->liveRegistry.clear();
+        for(const auto &h : owned->hotAdded) {
+            Mapping.erase(h.infoSpace.tagId);
+            TopicMapping.erase(h.infoSpace.tagId);
+        }
     }
 
     // Drop the routing entry so future hot reload commands don't dispatch
@@ -1715,6 +2036,9 @@ applyDeleteServer(
     if(owned->client) {
         UA_Client_disconnect(owned->client.get());
     }
+    // Threads are joined and the client is disconnected: no callback can run
+    // any more, so releasing the monitor contexts is safe now.
+    owned->resetSessionState();
 
     log("HotReload DeleteServer: '" + endpoint + "' removed from pool",
         LogLevel::INFO);
@@ -1739,7 +2063,9 @@ contextOwnsDatapointDeleteId(ClientContext *ctx, int id) {
 
 static bool
 contextOwnsGroupDeleteId(ClientContext *ctx, int id) {
-    return ctx && ctx->groupIdToName.find(id) != ctx->groupIdToName.end();
+    if(!ctx) return false;
+    std::lock_guard<std::mutex> lk(ctx->subsMutex);
+    return ctx->groupIdToName.find(id) != ctx->groupIdToName.end();
 }
 
 // Locate every connected ClientContext that handles a given purpose.
@@ -1810,10 +2136,15 @@ resolveHotReloadTargets(
 
         if(cmd.purpose == "OPC_HI_DATAPOINT") {
             for(int delId : cmd.ids) {
-                auto mit = Mapping.find(delId);
-                if(mit == Mapping.end())
-                    continue;
-                auto cit = clientPool.find(mit->second.second);
+                std::string mappedEndpoint;
+                {
+                    std::lock_guard<std::mutex> mlk(g_mappingMutex);
+                    auto mit = Mapping.find(delId);
+                    if(mit == Mapping.end())
+                        continue;
+                    mappedEndpoint = mit->second.second;
+                }
+                auto cit = clientPool.find(mappedEndpoint);
                 if(cit == clientPool.end() || !cit->second ||
                    !cit->second->isConnected.load(std::memory_order_acquire))
                     continue;
@@ -1873,8 +2204,8 @@ runClient(bool isService, int argc, char *argv[]) {
     // Extract values
 
 
-        // Extract AppSettings
-        std::string applicationEndURL = config["AppSettings"]["ApplicationEndURL"].get<std::string>();
+        // Extract AppSettings. (ApplicationEndURL is Host:Port and is not read
+        // separately - Host/Port are the source of truth for every URL we build.)
         std::string applicationEndURLHost = config["AppSettings"]["ApplicationEndURLHost"].get<std::string>();
         int applicationEndURLPort = config["AppSettings"]["ApplicationEndURLPort"].get<int>();
 
@@ -1944,28 +2275,17 @@ runClient(bool isService, int argc, char *argv[]) {
 #endif
 
 
-    // Ask user if they want to start (only in console/GUI mode)
-    #ifdef _WIN32
-    int result = IDYES;
-    if(!isService) {
-        result = MessageBoxA(NULL, "Do you want to start the client?", "Confirmation",
-                             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-    }
-    if(result == IDYES && !isService) {
-        MessageBoxA(NULL, "Client Started", "Info", MB_OK);
-    }
-    if(result == IDNO) {
-        return 0;  // Exit if user chooses No
-    }
-#endif
+    // C-27: the "Do you want to start?" / "Client Started" modal prompts were
+    // removed. They blocked any non-interactive launch (installer post-install
+    // run, scheduled task, RDP session without a desktop) and the "Started"
+    // box appeared before anything had actually started.
 
-    // Global logging control - only enable file logging with --debug
-    g_logging_enabled = false; // Default: no file logging
-
+    // Logging: file logging is always on (C-28) so field logs exist for
+    // support; --debug additionally echoes to the console.
     g_debug = cliOptions.debug;
-    g_logging_enabled = cliOptions.debug; // Enable file logging in debug mode
+    g_logging_enabled = true;
 
-    // Initialize logging with client-specific folder (only if logging is enabled)
+    // Initialize logging with client-specific folder
     std::string logFolder = "logs/client";
     std::string logAppName = "client";
     if(!cliOptions.instanceId.empty()) {
@@ -1973,10 +2293,12 @@ runClient(bool isService, int argc, char *argv[]) {
         logAppName = "client_" + cliOptions.instanceId;
     }
     init_logging(logFolder, logAppName, true);
-    if (g_logging_enabled) {
-        log("Client logging initialized with day-wise log files", LogLevel::INFO);
-    } else {
-        std::cout << "Client started - no file logging (use --debug to enable)" << std::endl;
+    log("Client logging initialized with day-wise log files", LogLevel::INFO);
+    if(!isService && !g_debug) {
+        // Everything from here on is written to the log file; without this
+        // line the console looks "stuck" after the bearer-token message.
+        std::cout << "Client starting. Progress is logged to " << logFolder
+                  << "/<date>.log (run with --debug to echo it here)." << std::endl;
     }
     if(!cliOptions.instanceId.empty()) {
         log("Instance mode enabled: " + cliOptions.instanceId, LogLevel::INFO);
@@ -2021,104 +2343,144 @@ runClient(bool isService, int argc, char *argv[]) {
     // Initialize SqliteQueueService EARLY so we can use config cache during hierarchy fetch
     try {
         OfflineQueueOptions options;
-        options.batchSize = 100;
+        // C-19: these come from appsettings.json (Payload.OfflineQueueOptions).
+        options.batchSize = (retryBatchSize > 0) ? retryBatchSize : 100;
         options.uploadIntervalSeconds = 15;
+        options.retentionDays = (retentionDays > 0) ? retentionDays : 0;
         g_sqliteService = new SqliteQueueService(dbPath, options);
         log("SqliteQueueService initialized (early - for config cache).", LogLevel::INFO);
     } catch (const std::exception& e) {
         log("WARNING: Failed to initialize SqliteQueueService early: " + std::string(e.what()) + ". DB fallback will be unavailable.", LogLevel::WARNING);
     }
         
-    // Retry ParseServerHierarchy with constant 10-second intervals (infinite retries)
+    // Retry ParseServerHierarchy with constant 10-second intervals until it
+    // succeeds or we are asked to stop (C-15: previously ignored g_running,
+    // so a service stop during startup could never complete).
     const int retryDelay = 10; // seconds
     bool hierarchySuccess = false;
     int attempt = 1;
-    
-    while (!hierarchySuccess) {
-        try {
-            log("Attempt " + std::to_string(attempt) + " - Fetching server hierarchy...", LogLevel::INFO);
 
-            // 1. Try local database cache first
-            std::string cacheKey = "OPCUA_HIERARCHY_" + NodeID;
-            bool cacheHit = false;
+    while (!hierarchySuccess && g_running) {
+        log("Attempt " + std::to_string(attempt) + " - Fetching server hierarchy...", LogLevel::INFO);
 
-            if (!cacheHit && g_sqliteService) {
-                log("Checking local database for key: " + cacheKey, LogLevel::INFO);
-                try {
-                    std::string dbData = g_sqliteService->GetConfig(cacheKey);
-                    if (!dbData.empty()) {
-                        log("DB Hit! Loading hierarchy for " + NodeID + " from local database.", LogLevel::INFO);
-                        json dbJson = json::parse(dbData);
-                        serverList = ParseServerHierarchyFromJson(dbJson);
-                        if (!serverList.empty()) {
-                            hierarchySuccess = true;
-                            cacheHit = true;
-                            log("Hierarchy loaded from local database successfully.", LogLevel::INFO);
-                        } else {
-                            log("Database data invalid or empty. Falling back to API.", LogLevel::WARNING);
-                        }
-                    } else {
-                        log("DB Miss for " + cacheKey + ". Falling back to API...", LogLevel::INFO);
-                    }
-                } catch (const std::exception& e) {
-                    log("Error reading from database: " + std::string(e.what()) + ". Falling back to API.", LogLevel::ERRORS);
-                }
-            }
+        const std::string cacheKey = "OPCUA_HIERARCHY_" + NodeID;
 
-            // 2. Fallback to API if DB miss
-            if (!cacheHit) {
+        // C-07: API FIRST, local cache only as a fallback.
+        //
+        // The previous order (cache first, API only on a miss) meant that once a
+        // hierarchy had been cached, a restart never picked up backend changes.
+        // Now the live API is authoritative whenever it can be reached:
+        //   - API reachable, non-empty  -> use it, refresh the cache
+        //   - API reachable, empty      -> treat as authoritative "nothing to
+        //                                  run", do NOT load a stale cache, retry
+        //   - API unreachable / throws  -> load the last cached copy (offline)
+        bool apiReachable = false;
+
+        if(BearerToken.empty()) {
+            log("No bearer token (offline) - skipping hierarchy API call, using local cache.",
+                LogLevel::WARNING);
+        } else {
+            try {
                 std::string target = "/api/GetOpcUaHierarchy";
-                // JSON body
                 json jBody;
                 jBody["orgId"] = 0;
                 jBody["roleId"] = "";
                 jBody["userId"] = 0;
                 jBody["moduleId"] = 0;
                 jBody["userType"] = "";
-                jBody["requestDateTime"] = "2024-12-26T08:16:05.629Z"; // Keep hardcoded for now or use dynamic
+                jBody["requestDateTime"] = currentUtcIso8601(); // C-32
                 jBody["ipAddress"] = "";
                 jBody["originName"] = "";
                 jBody["filterModel"]["customValue"] = NodeID;
-
                 std::string json_body = jBody.dump();
-                
-                // Call getResponse directly to get the raw JSON for caching
-                auto futureResponse = std::async(std::launch::async, getResponse, 
-                                                applicationEndURLHost, std::to_string(applicationEndURLPort), 
-                                                BearerToken, json_body, target);
-                
-                json apiResponse = futureResponse.get();
 
-                // Cache the fresh response to local database
-                if (!apiResponse.is_null() && g_sqliteService) {
-                     try {
-                         g_sqliteService->SetConfig(cacheKey, apiResponse.dump());
-                         log("Cached fresh hierarchy to local database key: " + cacheKey, LogLevel::INFO);
-                     } catch (const std::exception& e) {
-                         log("Failed to cache to database: " + std::string(e.what()), LogLevel::WARNING);
-                     }
-                }
+                json apiResponse = getResponse(applicationEndURLHost,
+                                               std::to_string(applicationEndURLPort),
+                                               BearerToken, json_body, target);
+                apiReachable = true;
 
-                // Parse
                 serverList = ParseServerHierarchyFromJson(apiResponse);
-                
-                if (!serverList.empty()) {
+                if(!serverList.empty()) {
                     hierarchySuccess = true;
-                    log("Server hierarchy fetched from API successfully! Found " + std::to_string(serverList.size()) + " servers.", LogLevel::INFO);
+                    log("Server hierarchy fetched from API successfully! Found " +
+                            std::to_string(serverList.size()) + " servers.",
+                        LogLevel::INFO);
+                    if(g_sqliteService) {
+                        try {
+                            g_sqliteService->SetConfig(cacheKey, apiResponse.dump());
+                            log("Cached fresh hierarchy to local database key: " + cacheKey,
+                                LogLevel::INFO);
+                        } catch(const std::exception &e) {
+                            log("Failed to cache to database: " + std::string(e.what()),
+                                LogLevel::WARNING);
+                        }
+                    }
                 } else {
-                    log("Empty server hierarchy response - retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::ERRORS);
+                    log("API returned an empty server hierarchy for " + NodeID +
+                            " (authoritative - not using cache). Retrying in " +
+                            std::to_string(retryDelay) + " seconds...",
+                        LogLevel::ERRORS);
                 }
+            } catch(const std::exception &e) {
+                log("Hierarchy API call failed: " + std::string(e.what()) +
+                        " - falling back to local cache.",
+                    LogLevel::ERRORS);
             }
-
-        } catch (const std::exception& e) {
-            log("Hierarchy fetch failed: " + std::string(e.what()), LogLevel::ERRORS);
         }
-        
+
+        if(!hierarchySuccess && !apiReachable && g_sqliteService) {
+            log("Checking local database for key: " + cacheKey, LogLevel::INFO);
+            try {
+                std::string dbData = g_sqliteService->GetConfig(cacheKey);
+                if(!dbData.empty()) {
+                    json dbJson = json::parse(dbData);
+                    serverList = ParseServerHierarchyFromJson(dbJson);
+                    if(!serverList.empty()) {
+                        hierarchySuccess = true;
+                        log("Hierarchy loaded from local database (API unavailable). Found " +
+                                std::to_string(serverList.size()) + " servers.",
+                            LogLevel::WARNING);
+                    } else {
+                        log("Database hierarchy is invalid or empty.", LogLevel::WARNING);
+                    }
+                } else {
+                    log("DB Miss for " + cacheKey + ".", LogLevel::INFO);
+                }
+            } catch(const std::exception &e) {
+                log("Error reading hierarchy from database: " + std::string(e.what()),
+                    LogLevel::ERRORS);
+            }
+        }
+
         if (!hierarchySuccess) {
             log("Retrying in " + std::to_string(retryDelay) + " seconds...", LogLevel::INFO);
-            std::this_thread::sleep_for(std::chrono::seconds(retryDelay));
+            // Sleep in 1 s slices so a stop request is honoured promptly.
+            for(int i = 0; i < retryDelay && g_running; ++i)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
             attempt++;
         }
+    }
+
+    if(!hierarchySuccess) {
+        log("Startup aborted before the server hierarchy could be loaded (stop requested).",
+            LogLevel::ERRORS);
+        if(g_sqliteService) {
+            g_sqliteService->DisposeDB();
+            delete g_sqliteService;
+            g_sqliteService = nullptr;
+        }
+#ifdef _WIN32
+        if(hMutex) {
+            ReleaseMutex(hMutex);
+            CloseHandle(hMutex);
+        }
+#else
+        if(lockFd >= 0) {
+            flock(lockFd, LOCK_UN);
+            close(lockFd);
+        }
+#endif
+        return EXIT_FAILURE;
     }
 
     // Build datapointId -> orgId map from your server/device config (declare outside try block)
@@ -2162,9 +2524,11 @@ runClient(bool isService, int argc, char *argv[]) {
         g_sqliteService->StartQueueWorker(); // Start the DB writer thread
         log("SqliteQueueService queue worker started.", LogLevel::INFO);
 
-        // After: g_sqliteService = new SqliteQueueService("OfflineData.db", options);
-        g_sqliteService->SetApiUrl("http://164.52.221.177:5128/api/UploadBulkTagData");   // required
-        g_sqliteService->SetApiAuth(BearerToken); // Reuse existing token (empty when offline, refreshed via callback when online)  
+        // C-11: bulk upload goes to the configured API host, not a hardcoded IP.
+        g_sqliteService->SetApiUrl("http://" + applicationEndURLHost + ":" +
+                                   std::to_string(applicationEndURLPort) +
+                                   "/api/UploadBulkTagData");
+        g_sqliteService->SetApiAuth(BearerToken); // Reuse existing token (empty when offline, refreshed via callback when online)
 
         // Set callback for token refresh on 401
         g_sqliteService->SetTokenRefreshCallback([=]() -> std::string {
@@ -2194,6 +2558,11 @@ runClient(bool isService, int argc, char *argv[]) {
         log("FATAL: Failed to initialize SqliteQueueService: " + std::string(e.what()), LogLevel::ERRORS);
         return EXIT_FAILURE;
     }
+
+    // Client pool. Declared before the MQTT handler so the message callback
+    // (registered right after connect, C-29) can capture it by reference.
+    std::vector<std::unique_ptr<ClientContext>> clientContexts;
+    std::unordered_map<std::string, ClientContext *> clientPool;
 
     // Initialize global MQTT handler OUTSIDE the try block to ensure proper scope
     log("Creating MQTT handler...", LogLevel::INFO);
@@ -2309,16 +2678,21 @@ runClient(bool isService, int argc, char *argv[]) {
 
         // Register token refresh callback: called before every MQTT reconnect attempt.
         // Re-fetches the bearer token so an expired JWT never causes permanent not_authorized.
+        // C-25: capture the EdgeConfig credentials by value. The callback runs
+        // on the MQTT thread; it must not mutate `edgeCfg` (which other code
+        // reads without synchronization). MQTTHandler stores the returned
+        // password itself, so SetEdgeConfigMqttPassword is not needed here.
         g_mqttHandler->setPasswordRefreshCallback(
-            [applicationEndURLHost, applicationEndURLPort, &edgeCfg,
+            [applicationEndURLHost, applicationEndURLPort,
+             edgeUser = edgeCfg.username, edgePass = edgeCfg.password,
              &BearerToken]() -> std::string {
                 try {
                     log("MQTT token refresh: fetching new bearer token ...", LogLevel::INFO);
                     std::string freshToken = getBearerTokenNow(
                         applicationEndURLHost,
                         std::to_string(applicationEndURLPort),
-                        edgeCfg.username,
-                        edgeCfg.password,
+                        edgeUser,
+                        edgePass,
                         true).get();
                     if(freshToken.empty()) {
                         log("MQTT token refresh: empty token returned.", LogLevel::WARNING);
@@ -2328,7 +2702,6 @@ runClient(bool isService, int argc, char *argv[]) {
                         std::lock_guard<std::mutex> lk(g_bearerTokenMutex);
                         BearerToken = freshToken;
                     }
-                    SetEdgeConfigMqttPassword(edgeCfg, freshToken);
                     if(g_sqliteService)
                         g_sqliteService->SetApiAuth(freshToken);
                     // Wrap in JSON exactly as the broker expects
@@ -2369,752 +2742,11 @@ runClient(bool isService, int argc, char *argv[]) {
     // Give MQTT a moment to start connecting
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-#ifdef UA_ENABLE_SUBSCRIPTIONS
-    signal(SIGINT, stopHandler);
-    signal(SIGTERM, stopHandler);
-#endif
-
-    std::vector<std::unique_ptr<ClientContext>> clientContexts;
-    std::unordered_map<std::string, ClientContext *> clientPool;
-
-
-
-    std::vector<std::string> topicsToSubscribe;
-    //log("Collecting topics to subscribe...", LogLevel::INFO);
-
-    // Hot reload trigger channel — subscribed alongside per-tag control topics
-    // so the broker delivers Add/Delete/Update/Reload commands on the same
-    // session.
-    topicsToSubscribe.push_back("HTRLD/Edgents");
-
-    for(const auto &server : serverList) {
-        //log(server.name + " ", LogLevel::DEBUG);
-        //cout << (endl);
-
-        // Print tags if they exist
-        for(const auto &group : server.groups) {
-            for(const auto &tag : group.tags) {
-                //if(tag.name) {
-                //    //log(*tag.name + " ", LogLevel::DEBUG);
-                //}
-                //cout << endl;
-
-                if(tag.rdWtOpt == "RD_WRT_RO") {
-                    //log("ReadOnly");
-                } else if(tag.rdWtOpt == "RD_WRT_RW") {
-                    if(tag.mappedInfospaceTags) {
-                        for(const auto &infoSpace : *tag.mappedInfospaceTags) {
-                            //log(infoSpace.namespaces);
-                            topicsToSubscribe.push_back(infoSpace.namespaces);
-                            // cout << infoSpace.namespaces << " subscribed; ";
-                            //cout << endl;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    //cout << endl;
-
-    if (!topicsToSubscribe.empty()) {
-        log("Waiting for MQTT connection before subscribing...", LogLevel::INFO);
-        // Wait up to 10 seconds for connection
-        int retries = 0;
-        while (!g_mqttHandler->isConnected() && retries < 100) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            retries++;
-        }
-
-        if (g_mqttHandler->isConnected()) {
-            size_t total = topicsToSubscribe.size();
-            size_t batchSize = 500;
-            log("Starting batch subscription for " + std::to_string(total) + " topics...", LogLevel::INFO);
-            
-            for (size_t i = 0; i < total; i += batchSize) {
-                size_t end = std::min(i + batchSize, total);
-                std::vector<std::string> batch(topicsToSubscribe.begin() + i, topicsToSubscribe.begin() + end);
-                
-                log("Subscribing to batch " + std::to_string(i/batchSize + 1) + 
-                    " (" + std::to_string(batch.size()) + " topics)...", LogLevel::INFO);
-                
-                g_mqttHandler->subscribeBatch(batch);
-                
-                // Small delay between batches to avoid overwhelming the broker
-                std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
-            }
-            log("All batch subscriptions initiated.", LogLevel::INFO);
-        } else {
-            log("Failed to connect to MQTT broker after waiting. Subscriptions skipped.", LogLevel::ERRORS);
-        }
-    } else {
-        log("No topics found to subscribe.", LogLevel::INFO);
-    }
-
-    // *** FIX START ***
-    // Add this block BEFORE the main "for" loop
-    std::call_once(security_policies_loaded, []() {
-        log("Performing one-time global security policy initialization...", LogLevel::INFO);
-        // Create a temporary client just to trigger the OpenSSL policy loading
-        UA_Client *tempClient = UA_Client_new();
-        UA_ClientConfig_setDefault(UA_Client_getConfig(tempClient));
-        // Deleting the client is enough to ensure policies are loaded and ready
-        UA_Client_delete(tempClient);
-        log("Global security policies initialized.", LogLevel::INFO);
-    });
-    // *** FIX END ***
-
-    
-
-    // Per-server setup wrapped as a callable so the hot reload worker can
-    // spawn brand-new ClientContexts at runtime (purpose=OPC_HI_SERVER, action=Add)
-    // using the exact same pipeline as startup. Returns a fully-started
-    // ClientContext on success, or nullptr if any blocking error (cert load
-    // failure, profile lookup error, etc.) prevents bringing the server up.
-    auto buildAndStartContext =
-        [&](const ServerInfoO &server) -> std::unique_ptr<ClientContext> {
-        auto server_copy = server;
-        auto context = std::make_unique<ClientContext>();
-        context->name = server.name;
-        context->endpoint = server.endpointUrl;
-        context->typeId = server.typeId;
-        context->serverHierarchyId = server.dataPointId;
-        
-        
-    
-        // The rest of your loop (connectOnce, onConnected lambdas) remains the same as the previous fix
-        context->connectOnce = [ctx=context.get(), server = server_copy]() -> UA_StatusCode {
-
-            // Create a new client and get its fresh config
-        ctx->client.reset(UA_Client_new());
-        UA_ClientConfig *config = UA_Client_getConfig(ctx->client.get());
-        UA_ClientConfig_setDefault(config); // Start with a default config for EVERY client
-        config->logging = &myLogger; // Apply your custom logger
-
-        UA_String_clear(&config->clientDescription.applicationUri);
-        config->clientDescription.applicationUri =
-            UA_STRING_ALLOC("urn:Anexee.client.application");
-
-        // With many subscriptions, default 10 outstanding PublishRequests can starve
-        // keep-alives and trigger widespread "Inactivity for Subscription" events.
-        const size_t expectedSubCount = server.groups.size() + 1; // + event subscription
-        config->outStandingPublishRequests =
-            static_cast<UA_UInt16>(std::clamp<size_t>(expectedSubCount, 20, 256));
-        if(config->timeout < 30000)
-            config->timeout = 30000; // widen inactivity threshold under heavy load
-            
-        config->subscriptionInactivityCallback = [](UA_Client *, UA_UInt32, void *subCtx) {
-            auto c = static_cast<ClientContext*>(subCtx);
-            if(c) {
-                log(c->name + ": Subscription inactivity detected! Forcing reconnect.", LogLevel::ERRORS);
-                c->isConnected.store(false, std::memory_order_release);
-            }
-        };
-    
-        // --- Start of Corrected Security Logic ---
-    
-        if(server.msgSecurityMode != "NONE" && !server.msgSecurityMode.empty()) {
-
-                        // ADD MUTEX LOCK HERE
-                        std::lock_guard<std::mutex> lock(cert_loading_mutex);
-
-            // This server requires security. Load certificates and apply them.
-            UA_ByteString client_cert = loadFile("client/own/certs/client_cert.der");
-            UA_ByteString client_key = loadFile("client/own/certs/client_key.der");
-
-            // ── Auto-generate if cert or key is missing ──────────────────────
-            if(client_cert.length == 0 || client_key.length == 0) {
-                log("No client certificate/key found — generating a new self-signed certificate...",
-                    LogLevel::WARNING);
-                UA_ByteString_clear(&client_cert);
-                UA_ByteString_clear(&client_key);
-
-                UA_String certSubject[3] = {
-                    UA_STRING_STATIC("C=IN"),
-                    UA_STRING_STATIC("O=Anexee"),
-                    UA_STRING_STATIC("CN=AnexeeClient")
-                };
-
-                // Build SAN entries. For a client cert the server typically
-                // only checks the ApplicationURI, but we include the machine
-                // hostname + loopback for completeness and to match the
-                // server's pattern.
-                std::string localHostname = "localhost";
-#ifdef _WIN32
-                {
-                    char hostnameBuf[256];
-                    DWORD hostnameLen = sizeof(hostnameBuf);
-                    if(GetComputerNameA(hostnameBuf, &hostnameLen))
-                        localHostname = std::string(hostnameBuf);
-                }
-#else
-                {
-                    char hostnameBuf[256];
-                    if(gethostname(hostnameBuf, sizeof(hostnameBuf)) == 0)
-                        localHostname = std::string(hostnameBuf);
-                }
-#endif
-                std::string sanHostnameEntry = "DNS:" + localHostname;
-
-                // Optionally include the target OPC UA server's host in the
-                // SAN so the cert is also valid if the server validates the
-                // client address (rare, but defensive).
-                std::string serverHost = ExtractHostFromUrl(server.endpointUrl);
-                std::string sanServerHostEntry;
-                if(!serverHost.empty() && serverHost != localHostname && serverHost != "localhost") {
-                    sanServerHostEntry = (LooksLikeIpv4Address(serverHost) ? "IP:" : "DNS:") + serverHost;
-                    log("Including target server address in client cert SAN: " + sanServerHostEntry, LogLevel::INFO);
-                }
-
-                std::vector<UA_String> certSubjectAltName = {
-                    UA_STRING_STATIC("DNS:localhost"),
-                    UA_STRING_ALLOC(sanHostnameEntry.c_str()),
-                    UA_STRING_STATIC("IP:127.0.0.1"),
-                    UA_STRING_STATIC("URI:urn:Anexee.client.application")
-                };
-                if(!sanServerHostEntry.empty())
-                    certSubjectAltName.push_back(UA_STRING_ALLOC(sanServerHostEntry.c_str()));
-
-                UA_KeyValueMap *certParams = UA_KeyValueMap_new();
-                UA_UInt16 certExpiresInDays = 3650;
-                UA_KeyValueMap_setScalar(certParams, UA_QUALIFIEDNAME(0, (char*)"expires-in-days"),
-                                         (void*)&certExpiresInDays, &UA_TYPES[UA_TYPES_UINT16]);
-
-                UA_StatusCode certGenStatus = UA_CreateCertificate(
-                    UA_Log_Stdout, certSubject, 3,
-                    certSubjectAltName.data(), certSubjectAltName.size(),
-                    UA_CERTIFICATEFORMAT_DER, certParams, &client_key, &client_cert);
-                UA_KeyValueMap_delete(certParams);
-
-                // Clean up UA_STRING_ALLOC'd SAN entries
-                UA_String_clear(&certSubjectAltName[1]); // hostname
-                if(!sanServerHostEntry.empty())
-                    UA_String_clear(&certSubjectAltName[4]); // server host
-
-                if(certGenStatus != UA_STATUSCODE_GOOD || client_cert.length == 0 || client_key.length == 0) {
-                    log("Failed to auto-generate client certificate: " +
-                            std::string(UA_StatusCode_name(certGenStatus)),
-                        LogLevel::ERRORS);
-                } else {
-                    // Persist to disk so subsequent runs reuse the same identity.
-                    FILE *certFp = fopen("client/own/certs/client_cert.der", "wb");
-                    if(certFp) {
-                        fwrite(client_cert.data, sizeof(UA_Byte), client_cert.length, certFp);
-                        fclose(certFp);
-                    } else {
-                        log("WARNING: Could not persist generated client_cert.der to disk", LogLevel::WARNING);
-                    }
-                    FILE *keyFp = fopen("client/own/certs/client_key.der", "wb");
-                    if(keyFp) {
-                        fwrite(client_key.data, sizeof(UA_Byte), client_key.length, keyFp);
-                        fclose(keyFp);
-                    } else {
-                        log("WARNING: Could not persist generated client_key.der to disk", LogLevel::WARNING);
-                    }
-                    log("✓ Generated and saved a new self-signed client certificate (client/own/certs/)",
-                        LogLevel::INFO);
-                }
-            }
-
-            // Load trusted certificates from directory
-            UA_ByteString *trustList = NULL;
-            size_t trustListSize = loadCertsFromDirectory("client/trusted/certs", &trustList);
-            log("Loaded " + std::to_string(trustListSize) + " trusted certificate(s) for " + server.name, LogLevel::INFO);
-            
-            // Load issuer certificates from directory  
-            UA_ByteString *issuerList = NULL;
-            size_t issuerListSize = loadCertsFromDirectory("client/issuers/certs", &issuerList);
-            log("Loaded " + std::to_string(issuerListSize) + " issuer certificate(s) for " + server.name, LogLevel::INFO);
-            
-            // Load revocation list from directory
-            UA_ByteString *revocationList = NULL;
-            size_t revocationListSize = loadCertsFromDirectory("client/trusted/crl", &revocationList);
-            log("Loaded " + std::to_string(revocationListSize) + " revocation certificate(s) for " + server.name, LogLevel::INFO);
-    
-            if (client_cert.length > 0 && client_key.length > 0) {
-                UA_ClientConfig_setDefaultEncryption(
-                    config, client_cert, client_key,
-                    trustList, trustListSize,
-                    revocationList, revocationListSize);
-                    
-                log("Encryption configured for secure connection to " + server.name, LogLevel::INFO);
-            } else {
-                 log("Warning: Could not load or generate client certificate for secure server " + server.name, LogLevel::ERRORS);
-            }
-    
-            // Clean up byte strings after use
-            UA_ByteString_clear(&client_cert);
-            UA_ByteString_clear(&client_key);
-            
-            if(trustList) {
-                for(size_t i = 0; i < trustListSize; i++)
-                    UA_ByteString_clear(&trustList[i]);
-                UA_free(trustList);
-            }
-            
-            if(issuerList) {
-                for(size_t i = 0; i < issuerListSize; i++)
-                    UA_ByteString_clear(&issuerList[i]);
-                UA_free(issuerList);
-            }
-            
-            if(revocationList) {
-                for(size_t i = 0; i < revocationListSize; i++)
-                    UA_ByteString_clear(&revocationList[i]);
-                UA_free(revocationList);
-            }
-    
-            // Set security mode and policy based on this server's config
-            if(server.msgSecurityMode == "OPC_UA_SM_SG") {
-                config->securityMode = UA_MESSAGESECURITYMODE_SIGN;
-            } else if(server.msgSecurityMode == "OPC_UA_SM_SG_ENC") {
-                config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
-            }
-            
-            // This part needs to be dynamic based on your securityPolicy from JSON
-            const std::string &policy = server.securityPolicy;
-
-            //UA_String_clear(&config->securityPolicyUri);
-
-            if(policy == "UA_SP_BASIC256") {
-                config->securityPolicyUri = UA_STRING_ALLOC(
-                    (char*)"http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
-            } else if(policy == "UA_SP_AES128") {
-                config->securityPolicyUri =
-                    UA_STRING_ALLOC(
-                    (char *)"http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
-            } else if(policy == "UA_SP_AES256") {
-                config->securityPolicyUri =
-                    UA_STRING_ALLOC(
-                    (char *)"http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss");
-            } else {
-                config->securityPolicyUri = UA_STRING_ALLOC(
-                    (char *)"http://opcfoundation.org/UA/SecurityPolicy#None");
-            }
-
-        } 
-        // If msgSecurityMode is "NONE", we do nothing extra. The UA_ClientConfig_setDefault already handled it.
-
-
-
-    
-        // --- End of Corrected Security Logic ---
-            if(server.authType == "AUTH_STG_ANYMS" || server.authType == "AUTH_STG_ANYMS") {
-                return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
-            } else if(server.authType == "AUTH_STG_AUTH") {
-                std::string user = server.username;
-                std::string pass = server.password;
-
-                // Fallback to global credentials if server-specific ones are missing
-                if(user.empty()) user = APIusername;
-                if(pass.empty()) pass = APIpassword;
-
-                return UA_Client_connectUsername(ctx->client.get(),
-                                                 server.endpointUrl.c_str(),
-                                                 user.c_str(),
-                                                 pass.c_str());
-            }
-            else if(server.authType == "AUTH_STG_CERT") {
-                return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
-            }
-            return UA_STATUSCODE_BADIDENTITYTOKENINVALID;
-        };
-
-        //-------------------------------------------------------------------------
-
-            UserProfile profile;
-        try {
-            std::string json_body = "{}";
-            std::string cacheKey = "USER_PROFILE_" + APIusername;
-            nlohmann::ordered_json profileJson;
-            bool cacheHit = false;
-
-            // Try DB cache for UserProfile
-            if(g_sqliteService) {
-                try {
-                    std::string dbData = g_sqliteService->GetConfig(cacheKey);
-                    if(!dbData.empty()) {
-                        log("💾 DB Hit for UserProfile: " + cacheKey, LogLevel::INFO);
-                        profileJson = nlohmann::ordered_json::parse(dbData);
-                        profile = ParseUserProfileFromJson(profileJson);
-                        if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
-                            cacheHit = true;
-                        }
-                    }
-                } catch(const std::exception& e) {
-                    log("⚠️ DB cache error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
-                }
-            }
-
-
-
-            if(!cacheHit) {
-                if(BearerToken.empty()) {
-                    log("⚠️ No bearer token and no cached UserProfile. Skipping API call.", LogLevel::WARNING);
-                } else {
-                    auto futureResponse = std::async(
-                        std::launch::async, getResponse, applicationEndURLHost,
-                                   std::to_string(applicationEndURLPort), BearerToken, json_body,
-                                   "/api/GetUserProfile");
-
-                    profileJson = futureResponse.get();
-
-
-                    // Also store in DB
-                    if(g_sqliteService) {
-                        try {
-                            g_sqliteService->SetConfig(cacheKey, profileJson.dump());
-                        } catch(const std::exception& e) {
-                            log("⚠️ Failed to cache UserProfile to DB: " + std::string(e.what()), LogLevel::WARNING);
-                        }
-                    }
-
-                    profile = ParseUserProfileFromJson(profileJson);
-                }
-            }
-
-        } catch(const std::exception &e) {
-            log("❌ User profile request failed: " + std::string(e.what()),
-                LogLevel::ERRORS);
-            return nullptr;
-        }
-
-        if(profile.currentOrgId.empty()) {
-            log("❌ No currentOrgId in user profile for " + server.name,
-                LogLevel::ERRORS);
-            return nullptr;
-        }
-
-        log("✓ User profile: " + profile.displayName + " (OrgID: " +
-                profile.currentOrgId + ", Org: " + profile.currentOrgCode
-            + ")",
-            LogLevel::INFO);
-
-        printf("User Profile Loaded: %s | OrgID: %s | OrgCode: %s\n",
-               profile.displayName.c_str(), profile.currentOrgId.c_str(),
-               profile.currentOrgCode.c_str());
-
-        std::string orgShortCode = profile.currentOrgCode;
-
-        std::string NamespaceURI = "Anexee:" + orgShortCode;
-        // Cache the URI on the context so hot reload paths (running outside
-        // onConnected) can re-resolve the namespace index after a reconnect.
-        context->namespaceURI = NamespaceURI;
-        //------------------------------------------------------------------------------------------
-
-        context->onConnected = [ctx = context.get(), server = server_copy,
-                                NamespaceURI]() {
-            // base subscription (events)
-            UA_CreateSubscriptionRequest req = UA_CreateSubscriptionRequest_default();
-            UA_CreateSubscriptionResponse sub =
-                UA_Client_Subscriptions_create(ctx->client.get(), req, ctx, nullptr, nullptr);
-            ctx->subscriptions[server.name] = sub;
-            MonitorEvent(ctx->client.get(), ctx->subscriptions[server.name]);
-
-#ifdef UA_ENABLE_SUBSCRIPTIONS
-            // group subscriptions 
-            for(const auto &group : server.groups) {
-                UA_CreateSubscriptionRequest greq = UA_CreateSubscriptionRequest_default();
-                UA_UInt32 requestedKeepAlive =
-                    (group.maxKeepAliveCount > 0) ? (UA_UInt32)group.maxKeepAliveCount : 40;
-                greq.requestedPublishingInterval = group.publishingInterval;
-                UA_UInt32 requestedLifetime =
-                    (group.lifetimeCount > 0) ? (UA_UInt32)group.lifetimeCount
-                                              : (requestedKeepAlive * 3);
-                if(requestedLifetime < (requestedKeepAlive * 3))
-                    requestedLifetime = requestedKeepAlive * 3;
-                greq.requestedMaxKeepAliveCount = requestedKeepAlive;
-                greq.requestedLifetimeCount = requestedLifetime;
-                greq.priority = group.priority;
-                greq.maxNotificationsPerPublish = group.maxNotificationsPerPublish;
-                //greq.maxNotificationsPerPublish = 0;
-
-                UA_CreateSubscriptionResponse gsub =
-                    UA_Client_Subscriptions_create(ctx->client.get(), greq, ctx, nullptr, nullptr);
-                ctx->subscriptions[group.name] = gsub;
-                // The startup hierarchy API ships the group's hierarchy id
-                // under `dataPointId`; the hot reload MQTT command refers to
-                // the same number as `id`. Populating groupIdToName here lets
-                // applyGroupUpdate look up the subscription by id directly.
-                if(group.dataPointId != 0) {
-                    ctx->groupIdToName[group.dataPointId] = group.name;
-                } else {
-                    log("Subscription Created with no hierarchy id for '" +
-                            group.name +
-                            "' — hot reload group updates will resolve by "
-                            "name only",
-                        LogLevel::DEBUG);
-                }
-                log("Subscription Created: " + group.name +
-                        " (hierarchyId=" + std::to_string(group.dataPointId) +
-                        ") | ID: " + std::to_string(gsub.subscriptionId) +
-                        " | Interval: " +
-                        std::to_string(gsub.revisedPublishingInterval) + "ms",
-                    LogLevel::INFO);
-            }
-#endif
-
-            // ── Batch MonitoredItems registration: ONE call per group ──────────
-            // Uses UA_Client_MonitoredItems_createDataChanges (plural) which sends
-            // ALL items for a group in a single OPC UA service request.
-            for(const auto &group : server.groups) {
-                std::string groupName = group.name;
-
-                // Pre-compile expressions and parse NodeIds BEFORE hopping to the OPC thread!
-                // This shifts heavy CPU parsing work to the current calling thread (pool worker).
-                std::vector<MappedInfospaceTag> batchInfoSpaces;
-                std::vector<UA_NodeId>          batchNodeIds;
-                std::vector<MyMonitorContext *> batchContexts;
-
-                // ── Resolve namespace index once per batch ───────────────
-                UA_UInt16 resolvedNs = 0;
-                bool      nsResolved = false;
-                if(!NamespaceURI.empty()) {
-                    UA_UInt16 tmp;
-                    if(UA_Client_getNamespaceIndex(
-                           ctx->client.get(),
-                           UA_STRING((char *)NamespaceURI.c_str()),
-                           &tmp) == UA_STATUSCODE_GOOD) {
-                        resolvedNs = tmp;
-                        nsResolved = true;
-                        // Cache for hot reload (applyAdd builds node paths
-                        // from ctx->resolvedNs + the API's short nodeId).
-                        ctx->resolvedNs.store(resolvedNs,
-                                              std::memory_order_release);
-                    }
-                }
-
-                for(const auto &tag : group.tags) {
-                    if(!tag.mappedInfospaceTags) continue;
-                    for(const auto &infoSpace : *tag.mappedInfospaceTags) {
-                        auto it = Mapping.find(infoSpace.tagId);
-                        if(it == Mapping.end()) continue;
-
-                        const std::string &nodeIdStr = it->second.first;
-                        
-                        // 1. Parse NodeId
-                        UA_NodeId nodeId = UA_NODEID_NULL;
-                        const char *nsStart = strstr(nodeIdStr.c_str(), "ns=");
-                        if(nsStart) {
-                            const char *nsEnd = strchr(nsStart + 3, ';');
-                            if(nsEnd) {
-                                UA_UInt16 nsIdx = nsResolved
-                                    ? resolvedNs
-                                    : (UA_UInt16)strtoul(nsStart + 3, nullptr, 10);
-                                const char *idStart = nsEnd + 1;
-                                if(strncmp(idStart, "i=", 2) == 0)
-                                    nodeId = UA_NODEID_NUMERIC(
-                                        nsIdx,
-                                        (UA_UInt32)strtoul(idStart + 2, nullptr, 10));
-                                else if(strncmp(idStart, "s=", 2) == 0)
-                                    nodeId = UA_NODEID_STRING_ALLOC(nsIdx, idStart + 2);
-                            }
-                        }
-
-                        // 2. Build MyMonitorContext and pre-compile ExprTk AST
-                        auto *myCtx = new MyMonitorContext{
-                            infoSpace, g_mqttHandler, g_sqliteService,
-                            nullptr, g_asyncPublisher,
-                            [ctx](std::function<void()> task) {
-                                ctx->postTask(std::move(task));
-                            }
-                        };
-
-                        if(infoSpace.enableExpression && !infoSpace.expression.empty()) {
-                            myCtx->exprContext = std::make_shared<ExprTkContext>();
-                            myCtx->exprContext->symbol_table.add_variable(
-                                "value", myCtx->exprContext->value);
-                            myCtx->exprContext->symbol_table.add_constants();
-                            myCtx->exprContext->expression.register_symbol_table(
-                                myCtx->exprContext->symbol_table);
-                            exprtk::parser<double> parser;
-                            std::string exprStr = infoSpace.expression;
-                            std::transform(exprStr.begin(), exprStr.end(),
-                                           exprStr.begin(), ::tolower);
-                            if(!parser.compile(exprStr, myCtx->exprContext->expression))
-                                myCtx->exprContext.reset();
-                        }
-
-                        batchInfoSpaces.push_back(infoSpace);
-                        batchNodeIds.push_back(nodeId);
-                        batchContexts.push_back(myCtx);
-                    }
-                }
-
-                if(batchInfoSpaces.empty()) continue;
-
-                // Move heavy pre-computed vectors into the OPC thread closure
-                ctx->postOpcTask([ctx, batchInfoSpaces, batchNodeIds, batchContexts,
-                                  groupName, NamespaceURI]() mutable {
-                    const UA_CreateSubscriptionResponse &sub =
-                        ctx->subscriptions[groupName];
-                    size_t count = batchInfoSpaces.size();
-
-                    // ── Build UA_CreateMonitoredItemsRequest ─────────────────
-                    UA_CreateMonitoredItemsRequest batchReq;
-                    UA_CreateMonitoredItemsRequest_init(&batchReq);
-                    batchReq.subscriptionId     = sub.subscriptionId;
-                    batchReq.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
-                    batchReq.itemsToCreate =
-                        (UA_MonitoredItemCreateRequest *)UA_Array_new(
-                            count,
-                            &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
-                    batchReq.itemsToCreateSize = count;
-
-                    // ── Parallel arrays required by the API ──────────────────
-                    std::vector<UA_Client_DataChangeNotificationCallback> cbs(
-                        count, handler_NodeValueChanged);
-                    std::vector<UA_Client_DeleteMonitoredItemCallback>  delCbs(count, nullptr);
-
-                    for(size_t i = 0; i < count; ++i) {
-                        const MappedInfospaceTag &infoSpace  = batchInfoSpaces[i];
-
-                        // ── Fill request item ────────────────────────────────
-                        UA_MonitoredItemCreateRequest &req = batchReq.itemsToCreate[i];
-                        UA_MonitoredItemCreateRequest_init(&req);
-                        
-                        // IMPORTANT: We must deep copy the NodeId because UA_CreateMonitoredItemsRequest_clear
-                        // will attempt to free its members later. 
-                        UA_NodeId_copy(&batchNodeIds[i], &req.itemToMonitor.nodeId);
-                        UA_NodeId_clear(&batchNodeIds[i]);
-                        
-                        req.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
-                        req.monitoringMode            = UA_MONITORINGMODE_REPORTING;
-                        req.requestedParameters.samplingInterval = 0;
-                        req.requestedParameters.queueSize        = 10000;
-                        req.requestedParameters.discardOldest    = false;
-
-                        // Deadband filter (heap-allocated, owned by req)
-                        UA_DataChangeFilter *filter =
-                            (UA_DataChangeFilter *)UA_malloc(
-                                sizeof(UA_DataChangeFilter));
-                        UA_DataChangeFilter_init(filter);
-                        if(infoSpace.deadband > 0) {
-                            filter->deadbandType  = UA_DEADBANDTYPE_ABSOLUTE;
-                            filter->deadbandValue = infoSpace.deadband;
-                        }
-                        filter->trigger = UA_DATACHANGETRIGGER_STATUSVALUE;
-                        UA_ExtensionObject &fobj = req.requestedParameters.filter;
-                        memset(&fobj, 0, sizeof(fobj));
-                        fobj.encoding             = UA_EXTENSIONOBJECT_DECODED;
-                        fobj.content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER];
-                        fobj.content.decoded.data = filter;
-                    }
-
-                    // ── Single network service call for the whole group ───────
-                    UA_CreateMonitoredItemsResponse resp =
-                        UA_Client_MonitoredItems_createDataChanges(
-                            ctx->client.get(),
-                            batchReq,
-                            (void **)batchContexts.data(),
-                            cbs.data(),
-                            delCbs.data());
-
-                    // ── Deallocate the request (frees filter heap blocks too) ─
-                    UA_CreateMonitoredItemsRequest_clear(&batchReq);
-
-                    // ── Process results ──────────────────────────────────────
-                    size_t ok = 0;
-                    {
-                        std::lock_guard<std::mutex> regLk(ctx->registryMutex);
-                        for(size_t i = 0; i < resp.resultsSize; ++i) {
-                            if(resp.results[i].statusCode != UA_STATUSCODE_GOOD) {
-                                log("MonitoredItem failed for TagId " +
-                                        std::to_string(batchInfoSpaces[i].tagId) +
-                                        ": " +
-                                        UA_StatusCode_name(resp.results[i].statusCode),
-                                    LogLevel::ERRORS);
-                                delete batchContexts[i];
-                                batchContexts[i] = nullptr;
-                            } else {
-                                ++ok;
-                                // Record live monitor for later hot-reload
-                                // delete/update operations.
-                                LiveMonitorEntry entry;
-                                entry.hierarchyId =
-                                    batchInfoSpaces[i].hierarchyId;
-                                entry.tagId = batchInfoSpaces[i].tagId;
-                                entry.monitoredItemId =
-                                    resp.results[i].monitoredItemId;
-                                entry.subscriptionId = sub.subscriptionId;
-                                entry.groupName = groupName;
-                                entry.endpointUrl = ctx->endpoint;
-                                entry.infoSpace = batchInfoSpaces[i];
-                                ctx->liveRegistry[entry.hierarchyId]
-                                    .push_back(std::move(entry));
-                            }
-                        }
-                    }
-                    UA_CreateMonitoredItemsResponse_clear(&resp);
-
-                    log("Group " + groupName + ": registered " +
-                            std::to_string(ok) + "/" + std::to_string(count) +
-                            " monitored items",
-                        LogLevel::INFO);
-                });
-            }
-        };
-
-        // cout<<"Event Monitoring Created"<<endl;
-
-        context->startLoop();
-        return context;
-    };
-
-    // Publish the factory so the hot reload worker can spawn additional
-    // ClientContexts at runtime (purpose=OPC_HI_SERVER, action=Add).
-    g_buildContext = buildAndStartContext;
-
-    for(const auto &server : serverList) {
-        auto ctx = buildAndStartContext(server);
-        if(ctx) {
-            std::lock_guard<std::mutex> lk(g_clientPoolMutex);
-            clientPool[ctx->endpoint] = ctx.get();
-            clientContexts.push_back(std::move(ctx));
-        } else {
-            log("Skipping server '" + server.name +
-                    "' (" + server.endpointUrl + "): setup failed",
-                LogLevel::ERRORS);
-        }
-        // ADD THIS: Give each thread time to initialize before starting the next
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    log("Client pool initialized. Press Ctrl+C to stop...");
-
-    // ── Hot reload worker thread ───────────────────────────────────────────
-    // Drains g_hrQueue (populated from the MQTT callback when topic ==
-    // "HTRLD/Edgents"). Each task is a self-contained lambda that calls the
-    // EdgentHotReloading API and dispatches to applyAdd/Delete/Update/Reload.
-    g_hrRunning.store(true, std::memory_order_release);
-    g_hrWorker = std::thread([]() {
-        log("HotReload worker thread started", LogLevel::INFO);
-        while(true) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lk(g_hrMutex);
-                g_hrCv.wait(lk, [] {
-                    return !g_hrQueue.empty() ||
-                           !g_hrRunning.load(std::memory_order_acquire);
-                });
-                if(!g_hrRunning.load(std::memory_order_acquire) &&
-                   g_hrQueue.empty())
-                    break;
-                task = std::move(g_hrQueue.front());
-                g_hrQueue.pop();
-            }
-            try {
-                task();
-            } catch(const std::exception &e) {
-                log(std::string("HotReload task threw: ") + e.what(),
-                    LogLevel::ERRORS);
-            } catch(...) {
-                log("HotReload task threw unknown exception",
-                    LogLevel::ERRORS);
-            }
-        }
-        log("HotReload worker thread exiting", LogLevel::INFO);
-    });
-
+    // C-29: register the inbound message handler NOW, before any topic is
+    // subscribed and before the per-server contexts are built. Previously it
+    // was registered after the (multi-second) server setup, so HTRLD commands
+    // and control writes arriving in that window were silently dropped.
+    // Hot-reload tasks posted before the worker starts simply queue up.
     g_mqttHandler->setCallback([&clientPool, &clientContexts,
                                 applicationEndURLHost,
                                 applicationEndURLPort, &BearerToken,
@@ -3392,16 +3024,24 @@ runClient(bool isService, int argc, char *argv[]) {
 
         int tagId = data["TagId"].get<int>();
         int updateType = data["UpdateType"].get<int>();
-        
+
         //log("Processing TagId: " + std::to_string(tagId) + ", UpdateType: " + std::to_string(updateType), LogLevel::DEBUG);
 
-        // Find client context for this tag
-        if (Mapping.find(tagId) == Mapping.end()) {
-            log("TagId " + std::to_string(tagId) + " not found in mapping", LogLevel::ERRORS);
-            return;
+        // Find client context for this tag (C-01: Mapping is shared with the
+        // hot-reload worker; read it under the lock and copy out what we need).
+        std::string endpoint;
+        std::string mappedNodePath;
+        {
+            std::lock_guard<std::mutex> mlk(g_mappingMutex);
+            auto mit = Mapping.find(tagId);
+            if(mit == Mapping.end()) {
+                log("TagId " + std::to_string(tagId) + " not found in mapping", LogLevel::ERRORS);
+                return;
+            }
+            mappedNodePath = mit->second.first;
+            endpoint = mit->second.second;
         }
 
-        std::string endpoint = Mapping[tagId].second;
         ClientContext *context = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_clientPoolMutex);
@@ -3417,68 +3057,172 @@ runClient(bool isService, int argc, char *argv[]) {
         }
 
         if(updateType == static_cast<int>(UpdateType::Telemetry)) {
-            // std::lock_guard<std::mutex> lock(context->taskMutex);
-            // context->taskQueue.push([context, tagId]() {
-            //     MonitorItem(context->client.get(), context->subscription,
-            //                 Mapping[tagId].first.c_str(), tagId);
-            // });
+            // Inbound telemetry echoes are ignored; the client only produces
+            // telemetry, it does not consume it.
         } else if(updateType == static_cast<int>(UpdateType::Control)) {
-                // Extract NodeId from mapping
-                std::string nodeIdStr = Mapping[tagId].first;
+                // Extract the "ns=..;i=.." / "ns=..;s=.." tail of the mapped path
+                // (the hierarchy API stores paths like "Node2/ns=3;i=1002").
+                std::string nodeIdStr = mappedNodePath;
                 size_t lastSlash = nodeIdStr.find_last_of('/');
                 if (lastSlash != std::string::npos) {
-                    nodeIdStr = nodeIdStr.substr(lastSlash + 1); // Extract "ns=1;i=194"
+                    nodeIdStr = nodeIdStr.substr(lastSlash + 1);
                 }
 
-                // UA_Client_writeValueAttribute runs on the OPC thread via postOpcTask
+                // All UA_Client_* calls run on the OPC thread via postOpcTask.
                 context->postOpcTask([context, tagId, data, nodeIdStr]() {
                     log("Executing COMMAND write for TagId: " + std::to_string(tagId), LogLevel::DEBUG);
-                    
-                    // Parse value from payload
-                    double val = 0.0;
+
+                    if(!context->client) {
+                        log("Control write: client is null for " + context->endpoint, LogLevel::ERRORS);
+                        return;
+                    }
+
+                    // ── 1. Parse the payload value (keep the raw JSON too, so
+                    //       booleans / strings can be written natively). ────
+                    if(!data.contains("Value")) {
+                        log("Missing Value field in payload", LogLevel::ERRORS);
+                        return;
+                    }
+                    const nlohmann::json &jv = data["Value"];
+                    double numericVal = 0.0;
+                    bool haveNumeric = false;
                     try {
-                        if (data.contains("Value")) {
-                            if (data["Value"].is_number()) {
-                                val = data["Value"].get<double>();
-                            } else if (data["Value"].is_string()) {
-                                val = std::stod(data["Value"].get<std::string>());
-                            } else {
-                                log("Invalid Value type in payload", LogLevel::ERRORS);
-                                return;
-                            }
+                        if(jv.is_number()) {
+                            numericVal = jv.get<double>();
+                            haveNumeric = true;
+                        } else if(jv.is_boolean()) {
+                            numericVal = jv.get<bool>() ? 1.0 : 0.0;
+                            haveNumeric = true;
+                        } else if(jv.is_string()) {
+                            // Numeric strings are common in control payloads.
+                            try { numericVal = std::stod(jv.get<std::string>()); haveNumeric = true; }
+                            catch(...) { haveNumeric = false; }
                         } else {
-                            log("Missing Value field in payload", LogLevel::ERRORS);
+                            log("Invalid Value type in payload", LogLevel::ERRORS);
                             return;
                         }
-                    } catch (const std::exception& e) {
+                    } catch(const std::exception &e) {
                         log("Failed to parse Value: " + std::string(e.what()), LogLevel::ERRORS);
                         return;
                     }
 
-                    // Create UA_Variant with the value
+                    // ── 2. Build the target NodeId. C-04: use the namespace
+                    //       index resolved from the org URI (what the monitors
+                    //       use) when we have it; fall back to the stored index.
+                    //       Supports both numeric (i=) and string (s=) ids. ──
+                    UA_NodeId nid = parseUaNodePath(nodeIdStr);
+                    if(UA_NodeId_isNull(&nid)) {
+                        log("Failed to parse NodeId: " + nodeIdStr, LogLevel::ERRORS);
+                        return;
+                    }
+                    const UA_UInt16 resolved = context->resolvedNs.load(std::memory_order_acquire);
+                    if(resolved != 0)
+                        nid.namespaceIndex = resolved;
+
+                    // ── 3. Read the node's declared DataType so the write uses
+                    //       the matching builtin type (C-03). open62541 rejects a
+                    //       Double written to an Int32/Boolean node with
+                    //       BadTypeMismatch. If the read fails, fall back to the
+                    //       previous behaviour (write a Double). ──────────────
+                    UA_NodeId dataTypeId = UA_NODEID_NULL;
+                    UA_StatusCode dtRc =
+                        UA_Client_readDataTypeAttribute(context->client.get(), nid, &dataTypeId);
+                    int builtin = -1;
+                    if(dtRc == UA_STATUSCODE_GOOD && dataTypeId.namespaceIndex == 0 &&
+                       dataTypeId.identifierType == UA_NODEIDTYPE_NUMERIC) {
+                        // NS0 numeric ids of the builtin types are 1..25 and index
+                        // UA_TYPES directly (Boolean=1 .. DateTime=13 ..).
+                        for(int t = 0; t < UA_TYPES_COUNT; ++t) {
+                            if(UA_TYPES[t].typeId.identifierType == UA_NODEIDTYPE_NUMERIC &&
+                               UA_TYPES[t].typeId.namespaceIndex == 0 &&
+                               UA_TYPES[t].typeId.identifier.numeric ==
+                                   dataTypeId.identifier.numeric) {
+                                builtin = t;
+                                break;
+                            }
+                        }
+                    } else if(dtRc != UA_STATUSCODE_GOOD) {
+                        log("Control write: could not read DataType of " + nodeIdStr +
+                                " (" + std::string(UA_StatusCode_name(dtRc)) +
+                                ") - writing as Double",
+                            LogLevel::WARNING);
+                    }
+                    UA_NodeId_clear(&dataTypeId);
+
+                    // ── 4. Build a variant of the right type. ─────────────────
                     UA_Variant value;
                     UA_Variant_init(&value);
-                    UA_Variant_setScalar(&value, &val, &UA_TYPES[UA_TYPES_DOUBLE]);
+                    bool ok = true;
+                    std::string typeName = "Double";
 
-                    // Parse NodeId string safely
-                    int ns = 0, identifier = 0;
-                    if (sscanf(nodeIdStr.c_str(), "ns=%d;i=%d", &ns, &identifier) != 2) {
-                        log("Failed to parse NodeId: " + nodeIdStr, LogLevel::ERRORS);
-                        UA_Variant_clear(&value);
+                    // Storage for the scalar the variant points at.
+                    UA_Boolean vBool; UA_SByte vSByte; UA_Byte vByte;
+                    UA_Int16 vI16; UA_UInt16 vU16; UA_Int32 vI32; UA_UInt32 vU32;
+                    UA_Int64 vI64; UA_UInt64 vU64; UA_Float vF32; UA_Double vF64;
+                    UA_String vStr = UA_STRING_NULL;
+
+                    switch(builtin) {
+                        case UA_TYPES_BOOLEAN:
+                            typeName = "Boolean";
+                            if(jv.is_boolean()) vBool = jv.get<bool>();
+                            else if(jv.is_string()) {
+                                std::string sv = jv.get<std::string>();
+                                std::transform(sv.begin(), sv.end(), sv.begin(), ::tolower);
+                                vBool = (sv == "true" || sv == "1" || sv == "on");
+                            } else vBool = haveNumeric && numericVal != 0.0;
+                            UA_Variant_setScalar(&value, &vBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                            break;
+                        case UA_TYPES_SBYTE:  typeName = "SByte";  vSByte = (UA_SByte)numericVal;  UA_Variant_setScalar(&value, &vSByte, &UA_TYPES[UA_TYPES_SBYTE]);  ok = haveNumeric; break;
+                        case UA_TYPES_BYTE:   typeName = "Byte";   vByte  = (UA_Byte)numericVal;   UA_Variant_setScalar(&value, &vByte,  &UA_TYPES[UA_TYPES_BYTE]);   ok = haveNumeric; break;
+                        case UA_TYPES_INT16:  typeName = "Int16";  vI16   = (UA_Int16)numericVal;  UA_Variant_setScalar(&value, &vI16,   &UA_TYPES[UA_TYPES_INT16]);  ok = haveNumeric; break;
+                        case UA_TYPES_UINT16: typeName = "UInt16"; vU16   = (UA_UInt16)numericVal; UA_Variant_setScalar(&value, &vU16,   &UA_TYPES[UA_TYPES_UINT16]); ok = haveNumeric; break;
+                        case UA_TYPES_INT32:  typeName = "Int32";  vI32   = (UA_Int32)numericVal;  UA_Variant_setScalar(&value, &vI32,   &UA_TYPES[UA_TYPES_INT32]);  ok = haveNumeric; break;
+                        case UA_TYPES_UINT32: typeName = "UInt32"; vU32   = (UA_UInt32)numericVal; UA_Variant_setScalar(&value, &vU32,   &UA_TYPES[UA_TYPES_UINT32]); ok = haveNumeric; break;
+                        case UA_TYPES_INT64:  typeName = "Int64";  vI64   = (UA_Int64)numericVal;  UA_Variant_setScalar(&value, &vI64,   &UA_TYPES[UA_TYPES_INT64]);  ok = haveNumeric; break;
+                        case UA_TYPES_UINT64: typeName = "UInt64"; vU64   = (UA_UInt64)numericVal; UA_Variant_setScalar(&value, &vU64,   &UA_TYPES[UA_TYPES_UINT64]); ok = haveNumeric; break;
+                        case UA_TYPES_FLOAT:  typeName = "Float";  vF32   = (UA_Float)numericVal;  UA_Variant_setScalar(&value, &vF32,   &UA_TYPES[UA_TYPES_FLOAT]);  ok = haveNumeric; break;
+                        case UA_TYPES_STRING: {
+                            typeName = "String";
+                            std::string sv = jv.is_string() ? jv.get<std::string>() : jv.dump();
+                            vStr = UA_STRING_ALLOC(sv.c_str());
+                            UA_Variant_setScalar(&value, &vStr, &UA_TYPES[UA_TYPES_STRING]);
+                            break;
+                        }
+                        case UA_TYPES_DOUBLE:
+                        default: // unknown / not read: previous behaviour
+                            typeName = "Double";
+                            vF64 = numericVal;
+                            UA_Variant_setScalar(&value, &vF64, &UA_TYPES[UA_TYPES_DOUBLE]);
+                            ok = haveNumeric;
+                            break;
+                    }
+
+                    if(!ok) {
+                        log("Control write: payload Value is not numeric but node " +
+                                nodeIdStr + " is " + typeName + " - skipped",
+                            LogLevel::ERRORS);
+                        UA_String_clear(&vStr);
+                        UA_NodeId_clear(&nid);
                         return;
                     }
 
-                    // Create NodeId and write to OPC UA server
-                    UA_NodeId nid = UA_NODEID_NUMERIC(ns, identifier);
-                    log("Writing value " + std::to_string(val) + " to ns=" + std::to_string(ns) + ";i=" + std::to_string(identifier), LogLevel::DEBUG);
-                    
-                    UA_StatusCode retval = UA_Client_writeValueAttribute(context->client.get(), nid, &value);
+                    log("Writing " + typeName + " value " + jv.dump() + " to ns=" +
+                            std::to_string(nid.namespaceIndex) + " (" + nodeIdStr + ")",
+                        LogLevel::DEBUG);
+
+                    UA_StatusCode retval =
+                        UA_Client_writeValueAttribute(context->client.get(), nid, &value);
 
                     if (retval == UA_STATUSCODE_GOOD) {
                         log("Value written successfully to OPC UA server", LogLevel::INFO);
                     } else {
                         log("Failed to write value: " + std::string(UA_StatusCode_name(retval)), LogLevel::ERRORS);
                     }
+
+                    // `value` points at stack storage (or vStr), so only the
+                    // string payload and the NodeId need explicit cleanup.
+                    UA_String_clear(&vStr);
+                    UA_NodeId_clear(&nid);
                 });
             }
          else if(updateType == static_cast<int>(UpdateType::BulkData)) {
@@ -3487,6 +3231,822 @@ runClient(bool isService, int argc, char *argv[]) {
             log("Unknown UpdateType: " + std::to_string(updateType), LogLevel::ERRORS);
         }
     });
+
+
+#ifdef UA_ENABLE_SUBSCRIPTIONS
+    signal(SIGINT, stopHandler);
+    signal(SIGTERM, stopHandler);
+#endif
+
+
+
+
+    std::vector<std::string> topicsToSubscribe;
+    //log("Collecting topics to subscribe...", LogLevel::INFO);
+
+    // Hot reload trigger channel — subscribed alongside per-tag control topics
+    // so the broker delivers Add/Delete/Update/Reload commands on the same
+    // session.
+    topicsToSubscribe.push_back("HTRLD/Edgents");
+
+    for(const auto &server : serverList) {
+        //log(server.name + " ", LogLevel::DEBUG);
+        //cout << (endl);
+
+        // Print tags if they exist
+        for(const auto &group : server.groups) {
+            for(const auto &tag : group.tags) {
+                //if(tag.name) {
+                //    //log(*tag.name + " ", LogLevel::DEBUG);
+                //}
+                //cout << endl;
+
+                if(tag.rdWtOpt == "RD_WRT_RO") {
+                    //log("ReadOnly");
+                } else if(tag.rdWtOpt == "RD_WRT_RW") {
+                    if(tag.mappedInfospaceTags) {
+                        for(const auto &infoSpace : *tag.mappedInfospaceTags) {
+                            //log(infoSpace.namespaces);
+                            topicsToSubscribe.push_back(infoSpace.namespaces);
+                            // cout << infoSpace.namespaces << " subscribed; ";
+                            //cout << endl;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    //cout << endl;
+
+    if (!topicsToSubscribe.empty()) {
+        log("Waiting for MQTT connection before subscribing...", LogLevel::INFO);
+        // Wait up to 10 seconds for connection
+        int retries = 0;
+        while (!g_mqttHandler->isConnected() && retries < 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            retries++;
+        }
+
+        if (g_mqttHandler->isConnected()) {
+            size_t total = topicsToSubscribe.size();
+            size_t batchSize = 500;
+            log("Starting batch subscription for " + std::to_string(total) + " topics...", LogLevel::INFO);
+            
+            for (size_t i = 0; i < total; i += batchSize) {
+                size_t end = std::min(i + batchSize, total);
+                std::vector<std::string> batch(topicsToSubscribe.begin() + i, topicsToSubscribe.begin() + end);
+                
+                log("Subscribing to batch " + std::to_string(i/batchSize + 1) + 
+                    " (" + std::to_string(batch.size()) + " topics)...", LogLevel::INFO);
+                
+                g_mqttHandler->subscribeBatch(batch);
+                
+                // Small delay between batches to avoid overwhelming the broker
+                std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
+            }
+            log("All batch subscriptions initiated.", LogLevel::INFO);
+        } else {
+            log("Failed to connect to MQTT broker after waiting. Subscriptions skipped.", LogLevel::ERRORS);
+        }
+    } else {
+        log("No topics found to subscribe.", LogLevel::INFO);
+    }
+
+    // *** FIX START ***
+    // Add this block BEFORE the main "for" loop
+    std::call_once(security_policies_loaded, []() {
+        log("Performing one-time global security policy initialization...", LogLevel::INFO);
+        // Create a temporary client just to trigger the OpenSSL policy loading
+        UA_Client *tempClient = UA_Client_new();
+        UA_ClientConfig_setDefault(UA_Client_getConfig(tempClient));
+        // Deleting the client is enough to ensure policies are loaded and ready
+        UA_Client_delete(tempClient);
+        log("Global security policies initialized.", LogLevel::INFO);
+    });
+    // *** FIX END ***
+
+    
+
+    // Per-server setup wrapped as a callable so the hot reload worker can
+    // spawn brand-new ClientContexts at runtime (purpose=OPC_HI_SERVER, action=Add)
+    // using the exact same pipeline as startup. Returns a fully-started
+    // ClientContext on success, or nullptr if any blocking error (cert load
+    // failure, profile lookup error, etc.) prevents bringing the server up.
+    auto buildAndStartContext =
+        [&](const ServerInfoO &server) -> std::unique_ptr<ClientContext> {
+        auto server_copy = server;
+        auto context = std::make_unique<ClientContext>();
+        context->name = server.name;
+        context->endpoint = server.endpointUrl;
+        context->typeId = server.typeId;
+        context->serverHierarchyId = server.dataPointId;
+        
+        
+    
+        // The rest of your loop (connectOnce, onConnected lambdas) remains the same as the previous fix
+        context->connectOnce = [ctx = context.get(), server = server_copy,
+                                fallbackUser = authUsername,
+                                fallbackPass = authPassword]() -> UA_StatusCode {
+
+            // Create a new client and get its fresh config
+        ctx->client.reset(UA_Client_new());
+        UA_ClientConfig *config = UA_Client_getConfig(ctx->client.get());
+        UA_ClientConfig_setDefault(config); // Start with a default config for EVERY client
+        config->logging = &myLogger; // Apply your custom logger
+
+        UA_String_clear(&config->clientDescription.applicationUri);
+        config->clientDescription.applicationUri =
+            UA_STRING_ALLOC("urn:Anexee.client.application");
+
+        // With many subscriptions, default 10 outstanding PublishRequests can starve
+        // keep-alives and trigger widespread "Inactivity for Subscription" events.
+        const size_t expectedSubCount = server.groups.size() + 1; // + event subscription
+        config->outStandingPublishRequests =
+            static_cast<UA_UInt16>(std::clamp<size_t>(expectedSubCount, 20, 256));
+        if(config->timeout < 30000)
+            config->timeout = 30000; // widen inactivity threshold under heavy load
+            
+        config->subscriptionInactivityCallback = [](UA_Client *, UA_UInt32, void *subCtx) {
+            auto c = static_cast<ClientContext*>(subCtx);
+            if(c) {
+                log(c->name + ": Subscription inactivity detected! Forcing reconnect.", LogLevel::ERRORS);
+                c->isConnected.store(false, std::memory_order_release);
+            }
+        };
+    
+        // --- Start of Corrected Security Logic ---
+    
+        if(server.msgSecurityMode != "NONE" && !server.msgSecurityMode.empty()) {
+
+                        // ADD MUTEX LOCK HERE
+                        std::lock_guard<std::mutex> lock(cert_loading_mutex);
+
+            // This server requires security. Load certificates and apply them.
+            UA_ByteString client_cert = loadFile("client/own/certs/client_cert.der");
+            UA_ByteString client_key = loadFile("client/own/certs/client_key.der");
+
+            // ── Auto-generate if cert or key is missing ──────────────────────
+            if(client_cert.length == 0 || client_key.length == 0) {
+                log("No client certificate/key found — generating a new self-signed certificate...",
+                    LogLevel::WARNING);
+                UA_ByteString_clear(&client_cert);
+                UA_ByteString_clear(&client_key);
+
+                UA_String certSubject[3] = {
+                    UA_STRING_STATIC("C=IN"),
+                    UA_STRING_STATIC("O=Anexee"),
+                    UA_STRING_STATIC("CN=AnexeeClient")
+                };
+
+                // Build SAN entries. For a client cert the server typically
+                // only checks the ApplicationURI, but we include the machine
+                // hostname + loopback for completeness and to match the
+                // server's pattern.
+                std::string localHostname = "localhost";
+#ifdef _WIN32
+                {
+                    char hostnameBuf[256];
+                    DWORD hostnameLen = sizeof(hostnameBuf);
+                    if(GetComputerNameA(hostnameBuf, &hostnameLen))
+                        localHostname = std::string(hostnameBuf);
+                }
+#else
+                {
+                    char hostnameBuf[256];
+                    if(gethostname(hostnameBuf, sizeof(hostnameBuf)) == 0)
+                        localHostname = std::string(hostnameBuf);
+                }
+#endif
+                std::string sanHostnameEntry = "DNS:" + localHostname;
+
+                // Optionally include the target OPC UA server's host in the
+                // SAN so the cert is also valid if the server validates the
+                // client address (rare, but defensive).
+                std::string serverHost = ExtractHostFromUrl(server.endpointUrl);
+                std::string sanServerHostEntry;
+                if(!serverHost.empty() && serverHost != localHostname && serverHost != "localhost") {
+                    sanServerHostEntry = (LooksLikeIpv4Address(serverHost) ? "IP:" : "DNS:") + serverHost;
+                    log("Including target server address in client cert SAN: " + sanServerHostEntry, LogLevel::INFO);
+                }
+
+                std::vector<UA_String> certSubjectAltName = {
+                    UA_STRING_STATIC("DNS:localhost"),
+                    UA_STRING_ALLOC(sanHostnameEntry.c_str()),
+                    UA_STRING_STATIC("IP:127.0.0.1"),
+                    UA_STRING_STATIC("URI:urn:Anexee.client.application")
+                };
+                if(!sanServerHostEntry.empty())
+                    certSubjectAltName.push_back(UA_STRING_ALLOC(sanServerHostEntry.c_str()));
+
+                UA_KeyValueMap *certParams = UA_KeyValueMap_new();
+                UA_UInt16 certExpiresInDays = 3650;
+                UA_KeyValueMap_setScalar(certParams, UA_QUALIFIEDNAME(0, (char*)"expires-in-days"),
+                                         (void*)&certExpiresInDays, &UA_TYPES[UA_TYPES_UINT16]);
+
+                UA_StatusCode certGenStatus = UA_CreateCertificate(
+                    UA_Log_Stdout, certSubject, 3,
+                    certSubjectAltName.data(), certSubjectAltName.size(),
+                    UA_CERTIFICATEFORMAT_DER, certParams, &client_key, &client_cert);
+                UA_KeyValueMap_delete(certParams);
+
+                // Clean up UA_STRING_ALLOC'd SAN entries
+                UA_String_clear(&certSubjectAltName[1]); // hostname
+                if(!sanServerHostEntry.empty())
+                    UA_String_clear(&certSubjectAltName[4]); // server host
+
+                if(certGenStatus != UA_STATUSCODE_GOOD || client_cert.length == 0 || client_key.length == 0) {
+                    log("Failed to auto-generate client certificate: " +
+                            std::string(UA_StatusCode_name(certGenStatus)),
+                        LogLevel::ERRORS);
+                } else {
+                    // Persist to disk so subsequent runs reuse the same identity.
+                    FILE *certFp = fopen("client/own/certs/client_cert.der", "wb");
+                    if(certFp) {
+                        fwrite(client_cert.data, sizeof(UA_Byte), client_cert.length, certFp);
+                        fclose(certFp);
+                    } else {
+                        log("WARNING: Could not persist generated client_cert.der to disk", LogLevel::WARNING);
+                    }
+                    FILE *keyFp = fopen("client/own/certs/client_key.der", "wb");
+                    if(keyFp) {
+                        fwrite(client_key.data, sizeof(UA_Byte), client_key.length, keyFp);
+                        fclose(keyFp);
+                    } else {
+                        log("WARNING: Could not persist generated client_key.der to disk", LogLevel::WARNING);
+                    }
+                    log("✓ Generated and saved a new self-signed client certificate (client/own/certs/)",
+                        LogLevel::INFO);
+                }
+            }
+
+            // Load trusted certificates from directory
+            UA_ByteString *trustList = NULL;
+            size_t trustListSize = loadCertsFromDirectory("client/trusted/certs", &trustList);
+            log("Loaded " + std::to_string(trustListSize) + " trusted certificate(s) for " + server.name, LogLevel::INFO);
+            
+            // Load issuer certificates from directory  
+            UA_ByteString *issuerList = NULL;
+            size_t issuerListSize = loadCertsFromDirectory("client/issuers/certs", &issuerList);
+            log("Loaded " + std::to_string(issuerListSize) + " issuer certificate(s) for " + server.name, LogLevel::INFO);
+            
+            // Load revocation list from directory
+            UA_ByteString *revocationList = NULL;
+            size_t revocationListSize = loadCertsFromDirectory("client/trusted/crl", &revocationList);
+            log("Loaded " + std::to_string(revocationListSize) + " revocation certificate(s) for " + server.name, LogLevel::INFO);
+    
+            if (client_cert.length > 0 && client_key.length > 0) {
+                UA_ClientConfig_setDefaultEncryption(
+                    config, client_cert, client_key,
+                    trustList, trustListSize,
+                    revocationList, revocationListSize);
+                    
+                log("Encryption configured for secure connection to " + server.name, LogLevel::INFO);
+            } else {
+                 log("Warning: Could not load or generate client certificate for secure server " + server.name, LogLevel::ERRORS);
+            }
+    
+            // Clean up byte strings after use
+            UA_ByteString_clear(&client_cert);
+            UA_ByteString_clear(&client_key);
+            
+            if(trustList) {
+                for(size_t i = 0; i < trustListSize; i++)
+                    UA_ByteString_clear(&trustList[i]);
+                UA_free(trustList);
+            }
+            
+            if(issuerList) {
+                for(size_t i = 0; i < issuerListSize; i++)
+                    UA_ByteString_clear(&issuerList[i]);
+                UA_free(issuerList);
+            }
+            
+            if(revocationList) {
+                for(size_t i = 0; i < revocationListSize; i++)
+                    UA_ByteString_clear(&revocationList[i]);
+                UA_free(revocationList);
+            }
+    
+            // Set security mode and policy based on this server's config
+            if(server.msgSecurityMode == "OPC_UA_SM_SG") {
+                config->securityMode = UA_MESSAGESECURITYMODE_SIGN;
+            } else if(server.msgSecurityMode == "OPC_UA_SM_SG_ENC") {
+                config->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
+            } else {
+                log("Unknown msgSecurityMode '" + server.msgSecurityMode + "' for " +
+                        server.name + " - leaving SDK default security mode",
+                    LogLevel::WARNING);
+            }
+
+            // Map the API's policy name to a policy URI. C-24: clear the URI
+            // that setDefaultEncryption already allocated before replacing it
+            // (this leaked one string per reconnect), and do NOT force "#None"
+            // for an unknown policy - with SIGN/ENCRYPT mode that combination
+            // can never connect. Leaving the URI untouched lets the SDK pick
+            // the best matching policy the server offers.
+            const std::string &policy = server.securityPolicy;
+            const char *policyUri = nullptr;
+            if(policy == "UA_SP_BASIC256") {
+                policyUri = "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256";
+            } else if(policy == "UA_SP_AES128") {
+                policyUri = "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep";
+            } else if(policy == "UA_SP_AES256") {
+                policyUri = "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss";
+            }
+            if(policyUri) {
+                UA_String_clear(&config->securityPolicyUri);
+                config->securityPolicyUri = UA_STRING_ALLOC(policyUri);
+            } else {
+                log("Unknown securityPolicy '" + policy + "' for " + server.name +
+                        " - letting the SDK negotiate the policy",
+                    LogLevel::WARNING);
+            }
+
+        } 
+        // If msgSecurityMode is "NONE", we do nothing extra. The UA_ClientConfig_setDefault already handled it.
+
+
+
+    
+        // --- End of Corrected Security Logic ---
+            // C-34: the parser already normalizes "anonymous"/"anonymus" to
+            // AUTH_STG_ANYMS; an empty authType is treated as anonymous too.
+            if(server.authType == "AUTH_STG_ANYMS" || server.authType.empty()) {
+                return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
+            } else if(server.authType == "AUTH_STG_AUTH") {
+                std::string user = server.username;
+                std::string pass = server.password;
+
+                // C-10: fall back to this node's EdgeConfig identity (an Anexee
+                // login, which is what the Anexee OPC UA server authenticates
+                // against) instead of a hardcoded personal account.
+                if(user.empty()) user = fallbackUser;
+                if(pass.empty()) pass = fallbackPass;
+
+                return UA_Client_connectUsername(ctx->client.get(),
+                                                 server.endpointUrl.c_str(),
+                                                 user.c_str(),
+                                                 pass.c_str());
+            }
+            else if(server.authType == "AUTH_STG_CERT") {
+                return UA_Client_connect(ctx->client.get(), server.endpointUrl.c_str());
+            }
+            return UA_STATUSCODE_BADIDENTITYTOKENINVALID;
+        };
+
+        //-------------------------------------------------------------------------
+
+            UserProfile profile;
+        try {
+            std::string json_body = "{}";
+            // C-10: the profile belongs to the identity the bearer token was
+            // issued for (the EdgeConfig user), so key the cache on that.
+            std::string cacheKey = "USER_PROFILE_" + authUsername;
+            nlohmann::ordered_json profileJson;
+            bool gotProfile = false;
+
+            std::string tokenCopy;
+            {
+                std::lock_guard<std::mutex> lk(g_bearerTokenMutex);
+                tokenCopy = BearerToken;
+            }
+
+            // C-07: API first; the cached copy is only used when the API call
+            // fails (offline) or returns an unusable profile.
+            if(!tokenCopy.empty()) {
+                try {
+                    profileJson = getResponse(applicationEndURLHost,
+                                              std::to_string(applicationEndURLPort),
+                                              tokenCopy, json_body, "/api/GetUserProfile");
+                    profile = ParseUserProfileFromJson(profileJson);
+                    if(!profile.currentOrgCode.empty() && !profile.currentOrgId.empty()) {
+                        gotProfile = true;
+                        if(g_sqliteService) {
+                            try {
+                                g_sqliteService->SetConfig(cacheKey, profileJson.dump());
+                            } catch(const std::exception& e) {
+                                log("⚠️ Failed to cache UserProfile to DB: " + std::string(e.what()), LogLevel::WARNING);
+                            }
+                        }
+                    } else {
+                        log("⚠️ API UserProfile response incomplete (missing OrgCode/ID) - trying cache.",
+                            LogLevel::WARNING);
+                    }
+                } catch(const std::exception& e) {
+                    log("⚠️ UserProfile API call failed: " + std::string(e.what()) +
+                            " - falling back to cached profile.",
+                        LogLevel::WARNING);
+                }
+            } else {
+                log("⚠️ No bearer token (offline) - using cached UserProfile if available.",
+                    LogLevel::WARNING);
+            }
+
+            if(!gotProfile && g_sqliteService) {
+                try {
+                    std::string dbData = g_sqliteService->GetConfig(cacheKey);
+                    if(!dbData.empty()) {
+                        log("💾 DB Hit for UserProfile: " + cacheKey, LogLevel::INFO);
+                        profileJson = nlohmann::ordered_json::parse(dbData);
+                        profile = ParseUserProfileFromJson(profileJson);
+                    } else {
+                        log("📉 DB Miss for UserProfile: " + cacheKey, LogLevel::INFO);
+                    }
+                } catch(const std::exception& e) {
+                    log("⚠️ DB cache error for UserProfile: " + std::string(e.what()), LogLevel::WARNING);
+                }
+            }
+
+        } catch(const std::exception &e) {
+            log("❌ User profile request failed: " + std::string(e.what()),
+                LogLevel::ERRORS);
+            return nullptr;
+        }
+
+        if(profile.currentOrgId.empty()) {
+            log("❌ No currentOrgId in user profile for " + server.name,
+                LogLevel::ERRORS);
+            return nullptr;
+        }
+
+        log("✓ User profile: " + profile.displayName + " (OrgID: " +
+                profile.currentOrgId + ", Org: " + profile.currentOrgCode
+            + ")",
+            LogLevel::INFO);
+
+        std::string orgShortCode = profile.currentOrgCode;
+
+        std::string NamespaceURI = "Anexee:" + orgShortCode;
+        // Cache the URI on the context so hot reload paths (running outside
+        // onConnected) can re-resolve the namespace index after a reconnect.
+        context->namespaceURI = NamespaceURI;
+        //------------------------------------------------------------------------------------------
+
+        context->onConnected = [ctx = context.get(), server = server_copy,
+                                NamespaceURI]() {
+            // Runs on the OPC thread right after connectOnce() succeeded.
+            //
+            // C-31: the per-server "events" subscription (MonitorEvent on the
+            // Server object) was removed. Its handler only logged the fields,
+            // nothing was forwarded, so it was pure subscription/bandwidth
+            // overhead on every server.
+
+            // ── Resolve the org namespace index ONCE, here on the OPC thread ─
+            // (UA_Client_getNamespaceIndex is a network round-trip and must use
+            // the client from this thread). Worker tasks below read the cached
+            // value; they never touch the UA_Client.
+            UA_UInt16 resolvedNs = 0;
+            bool      nsResolved = false;
+            if(!NamespaceURI.empty()) {
+                UA_UInt16 tmp;
+                if(UA_Client_getNamespaceIndex(
+                       ctx->client.get(),
+                       UA_STRING((char *)NamespaceURI.c_str()),
+                       &tmp) == UA_STATUSCODE_GOOD) {
+                    resolvedNs = tmp;
+                    nsResolved = true;
+                    ctx->resolvedNs.store(resolvedNs, std::memory_order_release);
+                } else {
+                    log(ctx->name + ": namespace '" + NamespaceURI +
+                            "' not found on server - using node paths' stored ns index",
+                        LogLevel::WARNING);
+                }
+            }
+
+#ifdef UA_ENABLE_SUBSCRIPTIONS
+            // ── Group subscriptions (must stay on the OPC thread) ─────────────
+            for(const auto &group : server.groups) {
+                UA_CreateSubscriptionRequest greq = UA_CreateSubscriptionRequest_default();
+                UA_UInt32 requestedKeepAlive =
+                    (group.maxKeepAliveCount > 0) ? (UA_UInt32)group.maxKeepAliveCount : 40;
+                greq.requestedPublishingInterval = group.publishingInterval;
+                UA_UInt32 requestedLifetime =
+                    (group.lifetimeCount > 0) ? (UA_UInt32)group.lifetimeCount
+                                              : (requestedKeepAlive * 3);
+                if(requestedLifetime < (requestedKeepAlive * 3))
+                    requestedLifetime = requestedKeepAlive * 3;
+                greq.requestedMaxKeepAliveCount = requestedKeepAlive;
+                greq.requestedLifetimeCount = requestedLifetime;
+                greq.priority = group.priority;
+                greq.maxNotificationsPerPublish = group.maxNotificationsPerPublish;
+
+                UA_CreateSubscriptionResponse gsub =
+                    UA_Client_Subscriptions_create(ctx->client.get(), greq, ctx, nullptr, nullptr);
+                if(gsub.responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
+                    log("Subscription creation FAILED for '" + group.name + "' on " +
+                            ctx->endpoint + ": " +
+                            UA_StatusCode_name(gsub.responseHeader.serviceResult),
+                        LogLevel::ERRORS);
+                    continue;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(ctx->subsMutex);
+                    ctx->subscriptions[group.name] = gsub;
+                    // The startup hierarchy API ships the group's hierarchy id
+                    // under `dataPointId`; the hot reload MQTT command refers to
+                    // the same number as `id`. Populating groupIdToName here lets
+                    // applyGroupUpdate look up the subscription by id directly.
+                    if(group.dataPointId != 0)
+                        ctx->groupIdToName[group.dataPointId] = group.name;
+                }
+                if(group.dataPointId == 0) {
+                    log("Subscription Created with no hierarchy id for '" +
+                            group.name +
+                            "' - hot reload group updates will resolve by "
+                            "name only",
+                        LogLevel::DEBUG);
+                }
+                log("Subscription Created: " + group.name +
+                        " (hierarchyId=" + std::to_string(group.dataPointId) +
+                        ") | ID: " + std::to_string(gsub.subscriptionId) +
+                        " | Interval: " +
+                        std::to_string(gsub.revisedPublishingInterval) + "ms",
+                    LogLevel::INFO);
+            }
+#endif
+
+            // ── Monitored items: ONE service call per group ──────────────────
+            // C-16: the CPU-heavy preparation (ExprTk compile, NodeId parse,
+            // context construction) is done on a worker task so the OPC thread
+            // keeps calling run_iterate (keep-alives!) while it happens. Only
+            // the final UA_Client_MonitoredItems_createDataChanges call is
+            // posted back to the OPC thread.
+            for(const auto &group : server.groups) {
+                const std::string groupName = group.name;
+
+                ctx->postTask([ctx, group, groupName, resolvedNs, nsResolved]() {
+                    std::vector<MappedInfospaceTag>               batchInfoSpaces;
+                    std::vector<UA_NodeId>                        batchNodeIds;
+                    std::vector<std::shared_ptr<MyMonitorContext>> batchContexts;
+
+                    for(const auto &tag : group.tags) {
+                        if(!tag.mappedInfospaceTags) continue;
+                        for(const auto &infoSpace : *tag.mappedInfospaceTags) {
+                            std::string nodeIdStr;
+                            {
+                                std::lock_guard<std::mutex> mlk(g_mappingMutex);
+                                auto it = Mapping.find(infoSpace.tagId);
+                                if(it == Mapping.end()) continue;
+                                nodeIdStr = it->second.first;
+                            }
+
+                            // 1. Parse NodeId (no UA_Client needed)
+                            UA_NodeId nodeId = UA_NODEID_NULL;
+                            const char *nsStart = strstr(nodeIdStr.c_str(), "ns=");
+                            if(nsStart) {
+                                const char *nsEnd = strchr(nsStart + 3, ';');
+                                if(nsEnd) {
+                                    UA_UInt16 nsIdx = nsResolved
+                                        ? resolvedNs
+                                        : (UA_UInt16)strtoul(nsStart + 3, nullptr, 10);
+                                    const char *idStart = nsEnd + 1;
+                                    if(strncmp(idStart, "i=", 2) == 0)
+                                        nodeId = UA_NODEID_NUMERIC(
+                                            nsIdx,
+                                            (UA_UInt32)strtoul(idStart + 2, nullptr, 10));
+                                    else if(strncmp(idStart, "s=", 2) == 0)
+                                        nodeId = UA_NODEID_STRING_ALLOC(nsIdx, idStart + 2);
+                                }
+                            }
+
+                            // 2. Build MyMonitorContext (shared - see structs.h)
+                            //    and pre-compile the ExprTk AST.
+                            auto myCtx = std::make_shared<MyMonitorContext>();
+                            myCtx->infoSpace = infoSpace;
+                            myCtx->mqttHandler = g_mqttHandler;
+                            myCtx->sqliteService = g_sqliteService;
+                            myCtx->asyncPublisher = g_asyncPublisher;
+                            myCtx->postWorkerTask = [ctx](std::function<void()> task) {
+                                ctx->postTask(std::move(task));
+                            };
+
+                            if(infoSpace.enableExpression && !infoSpace.expression.empty()) {
+                                myCtx->exprContext = std::make_shared<ExprTkContext>();
+                                myCtx->exprContext->symbol_table.add_variable(
+                                    "value", myCtx->exprContext->value);
+                                myCtx->exprContext->symbol_table.add_constants();
+                                myCtx->exprContext->expression.register_symbol_table(
+                                    myCtx->exprContext->symbol_table);
+                                exprtk::parser<double> parser;
+                                std::string exprStr = infoSpace.expression;
+                                std::transform(exprStr.begin(), exprStr.end(),
+                                               exprStr.begin(), ::tolower);
+                                if(!parser.compile(exprStr, myCtx->exprContext->expression)) {
+                                    log("ExprTk compilation failed for tag " +
+                                            std::to_string(infoSpace.tagId) + ": " +
+                                            parser.error(),
+                                        LogLevel::ERRORS);
+                                    myCtx->exprContext.reset();
+                                }
+                            }
+
+                            batchInfoSpaces.push_back(infoSpace);
+                            batchNodeIds.push_back(nodeId);
+                            batchContexts.push_back(std::move(myCtx));
+                        }
+                    }
+
+                    if(batchInfoSpaces.empty()) return;
+
+                    // Hand the prepared vectors to the OPC thread for the single
+                    // network call. batchNodeIds are owned by the closure and
+                    // cleared there.
+                    ctx->postOpcTask([ctx, batchInfoSpaces = std::move(batchInfoSpaces),
+                                      batchNodeIds = std::move(batchNodeIds),
+                                      batchContexts = std::move(batchContexts),
+                                      groupName]() mutable {
+                        // Free the parsed NodeIds no matter how we leave.
+                        struct NodeIdsCleanup {
+                            std::vector<UA_NodeId> &ids;
+                            ~NodeIdsCleanup() {
+                                for(auto &n : ids) UA_NodeId_clear(&n);
+                            }
+                        } nodeIdsCleanup{batchNodeIds};
+
+                        if(!ctx->client || !ctx->isConnected.load(std::memory_order_acquire)) {
+                            log("Group " + groupName + ": client not connected, skipping "
+                                "monitor registration on " + ctx->endpoint,
+                                LogLevel::WARNING);
+                            return;
+                        }
+
+                        UA_UInt32 subscriptionId = 0;
+                        {
+                            std::lock_guard<std::mutex> lk(ctx->subsMutex);
+                            auto sIt = ctx->subscriptions.find(groupName);
+                            if(sIt == ctx->subscriptions.end()) {
+                                log("Group " + groupName + ": no subscription on " +
+                                        ctx->endpoint + " - monitors not registered",
+                                    LogLevel::ERRORS);
+                                return;
+                            }
+                            subscriptionId = sIt->second.subscriptionId;
+                        }
+
+                        const size_t count = batchInfoSpaces.size();
+
+                        UA_CreateMonitoredItemsRequest batchReq;
+                        UA_CreateMonitoredItemsRequest_init(&batchReq);
+                        batchReq.subscriptionId     = subscriptionId;
+                        batchReq.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+                        batchReq.itemsToCreate =
+                            (UA_MonitoredItemCreateRequest *)UA_Array_new(
+                                count,
+                                &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]);
+                        batchReq.itemsToCreateSize = count;
+
+                        std::vector<void *> rawCtxs(count, nullptr);
+                        std::vector<UA_Client_DataChangeNotificationCallback> cbs(
+                            count, handler_NodeValueChanged);
+                        std::vector<UA_Client_DeleteMonitoredItemCallback>  delCbs(count, nullptr);
+
+                        for(size_t i = 0; i < count; ++i) {
+                            const MappedInfospaceTag &infoSpace = batchInfoSpaces[i];
+
+                            UA_MonitoredItemCreateRequest &req = batchReq.itemsToCreate[i];
+                            UA_MonitoredItemCreateRequest_init(&req);
+                            // Deep copy: UA_CreateMonitoredItemsRequest_clear frees it.
+                            UA_NodeId_copy(&batchNodeIds[i], &req.itemToMonitor.nodeId);
+
+                            req.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
+                            req.monitoringMode            = UA_MONITORINGMODE_REPORTING;
+                            // C-20: per-tag backend settings (0 = server default).
+                            req.requestedParameters.samplingInterval =
+                                (UA_Double)(infoSpace.samplingInterval > 0 ? infoSpace.samplingInterval : 0);
+                            req.requestedParameters.queueSize =
+                                (UA_UInt32)(infoSpace.queuesize > 0 ? infoSpace.queuesize : 10000);
+                            req.requestedParameters.discardOldest    = false;
+
+                            // Deadband filter (heap-allocated, owned by req)
+                            UA_DataChangeFilter *filter =
+                                (UA_DataChangeFilter *)UA_malloc(
+                                    sizeof(UA_DataChangeFilter));
+                            UA_DataChangeFilter_init(filter);
+                            if(infoSpace.deadband > 0) {
+                                filter->deadbandType  = UA_DEADBANDTYPE_ABSOLUTE;
+                                filter->deadbandValue = infoSpace.deadband;
+                            }
+                            filter->trigger = UA_DATACHANGETRIGGER_STATUSVALUE;
+                            UA_ExtensionObject &fobj = req.requestedParameters.filter;
+                            memset(&fobj, 0, sizeof(fobj));
+                            fobj.encoding             = UA_EXTENSIONOBJECT_DECODED;
+                            fobj.content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER];
+                            fobj.content.decoded.data = filter;
+
+                            rawCtxs[i] = batchContexts[i].get();
+                        }
+
+                        // ── Single network service call for the whole group ───
+                        UA_CreateMonitoredItemsResponse resp =
+                            UA_Client_MonitoredItems_createDataChanges(
+                                ctx->client.get(),
+                                batchReq,
+                                rawCtxs.data(),
+                                cbs.data(),
+                                delCbs.data());
+
+                        UA_CreateMonitoredItemsRequest_clear(&batchReq);
+
+                        // ── Process results ──────────────────────────────────
+                        size_t ok = 0;
+                        {
+                            std::lock_guard<std::mutex> regLk(ctx->registryMutex);
+                            for(size_t i = 0; i < resp.resultsSize && i < count; ++i) {
+                                if(resp.results[i].statusCode != UA_STATUSCODE_GOOD) {
+                                    log("MonitoredItem failed for TagId " +
+                                            std::to_string(batchInfoSpaces[i].tagId) +
+                                            ": " +
+                                            UA_StatusCode_name(resp.results[i].statusCode),
+                                        LogLevel::ERRORS);
+                                    // batchContexts[i] is released with this closure.
+                                } else {
+                                    ++ok;
+                                    LiveMonitorEntry entry;
+                                    entry.hierarchyId = batchInfoSpaces[i].hierarchyId;
+                                    entry.tagId = batchInfoSpaces[i].tagId;
+                                    entry.monitoredItemId = resp.results[i].monitoredItemId;
+                                    entry.subscriptionId = subscriptionId;
+                                    entry.groupName = groupName;
+                                    entry.endpointUrl = ctx->endpoint;
+                                    entry.infoSpace = batchInfoSpaces[i];
+                                    entry.monCtx = batchContexts[i];
+                                    ctx->liveRegistry[entry.hierarchyId]
+                                        .push_back(std::move(entry));
+                                }
+                            }
+                        }
+                        UA_CreateMonitoredItemsResponse_clear(&resp);
+
+                        log("Group " + groupName + ": registered " +
+                                std::to_string(ok) + "/" + std::to_string(count) +
+                                " monitored items",
+                            LogLevel::INFO);
+                    });
+                });
+            }
+        };
+
+        // cout<<"Event Monitoring Created"<<endl;
+
+        context->startLoop();
+        return context;
+    };
+
+    // Publish the factory so the hot reload worker can spawn additional
+    // ClientContexts at runtime (purpose=OPC_HI_SERVER, action=Add).
+    g_buildContext = buildAndStartContext;
+
+    for(const auto &server : serverList) {
+        auto ctx = buildAndStartContext(server);
+        if(ctx) {
+            std::lock_guard<std::mutex> lk(g_clientPoolMutex);
+            clientPool[ctx->endpoint] = ctx.get();
+            clientContexts.push_back(std::move(ctx));
+        } else {
+            log("Skipping server '" + server.name +
+                    "' (" + server.endpointUrl + "): setup failed",
+                LogLevel::ERRORS);
+        }
+        // ADD THIS: Give each thread time to initialize before starting the next
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    log("Client pool initialized. Press Ctrl+C to stop...");
+
+    // ── Hot reload worker thread ───────────────────────────────────────────
+    // Drains g_hrQueue (populated from the MQTT callback when topic ==
+    // "HTRLD/Edgents"). Each task is a self-contained lambda that calls the
+    // EdgentHotReloading API and dispatches to applyAdd/Delete/Update/Reload.
+    g_hrRunning.store(true, std::memory_order_release);
+    g_hrWorker = std::thread([]() {
+        log("HotReload worker thread started", LogLevel::INFO);
+        while(true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(g_hrMutex);
+                g_hrCv.wait(lk, [] {
+                    return !g_hrQueue.empty() ||
+                           !g_hrRunning.load(std::memory_order_acquire);
+                });
+                if(!g_hrRunning.load(std::memory_order_acquire) &&
+                   g_hrQueue.empty())
+                    break;
+                task = std::move(g_hrQueue.front());
+                g_hrQueue.pop();
+            }
+            try {
+                task();
+            } catch(const std::exception &e) {
+                log(std::string("HotReload task threw: ") + e.what(),
+                    LogLevel::ERRORS);
+            } catch(...) {
+                log("HotReload task threw unknown exception",
+                    LogLevel::ERRORS);
+            }
+        }
+        log("HotReload worker thread exiting", LogLevel::INFO);
+    });
+
 
     while(g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -3534,8 +4094,89 @@ runClient(bool isService, int argc, char *argv[]) {
     return EXIT_SUCCESS;
 }
 
+#ifdef _WIN32
+// C-37: register / unregister this exe as a Windows service, mirroring the
+// server's --install/--uninstall. The service name is unchanged
+// ("AnexeeOPCUAClient") so existing registrations keep working. The binPath
+// is this exe with no arguments: WinMain detects SCM via
+// StartServiceCtrlDispatcher and falls back to console mode otherwise.
+static int
+installClientService() {
+    char selfPath[MAX_PATH];
+    if(GetModuleFileNameA(NULL, selfPath, MAX_PATH) == 0) {
+        std::cerr << "Cannot get executable path." << std::endl;
+        return 1;
+    }
+    std::string binPath = "\"" + std::string(selfPath) + "\"";
+
+    SC_HANDLE hSCManager = OpenSCManagerA(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    if(!hSCManager) {
+        DWORD err = GetLastError();
+        std::cerr << "OpenSCManager failed: " << err
+                  << (err == ERROR_ACCESS_DENIED ? " (run as Administrator)" : "")
+                  << std::endl;
+        return 1;
+    }
+    SC_HANDLE hService = CreateServiceA(
+        hSCManager, SERVICE_NAME, "Anexee OPC UA Client", SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+        binPath.c_str(), NULL, NULL, NULL, NULL, NULL);
+    if(!hService) {
+        DWORD err = GetLastError();
+        std::cerr << "CreateService failed: " << err
+                  << (err == ERROR_SERVICE_EXISTS ? " (already installed)" : "")
+                  << std::endl;
+        CloseServiceHandle(hSCManager);
+        return err == ERROR_SERVICE_EXISTS ? 0 : 1;
+    }
+    std::cout << "Service '" << SERVICE_NAME << "' installed. Start with: sc start "
+              << SERVICE_NAME << std::endl;
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+    return 0;
+}
+
+static int
+uninstallClientService() {
+    SC_HANDLE hSCManager = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+    if(!hSCManager) {
+        std::cerr << "OpenSCManager failed: " << GetLastError() << std::endl;
+        return 1;
+    }
+    SC_HANDLE hService = OpenServiceA(hSCManager, SERVICE_NAME, SERVICE_STOP | DELETE);
+    if(!hService) {
+        DWORD err = GetLastError();
+        std::cerr << "OpenService failed: " << err
+                  << (err == ERROR_SERVICE_DOES_NOT_EXIST ? " (not installed)" : "")
+                  << std::endl;
+        CloseServiceHandle(hSCManager);
+        return err == ERROR_SERVICE_DOES_NOT_EXIST ? 0 : 1;
+    }
+    SERVICE_STATUS st{};
+    ControlService(hService, SERVICE_CONTROL_STOP, &st); // best effort
+    int rc = 0;
+    if(!DeleteService(hService)) {
+        std::cerr << "DeleteService failed: " << GetLastError() << std::endl;
+        rc = 1;
+    } else {
+        std::cout << "Service '" << SERVICE_NAME << "' uninstalled." << std::endl;
+    }
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+    return rc;
+}
+#endif
+
 int
 main(int argc, char *argv[]) {
+#ifdef _WIN32
+    if(argc > 1) {
+        if(std::string(argv[1]) == "--install")
+            return installClientService();
+        if(std::string(argv[1]) == "--uninstall")
+            return uninstallClientService();
+    }
+#endif
     return runClient(false, argc, argv);
 }
 
@@ -3650,6 +4291,7 @@ ServiceWorkerThread(LPVOID lpParam) {
     LogEventWord(EVENTLOG_INFORMATION_TYPE, "Working directory set to exe folder");
     // Reuse client logic in service mode
     int code = runClient(true, __argc, __argv);
+    g_serviceWorkerExitCode.store(code);
     if(code != 0) {
         LogEventWord(EVENTLOG_ERROR_TYPE, "runClient exited with failure");
     } else {
@@ -3717,6 +4359,23 @@ ServiceMain(DWORD argc, LPTSTR *argv) {
         g_EventLog = nullptr;
     }
 
-    ReportSvcStatus(SERVICE_STOPPED, stopping ? NO_ERROR : NO_ERROR, 0);
+    // C-22: an operator-requested stop is a clean exit. Anything else (the
+    // worker returned on its own with a non-zero code, e.g. missing
+    // appsettings.json / EdgeConfig) is reported as a service-specific error
+    // so SCM records the failure and recovery actions can trigger.
+    const int workerCode = g_serviceWorkerExitCode.load();
+    if(stopping || workerCode == 0) {
+        ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
+    } else {
+        g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+        g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+        g_ServiceStatus.dwControlsAccepted = 0;
+        g_ServiceStatus.dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR;
+        g_ServiceStatus.dwServiceSpecificExitCode = (DWORD)workerCode;
+        g_ServiceStatus.dwCheckPoint = 0;
+        g_ServiceStatus.dwWaitHint = 0;
+        if(g_StatusHandle)
+            SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+    }
 }
 #endif // _WIN32

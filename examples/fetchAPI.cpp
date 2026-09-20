@@ -37,6 +37,7 @@ using tcp = boost::asio::ip::tcp;
 as::io_context http_ioc;
 unordered_map<int, pair<string, string>> Mapping;
 unordered_map<int, string> TopicMapping;
+std::mutex g_mappingMutex;
 
 // URL-encode helper
 static std::string
@@ -260,7 +261,7 @@ ParseServerHierarchyFromJson(const json &response) {
                                     tagInfo.parentId = tagItem.value("parentId", "");
                                     tagInfo.samplingInterval =
                                         tagItem.value("samplingInterval", 0);
-                                    tagInfo.deadband = tagItem.value("deadband", 0);
+                                    tagInfo.deadband = tagItem.value("deadband", 0.0);
                                     tagInfo.queuesize = tagItem.value("queueSize", 0);
                                     tagInfo.rdWtOpt = tagItem.value("rdWtOpt", "");
                                     tagInfo.sourceDatatype =
@@ -304,7 +305,7 @@ ParseServerHierarchyFromJson(const json &response) {
                                             mappedInfo.samplingInterval =
                                                 mappedTag.value("samplingInterval", 0);
                                             mappedInfo.deadband =
-                                                mappedTag.value("deadband", 0);
+                                                mappedTag.value("deadband", 0.0);
                                             mappedInfo.queuesize =
                                                 mappedTag.value("queueSize", 0);
 
@@ -332,11 +333,13 @@ ParseServerHierarchyFromJson(const json &response) {
                                             // topic like "TDSPL/NNNN/TEST/TEST"
                                             pair<string, string> NodePair = {
                                                 opcUaNamespace, serverInfo.endpointUrl};
-                                            Mapping[mappedInfo.tagId] = NodePair;
-                                           
-                                            // Store MQTT topic mapping for alarm fallback
-                                            TopicMapping[mappedInfo.tagId] =
-                                                mappedInfo.namespaces;
+                                            {
+                                                std::lock_guard<std::mutex> mlk(g_mappingMutex);
+                                                Mapping[mappedInfo.tagId] = NodePair;
+                                                // Store MQTT topic mapping for alarm fallback
+                                                TopicMapping[mappedInfo.tagId] =
+                                                    mappedInfo.namespaces;
+                                            }
 
                                             mappedTags.push_back(mappedInfo);
                                         }
@@ -1449,7 +1452,7 @@ parseSingleHotReloadServer(const json &item, int globalOrgId) {
                     tagInfo.parentId = tagItem.value("parentId", "");
                     tagInfo.samplingInterval =
                         tagItem.value("samplingInterval", 0);
-                    tagInfo.deadband = tagItem.value("deadband", 0);
+                    tagInfo.deadband = tagItem.value("deadband", 0.0);
                     tagInfo.queuesize = tagItem.value("queueSize", 0);
                     tagInfo.rdWtOpt = tagItem.value("rdWtOpt", "");
                     tagInfo.sourceDatatype =
@@ -1483,7 +1486,7 @@ parseSingleHotReloadServer(const json &item, int globalOrgId) {
                             mi.expression = tagInfo.expression;
                             mi.samplingInterval =
                                 mt.value("samplingInterval", 0);
-                            mi.deadband = mt.value("deadband", 0);
+                            mi.deadband = mt.value("deadband", 0.0);
                             mi.queuesize = mt.value("queueSize", 0);
                             mi.hierarchyId = tagInfo.dataPointId;
                             mi.orgId = mt.contains("orgId")
@@ -1493,9 +1496,12 @@ parseSingleHotReloadServer(const json &item, int globalOrgId) {
                             // Side-effect: register the new tag so MQTT
                             // control writes can route to this server right
                             // after onConnected fires.
-                            Mapping[mi.tagId] = {opcUaNamespace,
-                                                 serverInfo.endpointUrl};
-                            TopicMapping[mi.tagId] = mi.namespaces;
+                            {
+                                std::lock_guard<std::mutex> mlk(g_mappingMutex);
+                                Mapping[mi.tagId] = {opcUaNamespace,
+                                                     serverInfo.endpointUrl};
+                                TopicMapping[mi.tagId] = mi.namespaces;
+                            }
                             mapped.push_back(std::move(mi));
                         }
                         tagInfo.mappedInfospaceTags = std::move(mapped);

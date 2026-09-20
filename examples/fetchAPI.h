@@ -5,6 +5,7 @@
 #include <vector>
 #include <utility>
 #include <unordered_map>
+#include <mutex>
 #include <boost/asio/io_context.hpp>
 #include <nlohmann/json.hpp>
 #include "structs.h" 
@@ -21,6 +22,11 @@ extern as::io_context http_ioc;
 // These variables must be defined in one .cpp file (e.g., your existing one).
 extern std::unordered_map<int, std::pair<std::string, std::string>> Mapping;
 extern std::unordered_map<int, std::string> TopicMapping;
+// Guards Mapping and TopicMapping. They are written by the hot-reload worker
+// (Add/Delete) and read by the MQTT receive thread (control-write routing) and
+// the OPC threads (onConnected). Hold this for EVERY access. Never call out to
+// code that could re-lock it while holding it.
+extern std::mutex g_mappingMutex;
 
 using json = nlohmann::ordered_json;
 

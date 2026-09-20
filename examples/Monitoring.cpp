@@ -62,10 +62,23 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
         return;
     }
 
+    // Keep the context alive for as long as this task exists, even if the
+    // owning registry entry is released (reconnect / hot-reload delete) before
+    // a worker gets to run it. Contexts are always make_shared'd (see
+    // structs.h). weak_from_this() never throws (unlike shared_from_this()),
+    // which matters because this is a C callback boundary.
+    std::shared_ptr<MyMonitorContext> keepAlive = myContext->weak_from_this().lock();
+    if(!keepAlive) {
+        log("Monitoring context is not shared-owned; skipping notification for tagId " +
+                std::to_string(myContext->infoSpace.tagId),
+            LogLevel::ERRORS);
+        return;
+    }
+
     UA_DataValue *copiedValue = UA_DataValue_new();
     UA_DataValue_copy(value, copiedValue);
 
-    myContext->postWorkerTask([myContext, copiedValue]() {
+    myContext->postWorkerTask([myContext, copiedValue, keepAlive]() {
         // Redefine locally so existing code works unchanged
         UA_DataValue *value = copiedValue;
 
@@ -368,270 +381,12 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
 
 #endif
 
-static UA_MonitoredItemCreateRequest
-createMonitoredItemRequest(UA_NodeId nodeId) {
-
-    UA_MonitoredItemCreateRequest request;
-
-    if(nodeId.identifierType == UA_NODEIDTYPE_NUMERIC) {
-        UA_MonitoredItemCreateRequest_init(&request);
-        request.itemToMonitor.nodeId = UA_NODEID_NUMERIC(nodeId.namespaceIndex, nodeId.identifier.numeric);
-        request.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
-        request.monitoringMode = UA_MONITORINGMODE_REPORTING;
-    } else if(nodeId.identifierType == UA_NODEIDTYPE_STRING) {
-        UA_MonitoredItemCreateRequest_init(&request);
-        request.itemToMonitor.nodeId = UA_NODEID_STRING(
-            nodeId.namespaceIndex, const_cast<char *>(reinterpret_cast<const char *>(
-                                       nodeId.identifier.string.data)));
-        request.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
-        request.monitoringMode = UA_MONITORINGMODE_REPORTING;
-    } else if(nodeId.identifierType == UA_NODEIDTYPE_GUID) {
-        UA_MonitoredItemCreateRequest_init(&request);
-        request.itemToMonitor.nodeId = UA_NODEID_GUID(nodeId.namespaceIndex, nodeId.identifier.guid);
-        request.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
-        request.monitoringMode = UA_MONITORINGMODE_REPORTING;
-    } else if(nodeId.identifierType == UA_NODEIDTYPE_BYTESTRING) {
-        UA_ByteString bs = nodeId.identifier.byteString;
-        UA_MonitoredItemCreateRequest_init(&request);
-        request.itemToMonitor.nodeId = UA_NODEID_BYTESTRING(nodeId.namespaceIndex, (char *)bs.data);
-        request.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
-        request.monitoringMode = UA_MONITORINGMODE_REPORTING;
-    } else {
-        // Default case - create an empty request
-        UA_MonitoredItemCreateRequest_init(&request);
-        request.itemToMonitor.nodeId = UA_NODEID_NULL;
-        request.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE;
-        request.monitoringMode = UA_MONITORINGMODE_REPORTING;
-    }
-
-    return request;
-}
-
-static UA_NodeId
-parseNodeId(UA_Client *client, const char *nodeIdStr, const char *overrideNamespaceUri) {
-
-    // printf("Parsing NodeId string: %s\n with NamesapceURI : %s", nodeIdStr ,
-    // overrideNamespaceUri);
-    UA_NodeId nodeId = UA_NODEID_NULL;
-
-    /* --------------------------------------------------
-     * 1) Parse namespace from ns=<index>
-     * -------------------------------------------------- */
-
-    const char *nsStart = strstr(nodeIdStr, "ns=");
-    if(!nsStart)
-        return nodeId;
-
-    const char *nsEnd = strchr(nsStart + 3, ';');
-    if(!nsEnd)
-        return nodeId;
-
-    UA_UInt16 namespaceIndex = (UA_UInt16)strtoul(nsStart + 3, NULL, 10);
-
-    /* --------------------------------------------------
-     * 2) OPTIONAL override using Namespace URI
-     * -------------------------------------------------- */
-
-    if(overrideNamespaceUri && client) {
-        UA_UInt16 resolvedNs;
-        UA_StatusCode sc = UA_Client_getNamespaceIndex(
-            client, UA_STRING((char *)overrideNamespaceUri), &resolvedNs);
-
-        if(sc == UA_STATUSCODE_GOOD) {
-            namespaceIndex = resolvedNs; /* override */
-        }
-        /* else: silently keep original ns */
-    }
-
-    /* --------------------------------------------------
-     * 3) Parse identifier
-     * -------------------------------------------------- */
-
-    const char *idStart = nsEnd + 1;
-
-    if(strncmp(idStart, "i=", 2) == 0) {
-        UA_UInt32 numericId = (UA_UInt32)strtoul(idStart + 2, NULL, 10);
-        nodeId = UA_NODEID_NUMERIC(namespaceIndex, numericId);
-
-    } else if(strncmp(idStart, "s=", 2) == 0) {
-        nodeId = UA_NODEID_STRING_ALLOC(namespaceIndex, idStart + 2);
-
-    } else if(strncmp(idStart, "g=", 2) == 0) {
-        UA_Guid guid;
-        UA_String guidStr = UA_String_fromChars(idStart + 2);
-        if(UA_Guid_parse(&guid, guidStr) == UA_STATUSCODE_GOOD)
-            nodeId = UA_NODEID_GUID(namespaceIndex, guid);
-        UA_String_clear(&guidStr);
-
-    } else if(strncmp(idStart, "b=", 2) == 0) {
-        UA_ByteString bs;
-        UA_ByteString_init(&bs);
-        bs.length = strlen(idStart + 2);
-        bs.data = (UA_Byte *)UA_malloc(bs.length);
-        if(bs.data) {
-            memcpy(bs.data, idStart + 2, bs.length);
-            nodeId = UA_NODEID_BYTESTRING_ALLOC(namespaceIndex, (const char *)bs.data);
-        }
-    }
-
-    return nodeId;
-}
-
-// Include the header to ensure signature match
+// NOTE: The legacy single-item MonitorItem()/parseNodeId()/createMonitoredItemRequest()
+// path was removed (C-33). It had no callers (client.cpp uses the batched
+// UA_Client_MonitoredItems_createDataChanges path), spawned detached retry
+// threads holding a raw UA_Client*, and built UA_NODEID_STRING from a
+// non-NUL-terminated UA_String.
 #include "Monitoring.h"
-
-void
-MonitorItem(UA_Client *client, UA_CreateSubscriptionResponse response,
-            const char *nodeIdStr, int tagID, MyMonitorContext *myContext,
-            const char *overrideNamespaceUri, TaskScheduler scheduler, int attempt) {
-
-    UA_MonitoredItemCreateRequest monRequest;
-    UA_MonitoredItemCreateResult monResponse;
-
-    // global_mqttHandler = g_mqttHandler;
-
-    // PRE-COMPILE Expression Logic
-    // This is done ONCE per monitored item
-    if(myContext->infoSpace.enableExpression &&
-       !myContext->infoSpace.expression.empty()) {
-        myContext->exprContext = std::make_shared<ExprTkContext>();
-
-        // 1. Add variable 'value' to symbol table and bind to context value
-        myContext->exprContext->symbol_table.add_variable("value",
-                                                          myContext->exprContext->value);
-        myContext->exprContext->symbol_table.add_constants();  // Adds pi, epsilon, etc.
-
-        // 2. Register symbol table with expression
-        myContext->exprContext->expression.register_symbol_table(
-            myContext->exprContext->symbol_table);
-
-        // 3. Compile expression using local parser
-        exprtk::parser<double> parser;
-        // Transform expression to lower case for consistency
-        std::string exprStr = myContext->infoSpace.expression;
-        std::transform(exprStr.begin(), exprStr.end(), exprStr.begin(), ::tolower);
-
-        if(!parser.compile(exprStr, myContext->exprContext->expression)) {
-            log("ExprTk compilation failed for tag " + std::to_string(tagID) + ": " +
-                    parser.error(),
-                LogLevel::ERRORS);
-            // Verify if we should fallback or disable expression?
-            myContext->exprContext.reset();  // Disable if failed to compile
-        } else {
-            log("ExprTk compiled successfully for tag " + std::to_string(tagID),
-                LogLevel::DEBUG);
-        }
-    }
-
-    UA_NodeId nodeId = parseNodeId(client, nodeIdStr, overrideNamespaceUri);
-    if(UA_NodeId_isNull(&nodeId)) {
-        log("Invalid node ID format: " + string(nodeIdStr), LogLevel::ERRORS);
-        return;
-    }
-
-    monRequest = createMonitoredItemRequest(nodeId);
-
-    monRequest.requestedParameters.clientHandle = 42;
-
-    // Configure monitoring parameters for better timestamp handling
-    // monRequest.requestedParameters.samplingInterval =
-    // myContext->infoSpace.samplingInterval; // 1 second sampling interval
-    monRequest.requestedParameters.samplingInterval = 0;  // 1 second sampling interval
-    // monRequest.requestedParameters.queueSize = myContext->infoSpace.queuesize; // Queue
-    // size for notifications
-    monRequest.requestedParameters.queueSize = 10000;  // Queue size for notifications
-    
-    monRequest.requestedParameters.discardOldest = false;  // Discard oldest when queue is full
-
-    // Configure the monitoring filter
-    UA_DataChangeFilter filter;
-
-    if(myContext->infoSpace.deadband > 0) {
-        filter.deadbandType = UA_DEADBANDTYPE_ABSOLUTE;
-        filter.deadbandValue = myContext->infoSpace.deadband;
-    } else {
-        filter.deadbandType = UA_DEADBANDTYPE_NONE;
-        filter.deadbandValue = 0.0;
-    }
-
-    filter.trigger = UA_DATACHANGETRIGGER_STATUSVALUE;
-    UA_ExtensionObject filterExtObj;
-    memset(&filterExtObj, 0, sizeof(filterExtObj));
-    filterExtObj.encoding = UA_EXTENSIONOBJECT_DECODED;
-    filterExtObj.content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER];
-    filterExtObj.content.decoded.data = &filter;
-    monRequest.requestedParameters.filter = filterExtObj;
-
-    // log("Requesting MonitoredItem for NodeId: " + string(nodeIdStr) +
-    //     " | Sampling: " +
-    //     std::to_string(monRequest.requestedParameters.samplingInterval) + "ms | Queue:
-    //     " + std::to_string(monRequest.requestedParameters.queueSize), LogLevel::INFO);
-
-    // Async Retry Logic
-    int maxRetries = 5;
-
-    monResponse = UA_Client_MonitoredItems_createDataChange(
-        client, response.subscriptionId, UA_TIMESTAMPSTORETURN_BOTH, monRequest,
-        myContext, handler_NodeValueChanged, NULL);
-
-    if(monResponse.statusCode == UA_STATUSCODE_GOOD) {
-        UA_String nodeIdStrPrint = UA_STRING_NULL;
-        UA_NodeId_print(&monRequest.itemToMonitor.nodeId, &nodeIdStrPrint);
-        // log("Monitoring Created Successfully for Node " + string((char
-        // *)nodeIdStrPrint.data, nodeIdStrPrint.length) +
-        //     " | Id: " + to_string(monResponse.monitoredItemId) + " | TagID: " +
-        //     to_string(tagID), LogLevel::INFO);
-        UA_String_clear(&nodeIdStrPrint);
-    } else if(monResponse.statusCode == UA_STATUSCODE_BADNODEIDUNKNOWN &&
-              attempt < maxRetries) {
-        // log("Failed to create MonitoredItem (BadNodeIdUnknown) for TagID " +
-        // to_string(tagID) +
-        //     ". Retrying in 2 seconds... (Attempt " + to_string(attempt + 1) + "/" +
-        //     to_string(maxRetries) + ")", LogLevel::INFO);
-
-        if(scheduler) {
-            // CRITICAL FIX: Capture strings by VALUE (std::string) to avoid dangling
-            // pointers
-            std::string nsUriCopy = overrideNamespaceUri ? overrideNamespaceUri : "";
-            std::string nodeIdCopy = nodeIdStr ? nodeIdStr : "";
-
-            // Spawn a thread to wait, then schedule the next attempt on the main loop
-            std::thread([=]() {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                // Pass copies into the inner lambda
-                scheduler([=]() {
-                    MonitorItem(client, response, nodeIdCopy.c_str(), tagID, myContext,
-                                nsUriCopy.c_str(), scheduler, attempt + 1);
-                });
-            }).detach();
-
-            return;
-        } else {
-
-            // Fallback to synchronous sleep if no scheduler provided (legacy behavior)
-            log("No scheduler provided, falling back to synchronous retry",
-                LogLevel::WARNING);
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            MonitorItem(client, response, nodeIdStr, tagID, myContext,
-                        overrideNamespaceUri, nullptr, attempt + 1);
-            return;
-        }
-
-    } else {
-        // Other error or max retries reached
-        // log("Failed to create MonitoredItem for TagID " + to_string(tagID) +
-        //" | Status: " + string(UA_StatusCode_name(monResponse.statusCode)),
-        //LogLevel::ERRORS);
-    }
-
-    if(monResponse.statusCode != UA_STATUSCODE_GOOD) {
-        log("Permanently failed to create MonitoredItem for TagID " + to_string(tagID),
-            LogLevel::ERRORS);
-        // Clean up context to avoid memory leak since it wasn't passed to a successful
-        // monitor
-        delete myContext;
-    }
-}
 
 void
 handler_Event(UA_Client *client, UA_UInt32 subId, void *subContext, UA_UInt32 monId,
@@ -829,7 +584,7 @@ MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse response) {
     filter.selectClauses[2].typeDefinitionId = UA_NS0ID(BASEEVENTTYPE);
     filter.selectClauses[2].browsePathSize = 1;
     filter.selectClauses[2].browsePath = (UA_QualifiedName *)UA_Array_new(
-        filter.selectClauses[1].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
+        filter.selectClauses[2].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
     if(!filter.selectClauses[2].browsePath) {
         UA_Array_delete(filter.selectClauses, nSelectClauses,
                         &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
@@ -842,7 +597,7 @@ MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse response) {
     filter.selectClauses[3].typeDefinitionId = UA_NS0ID(BASEEVENTTYPE);
     filter.selectClauses[3].browsePathSize = 1;
     filter.selectClauses[3].browsePath = (UA_QualifiedName *)UA_Array_new(
-        filter.selectClauses[1].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
+        filter.selectClauses[3].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
     if(!filter.selectClauses[3].browsePath) {
         UA_Array_delete(filter.selectClauses, nSelectClauses,
                         &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
@@ -855,7 +610,7 @@ MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse response) {
     filter.selectClauses[4].typeDefinitionId = UA_NS0ID(BASEEVENTTYPE);
     filter.selectClauses[4].browsePathSize = 1;
     filter.selectClauses[4].browsePath = (UA_QualifiedName *)UA_Array_new(
-        filter.selectClauses[1].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
+        filter.selectClauses[4].browsePathSize, &UA_TYPES[UA_TYPES_QUALIFIEDNAME]);
     if(!filter.selectClauses[4].browsePath) {
         UA_Array_delete(filter.selectClauses, nSelectClauses,
                         &UA_TYPES[UA_TYPES_SIMPLEATTRIBUTEOPERAND]);
@@ -882,7 +637,8 @@ MonitorEvent(UA_Client *client, UA_CreateSubscriptionResponse response) {
             << result.statusCode;
         log(oss.str(), LogLevel ::ERRORS);
     } else {
-        log("Monitoring 'Root->Objects->Server', id " + result.monitoredItemId);
+        log("Monitoring 'Root->Objects->Server', id " +
+            std::to_string(result.monitoredItemId));
     }
 
     // Cleanup
