@@ -748,6 +748,25 @@ responseReadNamespacesArray(UA_Client *client, void *userdata, UA_UInt32 request
         nsMapping->local2remote[localIndex] = (UA_UInt16)i;
     }
 
+    /* If the mapping is the identity (the local namespace array matches the
+     * server's index for index), install no mapping. Indices outside the
+     * mapping tables are otherwise rewritten to UA_UINT16_MAX - index on the
+     * wire, which breaks servers that expose nodes in namespace indices they
+     * do not declare in their NamespaceArray (seen with python-opcua servers:
+     * nodes in ns=6 with a three-entry NamespaceArray). Without a mapping the
+     * indices are sent unchanged, as other clients do. */
+    UA_Boolean identity = true;
+    for(size_t i = 0; i < nsSize; ++i) {
+        if(nsMapping->remote2local[i] != i || nsMapping->local2remote[i] != i) {
+            identity = false;
+            break;
+        }
+    }
+    if(identity) {
+        UA_NamespaceMapping_delete(nsMapping);
+        return;
+    }
+
     client->channel.namespaceMapping = nsMapping;
 }
 

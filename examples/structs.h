@@ -13,15 +13,19 @@
 #include <atomic>
 #include <chrono>
 #include "MQTThandler.h" // Needed for MQTThandler pointer in AsyncPublisher
+#include <open62541/types.h>
 
 using namespace std;
 
 // Forward declaration if explicit include causes cycle, but MQTThandler.h has pragma once
-// class MQTTHandler; 
+// class MQTTHandler;
 
 struct AsyncMessage {
     std::string topic;
     std::string payload;
+    // false: drop the message instead of spilling it to SQLite / holding it in
+    // RAM when MQTT is down (poll results - CLIENT_POLLING_PLAN.md P-07).
+    bool spillIfDown = true;
 };
 
 class AsyncPublisher {
@@ -45,12 +49,12 @@ public:
         if (worker.joinable()) worker.join();
     }
 
-    void enqueue(std::string topic, std::string payload) {
+    void enqueue(std::string topic, std::string payload, bool spillIfDown = true) {
         {
             std::lock_guard<std::mutex> lock(queueMutex);
             if(messageDeque.size() >= MAX_PENDING)
                 messageDeque.pop_front();
-            messageDeque.push_back({std::move(topic), std::move(payload)});
+            messageDeque.push_back({std::move(topic), std::move(payload), spillIfDown});
         }
         cv.notify_one();
     }
@@ -88,6 +92,8 @@ private:
                 while (!localBatch.empty()) {
                     AsyncMessage msg = std::move(localBatch.front());
                     localBatch.pop_front();
+                    if (!msg.spillIfDown)
+                        continue; // not buffered offline: drop
                     if (!mqttDownSpill_(msg.topic, msg.payload))
                         toRequeue.push_back(std::move(msg));
                 }
@@ -103,6 +109,8 @@ private:
                 /* No spill: hold in RAM until MQTT returns. */
                 std::lock_guard<std::mutex> relock(queueMutex);
                 for (auto it = localBatch.rbegin(); it != localBatch.rend(); ++it) {
+                    if (!it->spillIfDown)
+                        continue; // not buffered offline: drop
                     if (messageDeque.size() >= MAX_PENDING)
                         messageDeque.pop_front();
                     messageDeque.push_front(std::move(*it));
@@ -219,6 +227,10 @@ struct ExprTkContext {
     double value;
     exprtk::symbol_table<double> symbol_table;
     exprtk::expression<double> expression;
+    // `value` is bound into `expression`, so setting it and evaluating must be
+    // one critical section: two updates for the same tag can run on different
+    // worker threads (change + poll, or two quick changes).
+    std::mutex evalMutex;
 };
 
 // Per-monitored-item context handed to open62541 as the raw `void *monContext`.
@@ -237,6 +249,18 @@ struct MyMonitorContext : public std::enable_shared_from_this<MyMonitorContext> 
     std::shared_ptr<ExprTkContext> exprContext;
     std::shared_ptr<AsyncPublisher> asyncPublisher; // Helper for non-blocking publish
     std::function<void(std::function<void()>)> postWorkerTask;
+
+    // The monitored node, kept so the poller can read it (owned; cleared in
+    // the destructor). Null for contexts that are never polled.
+    UA_NodeId nodeId = UA_NODEID_NULL;
+    // steady_clock ms of the last value published/queued for this tag by
+    // either path. The poller only reads tags quiet for a full interval.
+    std::atomic<std::int64_t> lastPublishMs{0};
+
+    MyMonitorContext() = default;
+    MyMonitorContext(const MyMonitorContext &) = delete;
+    MyMonitorContext &operator=(const MyMonitorContext &) = delete;
+    ~MyMonitorContext() { UA_NodeId_clear(&nodeId); }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

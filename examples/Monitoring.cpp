@@ -23,6 +23,7 @@
 #include "SqliteQueueService.h"
 #include "alarm_enums.h"
 #include "structs.h" // Includes exprtk.hpp safely
+#include "Monitoring.h" // PublishOrigin, steadyNowMs, postValueForPublish
 #include <nlohmann/json.hpp>
 
 using namespace std;
@@ -48,48 +49,24 @@ ScaleValue(double rawValue, double rawMin, double rawMax, double scaleMin,
 
 // Removed EvaluateExpression - logic moved to pre-compiled context
 
-void
-handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
-                         UA_UInt32 monId, void *monContext, UA_DataValue *value) {
-    auto *myContext = static_cast<MyMonitorContext *>(monContext);
-    if(!myContext) {
-        log("Monitoring context is null!", LogLevel::ERRORS);
-        return;
+// Decode, transform and publish one value for `myContext`. Runs on a worker
+// thread; the caller owns `value`. Shared by subscription notifications and
+// poll results (CLIENT_POLLING_PLAN.md P-04) - the payload is identical for
+// both; only offline handling differs.
+static void
+processAndPublish(MyMonitorContext *myContext, UA_DataValue *value,
+                  PublishOrigin origin, std::int64_t pollStaleMs) {
+    const bool isPoll = (origin == PublishOrigin::Poll);
+    if(isPoll) {
+        // A change was published while the read was in flight: nothing to add.
+        if(pollStaleMs > 0 &&
+           steadyNowMs() - myContext->lastPublishMs.load(std::memory_order_relaxed) <
+               pollStaleMs)
+            return;
+        // Poll results are never buffered offline (P-07).
+        if(!myContext->mqttHandler || !myContext->mqttHandler->isConnected())
+            return;
     }
-
-    if (!myContext->postWorkerTask) {
-        log("postWorkerTask is not configured!", LogLevel::ERRORS);
-        return;
-    }
-
-    // Keep the context alive for as long as this task exists, even if the
-    // owning registry entry is released (reconnect / hot-reload delete) before
-    // a worker gets to run it. Contexts are always make_shared'd (see
-    // structs.h). weak_from_this() never throws (unlike shared_from_this()),
-    // which matters because this is a C callback boundary.
-    std::shared_ptr<MyMonitorContext> keepAlive = myContext->weak_from_this().lock();
-    if(!keepAlive) {
-        log("Monitoring context is not shared-owned; skipping notification for tagId " +
-                std::to_string(myContext->infoSpace.tagId),
-            LogLevel::ERRORS);
-        return;
-    }
-
-    UA_DataValue *copiedValue = UA_DataValue_new();
-    UA_DataValue_copy(value, copiedValue);
-
-    myContext->postWorkerTask([myContext, copiedValue, keepAlive]() {
-        // Redefine locally so existing code works unchanged
-        UA_DataValue *value = copiedValue;
-
-        // Cleanup struct ensures memory is freed even if exceptions occur
-        struct ValueCleanup {
-            UA_DataValue* ptr;
-            ~ValueCleanup() {
-                UA_DataValue_clear(ptr);
-                UA_DataValue_delete(ptr);
-            }
-        } cleanup{copiedValue};
 
     MqttPayload p;
     // p.datapointId = myContext->infoSpace.tagId; // Assuming tagId is int? Check struct
@@ -238,10 +215,14 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
         if(p.tagType == "INFO_STATE") {
             if(myContext->exprContext) {
                 // HOT PATH with Pre-Compiled Expression
-                // Update the bound variable directly
-                myContext->exprContext->value = processedValue;
-                // Evaluate without parsing
-                double result = myContext->exprContext->expression.value();
+                // Set the bound variable and evaluate as one critical section
+                // (P-08: two updates for this tag may run on different workers).
+                double result;
+                {
+                    std::lock_guard<std::mutex> lk(myContext->exprContext->evalMutex);
+                    myContext->exprContext->value = processedValue;
+                    result = myContext->exprContext->expression.value();
+                }
                 p.value = (result != 0.0);
             } else {
                 // If expression is disabled or failed to compile, just use the original
@@ -347,9 +328,13 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
     /* MQTT down: persist directly to SQLite (same path as offline queue / bulk API). */
     if(myContext->mqttHandler && !myContext->mqttHandler->isConnected() &&
        myContext->sqliteService) {
+        if(isPoll)
+            return; // never buffered offline (P-07)
         myContext->sqliteService->EnqueueMessage(topic, p, orgId);
     } else if(myContext->asyncPublisher) {
-        myContext->asyncPublisher->enqueue(topic, payload.dump());
+        // Poll messages are dropped rather than spilled if MQTT drops before
+        // the publisher sends them.
+        myContext->asyncPublisher->enqueue(topic, payload.dump(), /*spillIfDown*/ !isPoll);
     } else if(myContext->mqttHandler && myContext->mqttHandler->isConnected()) {
         // Construct JSON manually or use library - library adds overhead but ensures
         // correctness. Assuming nlohmann::json is efficient enough. Improvement: Reuse a
@@ -374,9 +359,74 @@ handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
         myContext->mqttHandler->publish(topic, payloadSync.dump());
 
     } else if(myContext->sqliteService) {
+        if(isPoll)
+            return; // never buffered offline (P-07)
         myContext->sqliteService->EnqueueMessage(topic, p, orgId);
+    } else {
+        return; // nowhere to send it
     }
+
+    // Published or queued: the poller leaves this tag alone for an interval.
+    myContext->lastPublishMs.store(steadyNowMs(), std::memory_order_relaxed);
+}
+
+void
+postValueForPublish(const std::shared_ptr<MyMonitorContext> &ctx,
+                    const UA_DataValue *value, PublishOrigin origin,
+                    std::int64_t pollStaleMs) {
+    if(!ctx || !ctx->postWorkerTask || !value)
+        return;
+
+    UA_DataValue *copiedValue = UA_DataValue_new();
+    if(!copiedValue)
+        return;
+    UA_DataValue_copy(value, copiedValue);
+
+    // The task holds its own reference, so the context outlives the task even
+    // if the registry entry is released (reconnect / hot-reload delete) first.
+    std::shared_ptr<MyMonitorContext> keepAlive = ctx;
+    ctx->postWorkerTask([keepAlive, copiedValue, origin, pollStaleMs]() {
+        // Cleanup struct ensures memory is freed even if exceptions occur
+        struct ValueCleanup {
+            UA_DataValue *ptr;
+            ~ValueCleanup() {
+                UA_DataValue_clear(ptr);
+                UA_DataValue_delete(ptr);
+            }
+        } cleanup{copiedValue};
+
+        processAndPublish(keepAlive.get(), copiedValue, origin, pollStaleMs);
     });
+}
+
+void
+handler_NodeValueChanged(UA_Client *client, UA_UInt32 subId, void *subContext,
+                         UA_UInt32 monId, void *monContext, UA_DataValue *value) {
+    auto *myContext = static_cast<MyMonitorContext *>(monContext);
+    if(!myContext) {
+        log("Monitoring context is null!", LogLevel::ERRORS);
+        return;
+    }
+
+    if (!myContext->postWorkerTask) {
+        log("postWorkerTask is not configured!", LogLevel::ERRORS);
+        return;
+    }
+
+    // Keep the context alive for as long as this task exists, even if the
+    // owning registry entry is released (reconnect / hot-reload delete) before
+    // a worker gets to run it. Contexts are always make_shared'd (see
+    // structs.h). weak_from_this() never throws (unlike shared_from_this()),
+    // which matters because this is a C callback boundary.
+    std::shared_ptr<MyMonitorContext> keepAlive = myContext->weak_from_this().lock();
+    if(!keepAlive) {
+        log("Monitoring context is not shared-owned; skipping notification for tagId " +
+                std::to_string(myContext->infoSpace.tagId),
+            LogLevel::ERRORS);
+        return;
+    }
+
+    postValueForPublish(keepAlive, value, PublishOrigin::Change);
 }
 
 #endif

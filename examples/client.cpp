@@ -3,6 +3,7 @@
 
  #include <open62541/client_config_default.h>
  #include <open62541/client_highlevel.h>
+ #include <open62541/client_highlevel_async.h> // UA_Client_sendAsyncReadRequest (polling)
  #include <open62541/client_subscriptions.h>
  #include <open62541/plugin/log_stdout.h>
  #include <open62541/plugin/create_certificate.h>
@@ -96,6 +97,11 @@ static std::mutex                          g_clientPoolMutex;
 // 401.
 static std::mutex                          g_bearerTokenMutex;
 
+// Poll interval for quiet tags (CLIENT_POLLING_PLAN.md). Set once from
+// appsettings.json (Polling.PollIntervalSeconds) before any ClientContext
+// starts. 0 = polling disabled.
+static std::atomic<int>                    g_pollIntervalSec{60};
+
 // Forward declaration: a configurable factory that produces a fully-
 // configured-and-started ClientContext for a given ServerInfoO. Initialized
 // in runClient() once all per-process state (BearerToken, EdgeConfig,
@@ -109,6 +115,11 @@ static std::function<std::unique_ptr<ClientContext>(const ServerInfoO &)>
 // (ClientContext::hotAdded) after a (re)connect. Defined after the hot reload
 // dispatchers below; invoked from the OPC thread right after onConnected().
 static void replayHotAddedMonitors(ClientContext *ctx);
+
+// Reads every registered tag that has been quiet for a full poll interval and
+// publishes the result (CLIENT_POLLING_PLAN.md). Called from the OPC thread
+// loop after each run_iterate; returns immediately when no poll is due.
+static void runPollCycle(ClientContext *ctx);
 
 static void
 postHotReloadTask(std::function<void()> fn) {
@@ -294,6 +305,14 @@ struct ClientContext {
     std::function<void()> onConnected;
     static constexpr size_t MAX_OPC_TASKS_PER_TICK = 256;
 
+    // Polling (CLIENT_POLLING_PLAN.md). nextPollAt is OPC-thread only; a
+    // default value means "schedule one interval from now". pollsInFlight is
+    // shared with outstanding read requests (each holds a reference), so their
+    // callbacks can decrement it safely even while this context is torn down.
+    std::chrono::steady_clock::time_point nextPollAt{};
+    std::shared_ptr<std::atomic<int>> pollsInFlight =
+        std::make_shared<std::atomic<int>>(0);
+
     ClientContext() : running(true), isConnected(false) {}
 
     // Drop all per-session state that a fresh connect will rebuild:
@@ -314,6 +333,9 @@ struct ClientContext {
             groupIdToName.clear();
         }
         resolvedNs.store(0, std::memory_order_release);
+        // First poll of the next session is one interval after it connects
+        // (the new subscriptions deliver every current value on creation).
+        nextPollAt = std::chrono::steady_clock::time_point{};
         std::lock_guard<std::mutex> regLk(registryMutex);
         liveRegistry.clear();
     }
@@ -414,6 +436,9 @@ struct ClientContext {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     continue;
                 }
+
+                // ── Poll quiet tags (no-op unless an interval has elapsed) ───
+                runPollCycle(this);
 
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
@@ -799,6 +824,173 @@ parseUaNodePath(const std::string &p) {
     return nodeId;
 }
 
+// Format a UA_NodeId as "ns=<n>;s=<str>" / "ns=<n>;i=<num>" for logging.
+static std::string
+uaNodeIdToString(const UA_NodeId &id) {
+    std::string s = "ns=" + std::to_string(id.namespaceIndex) + ";";
+    switch(id.identifierType) {
+        case UA_NODEIDTYPE_NUMERIC:
+            s += "i=" + std::to_string(id.identifier.numeric);
+            break;
+        case UA_NODEIDTYPE_STRING:
+            s += "s=" + std::string((char *)id.identifier.string.data,
+                                    id.identifier.string.length);
+            break;
+        case UA_NODEIDTYPE_GUID:
+            s += "g=<guid>";
+            break;
+        case UA_NODEIDTYPE_BYTESTRING:
+            s += "b=<bytestring>";
+            break;
+        default:
+            s += "?";
+            break;
+    }
+    return s;
+}
+
+// ── Polling (CLIENT_POLLING_PLAN.md) ─────────────────────────────────────────
+//
+// Every registered tag is also polled: once per poll interval, the tags that
+// published nothing during the last interval are read and published. The
+// poll list is ctx->liveRegistry, which startup, hot reload and reconnect
+// already maintain, so a deleted tag stops being polled and an added one
+// starts without any polling-specific code in those paths.
+
+// One outstanding Read request. ctxs[i] is the tag for nodesToRead[i]. The
+// shared_ptrs keep the contexts (and their nodeIds) alive until the response
+// or cancellation arrives, even if hot reload deletes the tag meanwhile.
+struct PollBatch {
+    std::string serverName;
+    std::int64_t staleMs = 0;
+    std::shared_ptr<std::atomic<int>> inFlight;
+    std::vector<std::shared_ptr<MyMonitorContext>> ctxs;
+};
+
+// Nodes per Read request; servers commonly cap MaxNodesPerRead.
+static constexpr size_t POLL_CHUNK = 500;
+
+// open62541 calls this exactly once per sent request, on the OPC thread: with
+// the response, or with an empty response carrying BadTimeout (after
+// config->timeout) or a shutdown / connection-closed code when the request is
+// cancelled by a disconnect. It must not touch the ClientContext.
+static void
+onPollReadResponse(UA_Client *, void *userdata, UA_UInt32, UA_ReadResponse *rr) {
+    std::unique_ptr<PollBatch> batch(static_cast<PollBatch *>(userdata));
+    batch->inFlight->fetch_sub(1, std::memory_order_acq_rel);
+
+    const UA_StatusCode sr = rr->responseHeader.serviceResult;
+    if(sr != UA_STATUSCODE_GOOD) {
+        // Cancellation by a disconnect is expected; the next session polls again.
+        const bool cancelled = sr == UA_STATUSCODE_BADSHUTDOWN ||
+                               sr == UA_STATUSCODE_BADCONNECTIONCLOSED ||
+                               sr == UA_STATUSCODE_BADSECURECHANNELCLOSED ||
+                               sr == UA_STATUSCODE_BADSESSIONCLOSED ||
+                               sr == UA_STATUSCODE_BADSERVERNOTCONNECTED;
+        log("Poll " + batch->serverName + ": read of " +
+                std::to_string(batch->ctxs.size()) + " tags failed: " +
+                UA_StatusCode_name(sr),
+            cancelled ? LogLevel::DEBUG : LogLevel::WARNING);
+        return;
+    }
+
+    const size_t n = std::min(rr->resultsSize, batch->ctxs.size());
+    for(size_t i = 0; i < n; ++i)
+        postValueForPublish(batch->ctxs[i], &rr->results[i], PublishOrigin::Poll,
+                            batch->staleMs);
+}
+
+static void
+runPollCycle(ClientContext *ctx) {
+    const int intervalSec = g_pollIntervalSec.load(std::memory_order_relaxed);
+    if(intervalSec <= 0 || !ctx->client ||
+       !ctx->isConnected.load(std::memory_order_acquire))
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if(ctx->nextPollAt == std::chrono::steady_clock::time_point{}) {
+        // New session: its subscriptions just delivered every current value.
+        ctx->nextPollAt = now + std::chrono::seconds(intervalSec);
+        return;
+    }
+    if(now < ctx->nextPollAt)
+        return;
+    ctx->nextPollAt = now + std::chrono::seconds(intervalSec);
+
+    // A slow server is still answering the previous poll: skip this round
+    // instead of stacking reads on it.
+    if(ctx->pollsInFlight->load(std::memory_order_acquire) > 0) {
+        log("Poll " + ctx->name + ": previous poll still in flight, skipping",
+            LogLevel::DEBUG);
+        return;
+    }
+
+    // A tag is "quiet" if its last message is at least one interval old,
+    // minus a grace period. Without the grace a quiet tag would be polled only
+    // every OTHER cycle: its previous message (initial value on connect, or
+    // the last poll result) always lands a little after that cycle started,
+    // so one interval later it is a fraction of a second too young.
+    // Grace = 10% of the interval, at most 5 s (60 s -> 55 s, 10 s -> 9 s).
+    const std::int64_t intervalMs = static_cast<std::int64_t>(intervalSec) * 1000;
+    const std::int64_t staleMs =
+        intervalMs - std::min<std::int64_t>(5000, intervalMs / 10);
+    const std::int64_t nowMs = steadyNowMs();
+    std::vector<std::shared_ptr<MyMonitorContext>> stale;
+    {
+        std::lock_guard<std::mutex> lk(ctx->registryMutex);
+        for(const auto &kv : ctx->liveRegistry) {
+            for(const auto &entry : kv.second) {
+                const std::shared_ptr<MyMonitorContext> &mc = entry.monCtx;
+                if(!mc || UA_NodeId_isNull(&mc->nodeId))
+                    continue;
+                if(nowMs - mc->lastPublishMs.load(std::memory_order_relaxed) >= staleMs)
+                    stale.push_back(mc);
+            }
+        }
+    }
+
+    if(stale.empty())
+        return;
+
+    for(size_t off = 0; off < stale.size(); off += POLL_CHUNK) {
+        const size_t n = std::min(POLL_CHUNK, stale.size() - off);
+
+        auto batch = std::make_unique<PollBatch>();
+        batch->serverName = ctx->name;
+        batch->staleMs = staleMs;
+        batch->inFlight = ctx->pollsInFlight;
+        batch->ctxs.assign(stale.begin() + off, stale.begin() + off + n);
+
+        // NodeIds are borrowed from the contexts, not copied: the request is
+        // encoded inside the send call and is never cleared here.
+        std::vector<UA_ReadValueId> items(n);
+        for(size_t i = 0; i < n; ++i) {
+            UA_ReadValueId_init(&items[i]);
+            items[i].nodeId = batch->ctxs[i]->nodeId;
+            items[i].attributeId = UA_ATTRIBUTEID_VALUE;
+        }
+        UA_ReadRequest req;
+        UA_ReadRequest_init(&req);
+        req.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+        req.nodesToRead = items.data();
+        req.nodesToReadSize = n;
+
+        ctx->pollsInFlight->fetch_add(1, std::memory_order_acq_rel);
+        PollBatch *raw = batch.release();
+        const UA_StatusCode rc = UA_Client_sendAsyncReadRequest(
+            ctx->client.get(), &req, onPollReadResponse, raw, nullptr);
+        if(rc != UA_STATUSCODE_GOOD) {
+            // Not sent: open62541 does not invoke the callback, so clean up here.
+            ctx->pollsInFlight->fetch_sub(1, std::memory_order_acq_rel);
+            delete raw;
+            log("Poll " + ctx->name + ": could not send read request: " +
+                    UA_StatusCode_name(rc),
+                LogLevel::WARNING);
+            break;
+        }
+    }
+}
+
 // OPC-thread half of a hot-reload Add: create the monitored items for
 // (infoSpaces[i], nodePaths[i]) on `targetSubId` and register the survivors in
 // ctx->liveRegistry under `hierarchyId`. Shared by applyAdd (first creation)
@@ -867,6 +1059,7 @@ createHotReloadMonitorsOnOpc(ClientContext *ctx, UA_UInt32 targetSubId,
         fobj.content.decoded.data = filter;
 
         ctxs[i] = std::make_shared<MyMonitorContext>();
+        UA_NodeId_copy(&req.itemToMonitor.nodeId, &ctxs[i]->nodeId); // for polling
         ctxs[i]->infoSpace = infoSpaces[i];
         ctxs[i]->mqttHandler = g_mqttHandler;
         ctxs[i]->sqliteService = g_sqliteService;
@@ -2242,6 +2435,23 @@ runClient(bool isService, int argc, char *argv[]) {
             dbPath = appendInstanceSuffixToPath(dbPath, cliOptions.instanceId);
         }
 
+        // Polling of quiet tags (CLIENT_POLLING_PLAN.md P-01). Optional: files
+        // without a "Polling" section keep working with the 60 s default.
+        // 0 (or negative) disables polling.
+        {
+            int pollSec = 60;
+            try {
+                if(config.contains("Polling") && config["Polling"].is_object() &&
+                   config["Polling"].contains("PollIntervalSeconds"))
+                    pollSec = config["Polling"]["PollIntervalSeconds"].get<int>();
+            } catch(const std::exception &e) {
+                std::cerr << "[Config] Invalid Polling.PollIntervalSeconds (" << e.what()
+                          << "), using 60" << std::endl;
+                pollSec = 60;
+            }
+            g_pollIntervalSec.store(pollSec > 0 ? pollSec : 0, std::memory_order_relaxed);
+        }
+
 
 
 
@@ -2340,6 +2550,13 @@ runClient(bool isService, int argc, char *argv[]) {
     
     vector<ServerInfoO> serverList;
 
+    {
+        const int pollSec = g_pollIntervalSec.load(std::memory_order_relaxed);
+        log(pollSec > 0 ? "Polling quiet tags every " + std::to_string(pollSec) + " s"
+                        : std::string("Polling disabled (Polling.PollIntervalSeconds = 0)"),
+            LogLevel::INFO);
+    }
+
     // Initialize SqliteQueueService EARLY so we can use config cache during hierarchy fetch
     try {
         OfflineQueueOptions options;
@@ -2359,11 +2576,39 @@ runClient(bool isService, int argc, char *argv[]) {
     const int retryDelay = 10; // seconds
     bool hierarchySuccess = false;
     int attempt = 1;
+    const std::string startupToken = BearerToken;
 
     while (!hierarchySuccess && g_running) {
         log("Attempt " + std::to_string(attempt) + " - Fetching server hierarchy...", LogLevel::INFO);
 
         const std::string cacheKey = "OPCUA_HIERARCHY_" + NodeID;
+
+        // Sign in again before every retry. This loop can wait indefinitely
+        // (started offline with no cached hierarchy, or the API has no
+        // hierarchy for this node yet). Without a fresh token it would keep
+        // using the startup token: empty if we started offline, or expired
+        // after a long wait, so the client never recovered without a restart.
+        // One attempt per retry (not fetchBearerTokenWithRetry's 3 x 10 s) so
+        // a service stop during startup stays prompt. On failure the previous
+        // token is kept; it may still be valid.
+        if(attempt > 1) {
+            try {
+                json tokenResponse = ::getBearerToken(
+                    applicationEndURLHost, std::to_string(applicationEndURLPort),
+                    authUsername, authPassword);
+                if(tokenResponse.contains("access_token") &&
+                   tokenResponse["access_token"].is_string()) {
+                    std::lock_guard<std::mutex> lk(g_bearerTokenMutex);
+                    BearerToken = tokenResponse["access_token"].get<std::string>();
+                } else {
+                    log("Sign-in before hierarchy retry returned no token.",
+                        LogLevel::WARNING);
+                }
+            } catch(const std::exception &e) {
+                log("Sign-in before hierarchy retry failed: " + std::string(e.what()),
+                    LogLevel::WARNING);
+            }
+        }
 
         // C-07: API FIRST, local cache only as a fallback.
         //
@@ -2481,6 +2726,16 @@ runClient(bool isService, int argc, char *argv[]) {
         }
 #endif
         return EXIT_FAILURE;
+    }
+
+    // The MQTT password is derived from the bearer token and was set before
+    // the hierarchy loop. If the loop signed in again, derive it from the new
+    // token so the first MQTT connect does not use an empty or expired one.
+    if(BearerToken != startupToken) {
+        SetEdgeConfigMqttPassword(edgeCfg, BearerToken);
+        mqttPassword = edgeCfg.mqttPassword;
+        log("MQTT credentials updated from the token obtained while waiting for the hierarchy.",
+            LogLevel::INFO);
     }
 
     // Build datapointId -> orgId map from your server/device config (declare outside try block)
@@ -3812,6 +4067,7 @@ runClient(bool isService, int argc, char *argv[]) {
                             // 2. Build MyMonitorContext (shared - see structs.h)
                             //    and pre-compile the ExprTk AST.
                             auto myCtx = std::make_shared<MyMonitorContext>();
+                            UA_NodeId_copy(&nodeId, &myCtx->nodeId); // for polling
                             myCtx->infoSpace = infoSpace;
                             myCtx->mqttHandler = g_mqttHandler;
                             myCtx->sqliteService = g_sqliteService;
@@ -3953,9 +4209,11 @@ runClient(bool isService, int argc, char *argv[]) {
                             std::lock_guard<std::mutex> regLk(ctx->registryMutex);
                             for(size_t i = 0; i < resp.resultsSize && i < count; ++i) {
                                 if(resp.results[i].statusCode != UA_STATUSCODE_GOOD) {
+                                    // Include the NodeId we sent so a bad path in
+                                    // the hierarchy config is visible in the log.
                                     log("MonitoredItem failed for TagId " +
                                             std::to_string(batchInfoSpaces[i].tagId) +
-                                            ": " +
+                                            " [" + uaNodeIdToString(batchNodeIds[i]) + "]: " +
                                             UA_StatusCode_name(resp.results[i].statusCode),
                                         LogLevel::ERRORS);
                                     // batchContexts[i] is released with this closure.
@@ -4098,7 +4356,7 @@ runClient(bool isService, int argc, char *argv[]) {
 // C-37: register / unregister this exe as a Windows service, mirroring the
 // server's --install/--uninstall. The service name is unchanged
 // ("AnexeeOPCUAClient") so existing registrations keep working. The binPath
-// is this exe with no arguments: WinMain detects SCM via
+// is this exe with no arguments: main() detects SCM via
 // StartServiceCtrlDispatcher and falls back to console mode otherwise.
 static int
 installClientService() {
@@ -4176,24 +4434,21 @@ main(int argc, char *argv[]) {
         if(std::string(argv[1]) == "--uninstall")
             return uninstallClientService();
     }
-#endif
-    return runClient(false, argc, argv);
-}
 
-#ifdef _WIN32
-int WINAPI
-WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // The exe is linked for the Console subsystem, so this main() is the entry
+    // point in every launch mode, including when the SCM starts the service.
+    // The service is registered with a bare binPath (no flag), so detect SCM
+    // by trying to connect the service dispatcher: when the exe was launched
+    // from a console this fails immediately with
+    // ERROR_FAILED_SERVICE_CONTROLLER_CONNECT and we run in console mode.
     SERVICE_TABLE_ENTRYA serviceTable[] = {
         {const_cast<LPSTR>(SERVICE_NAME), (LPSERVICE_MAIN_FUNCTIONA)ServiceMain},
         {nullptr, nullptr}};
-
-    if(StartServiceCtrlDispatcherA(serviceTable)) {
-        return 0;  // Running as service
-    }
-    // Not launched by SCM. Fall back to console/GUI mode.
-    return main(__argc, __argv);
-}
+    if(StartServiceCtrlDispatcherA(serviceTable))
+        return 0;  // Ran as a service; ServiceMain has finished.
 #endif
+    return runClient(false, argc, argv);
+}
 
 // Service helper implementations
 // Service helper implementations (Windows only)
